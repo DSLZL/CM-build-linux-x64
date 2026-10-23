@@ -57,6 +57,7 @@ jobs:
       CM_CI_CONFIG: .github/cm-ci.json
       PYTHONDONTWRITEBYTECODE: "1"
       CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "false"
       SCCACHE_CACHE_SIZE: 2G
@@ -94,10 +95,17 @@ jobs:
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/worker_policy.py" verify-checkout
       - name: Record source identity separately from worker identity
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
+      - name: Materialize exact upstream and the reviewed Host overlay
+        run: python3 -B ci/scripts/host.py prepare 2>&1 | tee "$CM_CI_LOG_DIR/host-prepare.log"
       - name: Require real current-task mappings
         run: python3 -B ci/scripts/linux_ci.py configure 2>&1 | tee "$CM_CI_LOG_DIR/configure.log"
       - name: Install exact reviewed Rust toolchain on the worker
         run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
+      - name: Install required Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev libssl-dev bubblewrap
+          python3 -B ci/scripts/host.py native 2>&1 | tee "$CM_CI_LOG_DIR/native-inputs.log"
       - name: Install pinned sccache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -132,6 +140,12 @@ jobs:
           sccache --zero-stats
       - name: Fetch locked dependencies
         run: python3 -B ci/scripts/linux_ci.py fetch
+      - name: Build and bind the bundled sandbox helper before Host compilation
+        run: python3 -B ci/scripts/host.py helper
+      - name: Seal complete Host inputs and the compiled helper digest
+        run: python3 -B ci/scripts/host.py seal 2>&1 | tee "$CM_CI_LOG_DIR/host-seal.log"
+      - name: Check Host canonicalization and rejection before compiling
+        run: python3 -B fixtures/host-baseline/test_identity.py 2>&1 | tee "$CM_CI_LOG_DIR/host-identity-tests.log"
       - name: Check test and build only mapped current-task packages
         run: python3 -B ci/scripts/linux_ci.py build-test
       - name: Run actual acceptance for the current mapped task

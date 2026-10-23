@@ -45,8 +45,8 @@ jobs:
       - name: Verify fixed worker and source authority before executing CM source
         id: policy
         env:
-          CM_SOURCE_REPOSITORY: ${{ vars.CM_SOURCE_REPOSITORY }}
-          CM_BUILDER_REPOSITORY: ${{ vars.CM_BUILDER_REPOSITORY }}
+          CM_SOURCE_REPOSITORY: DSLZL/CM
+          CM_BUILDER_REPOSITORY: DSLZL/CM-build-linux-x64
           CM_SOURCE_SHA: ${{ inputs.source_sha }}
           CM_REQUEST_ID: ${{ inputs.request_id }}
           CM_POLICY_TOKEN: ${{ github.token }}
