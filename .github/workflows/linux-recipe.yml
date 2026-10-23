@@ -1,0 +1,194 @@
+# Initialize runner temporary paths after the exact source checkout.
+# Called only by this builder repository's reviewed build.yml.
+# Omitting cache-mode here inherits the caller's explicit platform-enforced cap.
+name: CM native Linux x64 recipe
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      builder_repository:
+        required: true
+        type: string
+      request_id:
+        required: true
+        type: string
+      cache_epoch:
+        required: true
+        type: string
+      cache_mode:
+        required: true
+        type: string
+    outputs:
+      artifact_id:
+        value: ${{ jobs.linux-x64.outputs.artifact_id }}
+      artifact_digest:
+        value: ${{ jobs.linux-x64.outputs.artifact_digest }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: cm-source
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      artifact_id: ${{ steps.payload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.payload.outputs.artifact-digest }}
+    env:
+      CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
+      CM_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+      CM_SOURCE_SHA: ${{ inputs.source_sha }}
+      CM_BUILDER_REPOSITORY: ${{ inputs.builder_repository }}
+      CM_EXECUTION_ROLE: platform_builder
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_CACHE_MODE: ${{ inputs.cache_mode }}
+      CM_CACHE_EPOCH: ${{ inputs.cache_epoch }}
+      CM_CI_CONFIG: .github/cm-ci.json
+      PYTHONDONTWRITEBYTECODE: "1"
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "false"
+      SCCACHE_CACHE_SIZE: 2G
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_BASEDIRS: ${{ github.workspace }}/cm-source
+    steps:
+      - name: Checkout trusted worker infrastructure at its exact workflow revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Checkout exact CM source from the sole source repository
+        id: source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set runner temporary paths after source checkout
+        run: |
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/cm-cargo-home"
+            echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cm-target"
+            echo "SCCACHE_DIR=$RUNNER_TEMP/cm-sccache"
+            echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-linux-x64-evidence"
+            echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-linux-x64-artifacts"
+          } >> "$GITHUB_ENV"
+      - name: Verify source SHA and platform-enforced cache authority
+        id: policy
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/worker_policy.py" verify-checkout
+      - name: Record source identity separately from worker identity
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
+      - name: Require real current-task mappings
+        run: python3 -B ci/scripts/linux_ci.py configure 2>&1 | tee "$CM_CI_LOG_DIR/configure.log"
+      - name: Install exact reviewed Rust toolchain on the worker
+        run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
+      - name: Install pinned sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+          disable_annotations: true
+      - name: Identify compatible cache namespace inside this builder repository
+        id: cache-identity
+        run: python3 -B ci/scripts/linux_ci.py identity 2>&1 | tee "$CM_CI_LOG_DIR/cache-identity.log"
+      - name: Restore this worker repository's Cargo downloads
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry/index
+            ${{ env.CARGO_HOME }}/registry/cache
+            ${{ env.CARGO_HOME }}/git/db
+          key: ${{ steps.cache-identity.outputs.cargo_key }}
+          restore-keys: ${{ steps.cache-identity.outputs.cargo_prefix }}
+          enableCrossOsArchive: false
+      - name: Restore this worker repository's sccache snapshot
+        id: sccache-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.cache-identity.outputs.sccache_key }}
+          restore-keys: ${{ steps.cache-identity.outputs.sccache_prefix }}
+          enableCrossOsArchive: false
+      - name: Start sccache after restoring its worker-local snapshot
+        id: sccache-start
+        run: |
+          sccache --start-server 2>&1 | tee "$CM_CI_LOG_DIR/sccache-start.log"
+          sccache --zero-stats
+      - name: Fetch locked dependencies
+        run: python3 -B ci/scripts/linux_ci.py fetch
+      - name: Check test and build only mapped current-task packages
+        run: python3 -B ci/scripts/linux_ci.py build-test
+      - name: Run actual acceptance for the current mapped task
+        run: python3 -B ci/scripts/linux_ci.py acceptance
+      - name: Capture compiler statistics and stop before archiving
+        id: cache-stop
+        if: ${{ always() && steps.sccache-start.outcome == 'success' }}
+        run: |
+          set +e
+          sccache --show-stats > "$CM_CI_LOG_DIR/sccache-stats.txt" 2> "$CM_CI_LOG_DIR/sccache-stats.stderr"
+          stats_status=$?
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-stats.json" 2> "$CM_CI_LOG_DIR/sccache-stats-json.stderr"
+          json_status=$?
+          sccache --stop-server > "$CM_CI_LOG_DIR/sccache-stop.log" 2>&1
+          stop_status=$?
+          cat "$CM_CI_LOG_DIR/sccache-stats.txt"
+          if (( stats_status != 0 || json_status != 0 || stop_status != 0 )); then exit 1; fi
+      - name: Record final identity and cache observations
+        if: ${{ always() && steps.policy.outcome == 'success' }}
+        env:
+          CM_JOB_STATUS: ${{ job.status }}
+          CM_CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          CM_CARGO_CACHE_MATCH: ${{ steps.cargo-cache.outputs.cache-matched-key }}
+          CM_SCCACHE_ARCHIVE_HIT: ${{ steps.sccache-cache.outputs.cache-hit }}
+          CM_SCCACHE_ARCHIVE_MATCH: ${{ steps.sccache-cache.outputs.cache-matched-key }}
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
+      - name: Upload actual current-task artifacts
+        id: payload
+        if: ${{ success() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-task-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save successful trusted source Cargo downloads
+        if: ${{ success() && inputs.cache_mode == 'write' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry/index
+            ${{ env.CARGO_HOME }}/registry/cache
+            ${{ env.CARGO_HOME }}/git/db
+          key: ${{ steps.cache-identity.outputs.cargo_key }}
+          enableCrossOsArchive: false
+      - name: Save successful trusted source compiler snapshot
+        if: ${{ success() && inputs.cache_mode == 'write' && steps.cache-stop.outcome == 'success' && steps.sccache-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.cache-identity.outputs.sccache_key }}
+          enableCrossOsArchive: false
+      - name: Upload logs compiler statistics and source/worker identities
+        if: ${{ always() && steps.policy.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_LOG_DIR }}
+          if-no-files-found: error
+          retention-days: 14

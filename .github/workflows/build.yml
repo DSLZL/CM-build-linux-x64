@@ -1,0 +1,114 @@
+# Install only in the independent CM-build-linux-x64 repository.
+name: CM Linux x64 builder
+run-name: CM Linux x64 / ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-hex commit from the fixed CM source repository
+        required: true
+        type: string
+      request_id:
+        description: Unique request ID issued by the trusted CM dispatcher
+        required: true
+        type: string
+      cache_epoch:
+        description: Reviewed cache namespace epoch
+        required: true
+        default: v1
+        type: string
+
+permissions:
+  contents: read
+cache-mode: none
+
+concurrency:
+  group: cm-build-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    cache-mode: none
+    outputs:
+      cache_mode: ${{ steps.policy.outputs.cache_mode }}
+      source_repository: ${{ steps.policy.outputs.source_repository }}
+      source_sha: ${{ steps.policy.outputs.source_sha }}
+      builder_repository: ${{ steps.policy.outputs.builder_repository }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Verify fixed worker and source authority before executing CM source
+        id: policy
+        env:
+          CM_SOURCE_REPOSITORY: ${{ vars.CM_SOURCE_REPOSITORY }}
+          CM_BUILDER_REPOSITORY: ${{ vars.CM_BUILDER_REPOSITORY }}
+          CM_SOURCE_SHA: ${{ inputs.source_sha }}
+          CM_REQUEST_ID: ${{ inputs.request_id }}
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/worker_policy.py preflight
+
+  build-read:
+    needs: preflight
+    if: needs.preflight.outputs.cache_mode == 'read'
+    cache-mode: read
+    uses: ./.github/workflows/linux-recipe.yml
+    with:
+      source_repository: ${{ needs.preflight.outputs.source_repository }}
+      source_sha: ${{ needs.preflight.outputs.source_sha }}
+      builder_repository: ${{ needs.preflight.outputs.builder_repository }}
+      request_id: ${{ inputs.request_id }}
+      cache_epoch: ${{ inputs.cache_epoch }}
+      cache_mode: read
+
+  build-write:
+    needs: preflight
+    if: needs.preflight.outputs.cache_mode == 'write'
+    cache-mode: write
+    uses: ./.github/workflows/linux-recipe.yml
+    with:
+      source_repository: ${{ needs.preflight.outputs.source_repository }}
+      source_sha: ${{ needs.preflight.outputs.source_sha }}
+      builder_repository: ${{ needs.preflight.outputs.builder_repository }}
+      request_id: ${{ inputs.request_id }}
+      cache_epoch: ${{ inputs.cache_epoch }}
+      cache_mode: write
+
+  receipt:
+    needs: [preflight, build-read, build-write]
+    if: >-
+      ${{ always() && needs.preflight.result == 'success' &&
+      (needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    cache-mode: none
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Bind actual upload digest to the worker run and requested CM source
+        env:
+          CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
+          CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
+          CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          CM_REQUEST_ID: ${{ inputs.request_id }}
+          CM_ARTIFACT_ID: ${{ needs.build-read.outputs.artifact_id || needs.build-write.outputs.artifact_id }}
+          CM_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.artifact_digest || needs.build-write.outputs.artifact_digest }}
+          CM_BUILD_JOB: ${{ needs.build-read.result == 'success' && 'build-read / linux-x64' || 'build-write / linux-x64' }}
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/worker_policy.py receipt
+      - name: Upload worker receipt for exact central verification
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-build-receipt-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-worker-receipt
+          if-no-files-found: error
+          retention-days: 14
