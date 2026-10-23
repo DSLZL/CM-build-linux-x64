@@ -101,6 +101,12 @@ jobs:
         run: python3 -B ci/scripts/linux_ci.py configure 2>&1 | tee "$CM_CI_LOG_DIR/configure.log"
       - name: Install exact reviewed Rust toolchain on the worker
         run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
+      - name: Enable upstream-required user namespaces on this ephemeral CI runner
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 | tee "$CM_CI_LOG_DIR/userns-setup.log"
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 | tee -a "$CM_CI_LOG_DIR/userns-setup.log"
+          fi
       - name: Install required Linux native dependencies
         run: |
           sudo apt-get update
