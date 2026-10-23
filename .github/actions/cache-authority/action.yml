@@ -1,0 +1,5 @@
+name: Verify worker cache authority
+description: Read the runner-injected cache mode before executing requested CM code
+runs:
+  using: node24
+  main: index.js

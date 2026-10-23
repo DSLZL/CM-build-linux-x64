@@ -90,9 +90,9 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Verify source SHA and platform-enforced cache authority
         id: policy
+        uses: ./.cm-worker/.github/actions/cache-authority
         env:
           CM_POLICY_TOKEN: ${{ github.token }}
-        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/worker_policy.py" verify-checkout
       - name: Record source identity separately from worker identity
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
       - name: Materialize exact upstream and the reviewed Host overlay
