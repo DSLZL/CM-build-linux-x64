@@ -43,6 +43,10 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+      - name: Verify runner-injected cache-none authority before producer work
+        uses: ./.github/actions/cache-authority
+        env:
+          CM_CACHE_MODE: none
       - name: Verify fixed worker and source authority before executing CM source
         id: policy
         env:
@@ -114,10 +118,14 @@ jobs:
           persist-credentials: false
       - name: Set independent consumer paths
         run: |
+          mkdir -p "$RUNNER_TEMP/cm-runtime-evidence"
+          echo 'Initialized evidence before consumer authority checks.' > "$RUNNER_TEMP/cm-runtime-evidence/setup.log"
           echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-extracted/runtime-inputs" >> "$GITHUB_ENV"
           echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer" >> "$GITHUB_ENV"
           echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-runtime-evidence" >> "$GITHUB_ENV"
           echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-runtime-artifacts" >> "$GITHUB_ENV"
+      - name: Verify and export runner-injected cache-none authority
+        uses: ./.github/actions/cache-authority
       - name: Verify exact producer artifact and actual cache-none authority
         id: input
         env:
