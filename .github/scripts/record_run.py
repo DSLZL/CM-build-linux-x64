@@ -24,24 +24,28 @@ def record(output):
     require_hosted_linux()
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    role = os.environ.get("CM_EXECUTION_ROLE", "source_checks")
     source_root = os.environ.get("CM_SOURCE_DIR", os.environ["GITHUB_WORKSPACE"])
-    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip()
+    head = (os.environ["CM_SOURCE_SHA"] if role == "runtime_consumer" else
+            subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip())
     repository = os.environ["GITHUB_REPOSITORY"]
     source_repository = os.environ.get("CM_SOURCE_REPOSITORY", repository)
     source_sha = os.environ.get("CM_SOURCE_SHA", head)
     if source_sha != head:
         raise RuntimeError("Requested source SHA does not match the checked-out CM source")
-    role = os.environ.get("CM_EXECUTION_ROLE", "source_checks")
-    if role not in {"source_checks", "platform_builder"}:
+    if role not in {"source_checks", "platform_builder", "runtime_consumer"}:
         raise RuntimeError("Unknown execution role")
     if role == "source_checks" and source_repository != repository:
         raise RuntimeError("Source checks must run in their source repository")
-    if role == "platform_builder" and (source_repository == repository or os.environ.get("CM_BUILDER_REPOSITORY") != repository):
+    if role in {"platform_builder", "runtime_consumer"} and (source_repository == repository or os.environ.get("CM_BUILDER_REPOSITORY") != repository):
         raise RuntimeError("Product builds require the distinct fixed builder repository")
+    if role == "runtime_consumer" and (os.environ.get("CM_CACHE_MODE") != "none" or os.environ.get("ACTIONS_CACHE_MODE") != "none"):
+        raise RuntimeError("Runtime consumer requires actual platform-enforced cache-mode none")
     identity = {"provider": "github_actions", "repository": repository,
                 "source_repository": source_repository, "source_sha": source_sha, "head_sha": head,
                 "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"], "execution_role": role,
                 "cache_repository": repository if role == "platform_builder" else None,
+                "source_checkout": role != "runtime_consumer",
                 "request_id": os.environ.get("CM_REQUEST_ID"),
                 "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
                 "workflow": os.environ["GITHUB_WORKFLOW_REF"], "job": os.environ["GITHUB_JOB"],

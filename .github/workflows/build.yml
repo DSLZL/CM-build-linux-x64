@@ -37,6 +37,7 @@ jobs:
       source_repository: ${{ steps.policy.outputs.source_repository }}
       source_sha: ${{ steps.policy.outputs.source_sha }}
       builder_repository: ${{ steps.policy.outputs.builder_repository }}
+      consumer_required: ${{ steps.policy.outputs.consumer_required }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -50,7 +51,9 @@ jobs:
           CM_SOURCE_SHA: ${{ inputs.source_sha }}
           CM_REQUEST_ID: ${{ inputs.request_id }}
           CM_POLICY_TOKEN: ${{ github.token }}
-        run: python3 -B .github/scripts/worker_policy.py preflight
+        run: |
+          python3 -B .github/scripts/worker_policy.py self-check
+          python3 -B .github/scripts/worker_policy.py preflight
 
   build-read:
     needs: preflight
@@ -64,6 +67,7 @@ jobs:
       request_id: ${{ inputs.request_id }}
       cache_epoch: ${{ inputs.cache_epoch }}
       cache_mode: read
+      consumer_required: ${{ needs.preflight.outputs.consumer_required == 'true' }}
 
   build-write:
     needs: preflight
@@ -77,12 +81,93 @@ jobs:
       request_id: ${{ inputs.request_id }}
       cache_epoch: ${{ inputs.cache_epoch }}
       cache_mode: write
+      consumer_required: ${{ needs.preflight.outputs.consumer_required == 'true' }}
 
-  receipt:
+  runtime-consumer:
     needs: [preflight, build-read, build-write]
     if: >-
       ${{ always() && needs.preflight.result == 'success' &&
+      needs.preflight.outputs.consumer_required == 'true' &&
       (needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    cache-mode: none
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.payload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.payload.outputs.artifact-digest }}
+    env:
+      CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
+      CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+      CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_EXECUTION_ROLE: runtime_consumer
+      CM_CACHE_MODE: none
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout trusted worker only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Set independent consumer paths
+        run: |
+          echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-extracted/runtime-inputs" >> "$GITHUB_ENV"
+          echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer" >> "$GITHUB_ENV"
+          echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-runtime-evidence" >> "$GITHUB_ENV"
+          echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-runtime-artifacts" >> "$GITHUB_ENV"
+      - name: Verify exact producer artifact and actual cache-none authority
+        id: input
+        env:
+          CM_INPUT_ARTIFACT_ID: ${{ needs.build-read.outputs.input_artifact_id || needs.build-write.outputs.input_artifact_id }}
+          CM_INPUT_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.input_artifact_digest || needs.build-write.outputs.input_artifact_digest }}
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -B .github/scripts/worker_policy.py verify-consumer
+      - name: Record independent consumer without a product source checkout
+        run: /usr/bin/python3 -B .github/scripts/record_run.py "$CM_CI_LOG_DIR"
+      - name: Download the verified same-run producer handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CM_INPUT_ARTIFACT_NAME: ${{ steps.input.outputs.input_artifact_name }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_INPUT_ARTIFACT_NAME" --dir "$CM_CONSUMER_TRANSFER_DIR"
+          /usr/bin/python3 -B .github/scripts/worker_policy.py extract-consumer
+      - name: Prepare observation tools and user namespaces before consumption
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends strace binutils
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Consume runtime inputs in a strict minimal rootfs
+        run: /usr/bin/python3 -B "$CM_CONSUMER_INPUT_DIR/runtime_consumer.py" consume
+      - name: Upload actual consumer product evidence
+        id: payload
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-consumer-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain lightweight consumer failures and provenance
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-consumer-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_LOG_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+  receipt:
+    needs: [preflight, build-read, build-write, runtime-consumer]
+    if: >-
+      ${{ always() && needs.preflight.result == 'success' &&
+      (needs.build-read.result == 'success' || needs.build-write.result == 'success') &&
+      (needs.preflight.outputs.consumer_required != 'true' || needs.runtime-consumer.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     cache-mode: none
@@ -103,6 +188,11 @@ jobs:
           CM_ARTIFACT_ID: ${{ needs.build-read.outputs.artifact_id || needs.build-write.outputs.artifact_id }}
           CM_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.artifact_digest || needs.build-write.outputs.artifact_digest }}
           CM_BUILD_JOB: ${{ needs.build-read.result == 'success' && 'build-read / linux-x64' || 'build-write / linux-x64' }}
+          CM_CONSUMER_REQUIRED: ${{ needs.preflight.outputs.consumer_required }}
+          CM_CONSUMER_ARTIFACT_ID: ${{ needs.runtime-consumer.outputs.artifact_id }}
+          CM_CONSUMER_ARTIFACT_DIGEST: ${{ needs.runtime-consumer.outputs.artifact_digest }}
+          CM_INPUT_ARTIFACT_ID: ${{ needs.build-read.outputs.input_artifact_id || needs.build-write.outputs.input_artifact_id }}
+          CM_INPUT_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.input_artifact_digest || needs.build-write.outputs.input_artifact_digest }}
           CM_POLICY_TOKEN: ${{ github.token }}
         run: python3 -B .github/scripts/worker_policy.py receipt
       - name: Upload worker receipt for exact central verification

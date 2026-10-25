@@ -24,11 +24,18 @@ on:
       cache_mode:
         required: true
         type: string
+      consumer_required:
+        required: true
+        type: boolean
     outputs:
       artifact_id:
         value: ${{ jobs.linux-x64.outputs.artifact_id }}
       artifact_digest:
         value: ${{ jobs.linux-x64.outputs.artifact_digest }}
+      input_artifact_id:
+        value: ${{ jobs.linux-x64.outputs.input_artifact_id }}
+      input_artifact_digest:
+        value: ${{ jobs.linux-x64.outputs.input_artifact_digest }}
 
 permissions:
   contents: read
@@ -45,6 +52,8 @@ jobs:
     outputs:
       artifact_id: ${{ steps.payload.outputs.artifact-id }}
       artifact_digest: ${{ steps.payload.outputs.artifact-digest }}
+      input_artifact_id: ${{ steps.runtime-inputs.outputs.artifact-id }}
+      input_artifact_digest: ${{ steps.runtime-inputs.outputs.artifact-digest }}
     env:
       CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
       CM_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
@@ -87,6 +96,8 @@ jobs:
             echo "SCCACHE_DIR=$RUNNER_TEMP/cm-sccache"
             echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-linux-x64-evidence"
             echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-linux-x64-artifacts"
+            echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-inputs"
+            echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer"
           } >> "$GITHUB_ENV"
       - name: Verify source SHA and platform-enforced cache authority
         id: policy
@@ -150,6 +161,9 @@ jobs:
         run: python3 -B ci/scripts/host.py helper
       - name: Seal complete Host inputs and the compiled helper digest
         run: python3 -B ci/scripts/host.py seal 2>&1 | tee "$CM_CI_LOG_DIR/host-seal.log"
+      - name: Check consumer observer before Host compilation
+        if: inputs.consumer_required
+        run: python3 -B ci/scripts/runtime_consumer.py self-check
       - name: Check Host canonicalization and rejection before compiling
         run: python3 -B fixtures/host-baseline/test_identity.py 2>&1 | tee "$CM_CI_LOG_DIR/host-identity-tests.log"
       - name: Check test and build only mapped current-task packages
@@ -185,6 +199,16 @@ jobs:
         with:
           name: cm-linux-x64-task-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload exact frozen runtime inputs for the separate consumer
+        id: runtime-inputs
+        if: ${{ success() && inputs.consumer_required }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-runtime-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CONSUMER_TRANSFER_DIR }}
+          compression-level: 0
           if-no-files-found: error
           retention-days: 14
       - name: Save successful trusted source Cargo downloads
