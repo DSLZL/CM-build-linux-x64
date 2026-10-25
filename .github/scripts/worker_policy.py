@@ -155,7 +155,7 @@ def archive_members(members, root):
             resolved = Path(os.path.normpath(str(path.parent / target if member.issym() else target)))
             if (target.is_absolute() or "\\" in member.linkname or not resolved.parts
                 or resolved.parts[0] != root or ".." in resolved.parts):
-                raise RuntimeError("Consumer archive link escapes its input root")
+                raise RuntimeError("Consumer archive link escapes its input root: " + repr((member.name, member.linkname)))
 
 
 def extract_archive(archive, destination):
@@ -189,6 +189,7 @@ def self_check():
                     lambda: successful_job([{"id": 1, "name": "consumer", "conclusion": "success"}] * 2, "consumer")])
     for name, kind, link in (("../escape", tarfile.REGTYPE, ""), ("runtime-inputs/socket", tarfile.FIFOTYPE, ""),
                              ("runtime-inputs/link", tarfile.SYMTYPE, "../../outside"),
+                             ("runtime-inputs/alias", tarfile.SYMTYPE, "/tmp/original-codex"),
                              ("runtime-inputs/link", tarfile.LNKTYPE, "/etc/passwd")):
         member = tarfile.TarInfo(name)
         member.type, member.linkname = kind, link
@@ -206,6 +207,9 @@ def self_check():
         (source / "cli").write_bytes(b"runtime-only")
         (source / "cli").chmod(0o755)
         (source / "alias").symlink_to("cli")
+        (source / "nested").mkdir()
+        (source / "nested/alias").symlink_to("../cli")
+        os.link(source / "cli", source / "hardlink")
         archive_path = root / "input.tar"
         with tarfile.open(archive_path, "w") as archive:
             archive.add(source, arcname="runtime-inputs")
@@ -215,6 +219,8 @@ def self_check():
         assert (destination / "cli").read_bytes() == b"runtime-only"
         assert (destination / "cli").stat().st_mode & 0o777 == 0o755
         assert (destination / "alias").is_symlink() and (destination / "alias").read_bytes() == b"runtime-only"
+        assert (destination / "nested/alias").is_symlink() and (destination / "nested/alias").read_bytes() == b"runtime-only"
+        assert (destination / "hardlink").samefile(destination / "cli")
 
 
 def receipt():
