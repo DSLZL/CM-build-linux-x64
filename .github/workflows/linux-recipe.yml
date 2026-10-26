@@ -69,7 +69,7 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "false"
-      SCCACHE_CACHE_SIZE: 2G
+      SCCACHE_CACHE_SIZE: 8G
       SCCACHE_IDLE_TIMEOUT: "0"
       SCCACHE_BASEDIRS: ${{ github.workspace }}/cm-source
     steps:
@@ -94,6 +94,7 @@ jobs:
             echo "CARGO_HOME=$RUNNER_TEMP/cm-cargo-home"
             echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cm-target"
             echo "SCCACHE_DIR=$RUNNER_TEMP/cm-sccache"
+            echo "CM_HOST_BUILD_CACHE_DIR=$RUNNER_TEMP/cm-host-build-cache"
             echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-linux-x64-evidence"
             echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-linux-x64-artifacts"
             echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-inputs"
@@ -155,21 +156,39 @@ jobs:
         run: |
           sccache --start-server 2>&1 | tee "$CM_CI_LOG_DIR/sccache-start.log"
           sccache --zero-stats
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-restored.json"
       - name: Fetch locked dependencies
         run: python3 -B ci/scripts/linux_ci.py fetch
       - name: Build and bind the bundled sandbox helper before Host compilation
-        run: python3 -B ci/scripts/host.py helper
+        run: |
+          python3 -B ci/scripts/host.py helper
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-helper.json"
       - name: Seal complete Host inputs and the compiled helper digest
+        id: host-identity
         run: python3 -B ci/scripts/host.py seal 2>&1 | tee "$CM_CI_LOG_DIR/host-seal.log"
       - name: Check consumer observer before Host compilation
         if: inputs.consumer_required
         run: python3 -B ci/scripts/runtime_consumer.py self-check
       - name: Check Host canonicalization and rejection before compiling
         run: python3 -B fixtures/host-baseline/test_identity.py 2>&1 | tee "$CM_CI_LOG_DIR/host-identity-tests.log"
+      - name: Restore exact product-input Host binaries and original build evidence
+        id: host-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
+          key: ${{ steps.host-identity.outputs.host_key }}
+          enableCrossOsArchive: false
+      - name: Verify restored Host bytes identity and original producer
+        run: python3 -B ci/scripts/host.py cache-restore
       - name: Check test and build only mapped current-task packages
-        run: python3 -B ci/scripts/linux_ci.py build-test
+        run: |
+          python3 -B ci/scripts/linux_ci.py build-test
+          sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-host.json"
       - name: Run actual acceptance for the current mapped task
         run: python3 -B ci/scripts/linux_ci.py acceptance
+      - name: Prepare a verified Host snapshot after successful current acceptance
+        if: ${{ success() && inputs.cache_mode == 'write' && steps.host-cache.outputs.cache-hit != 'true' }}
+        run: python3 -B ci/scripts/host.py cache-save
       - name: Capture compiler statistics and stop before archiving
         id: cache-stop
         if: ${{ always() && steps.sccache-start.outcome == 'success' }}
@@ -227,6 +246,13 @@ jobs:
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: ${{ steps.cache-identity.outputs.sccache_key }}
+          enableCrossOsArchive: false
+      - name: Save successful trusted source Host binaries and original build checks
+        if: ${{ success() && inputs.cache_mode == 'write' && steps.host-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
+          key: ${{ steps.host-identity.outputs.host_key }}
           enableCrossOsArchive: false
       - name: Upload logs compiler statistics and source/worker identities
         if: ${{ always() && steps.policy.outcome == 'success' }}
