@@ -78,7 +78,7 @@ def preflight():
     mode = "write" if sha == source_head else "read"
     config_record = api("repos/" + source + "/contents/.github/cm-ci.json?ref=" + sha)
     config = json.loads(base64.b64decode(config_record["content"]))
-    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01") else "false"
+    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02") else "false"
     record = {"source_repository": source, "source_sha": sha, "source_default_branch": branch,
               "observed_source_default_sha": source_head, "builder_repository": worker,
               "workflow_sha": workflow_sha, "worker_default_branch": worker_branch,
