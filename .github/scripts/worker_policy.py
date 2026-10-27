@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from record_run import require_hosted_linux
@@ -140,6 +141,21 @@ def successful_job(jobs, name):
     return {"job": name, "job_id": matches[0]["id"], "job_conclusion": "success"}
 
 
+def receipt_jobs(path, names):
+    # A dependent job can start before its predecessor is visible as completed in the API.
+    for attempt in range(12):
+        jobs = api(path)["jobs"]
+        pending = any(not any(job.get("name") == name and job.get("status") == "completed"
+                              for job in jobs) for name in names)
+        if not pending:
+            for name in names:
+                successful_job(jobs, name)
+            return jobs
+        if attempt < 11:
+            time.sleep(5)
+    raise RuntimeError("Required receipt jobs did not become completed within 55 seconds")
+
+
 def archive_members(members, root):
     seen = set()
     for member in members:
@@ -175,10 +191,26 @@ def extract_consumer():
 
 def self_check():
     require_hosted_linux()
+    from unittest.mock import patch
+
     record = {"id": 1, "name": "input", "digest": "sha256:" + "a" * 64,
               "expired": False, "workflow_run": {"id": 2}}
     assert artifact_binding(record, 1, "input", "a" * 64, 2)["artifact_id"] == 1
     assert successful_job([{"id": 3, "name": "consumer", "conclusion": "success"}], "consumer")["job_id"] == 3
+    ready = {"jobs": [{"id": 3, "name": "producer", "status": "completed", "conclusion": "success"},
+                      {"id": 4, "name": "consumer", "status": "completed", "conclusion": "success"}]}
+    pending = {"jobs": [ready["jobs"][0], {"id": 4, "name": "consumer", "status": "in_progress", "conclusion": None}]}
+    with patch(__name__ + ".api", side_effect=[{"jobs": []}, pending, ready]) as fetch, patch("time.sleep") as pause:
+        assert receipt_jobs("jobs", ["producer", "consumer"]) == ready["jobs"]
+        assert fetch.call_count == 3 and pause.call_count == 2
+    with patch(__name__ + ".api", return_value=pending) as fetch, patch("time.sleep") as pause:
+        try:
+            receipt_jobs("jobs", ["producer", "consumer"])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Receipt accepted a consumer that never completed")
+        assert fetch.call_count == 12 and pause.call_count == 11
     invalid = [lambda: artifact_binding(record, 2, "input", "a" * 64, 2),
                lambda: artifact_binding(record, 1, "wrong", "a" * 64, 2),
                lambda: artifact_binding(record, 1, "input", "b" * 64, 2),
@@ -233,7 +265,10 @@ def receipt():
     artifact_name = "cm-linux-x64-task-artifacts-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     actual = api("repos/" + worker + "/actions/artifacts/" + str(artifact_id))
     artifact_binding(actual, artifact_id, artifact_name, digest, int(os.environ["GITHUB_RUN_ID"]))
-    jobs = api("repos/" + worker + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100")["jobs"]
+    names = [os.environ["CM_BUILD_JOB"]]
+    if os.environ.get("CM_CONSUMER_REQUIRED") == "true":
+        names.append("runtime-consumer")
+    jobs = receipt_jobs("repos/" + worker + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100", names)
     producer_job = successful_job(jobs, os.environ["CM_BUILD_JOB"])
     ci = {"provider": "github_actions", "repository": worker, "source_repository": source,
           "head_sha": sha, "source_sha": sha, "workflow_sha": workflow_sha,
