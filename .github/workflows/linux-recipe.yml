@@ -149,7 +149,9 @@ jobs:
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: ${{ steps.cache-identity.outputs.sccache_key }}
-          restore-keys: ${{ steps.cache-identity.outputs.sccache_prefix }}
+          restore-keys: |
+            ${{ steps.cache-identity.outputs.sccache_prefix }}
+            ${{ steps.cache-identity.outputs.sccache_legacy_prefix }}
           enableCrossOsArchive: false
       - name: Start sccache after restoring its worker-local snapshot
         id: sccache-start
