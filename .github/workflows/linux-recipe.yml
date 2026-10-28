@@ -95,6 +95,7 @@ jobs:
             echo "CARGO_TARGET_DIR=$RUNNER_TEMP/cm-target"
             echo "SCCACHE_DIR=$RUNNER_TEMP/cm-sccache"
             echo "CM_HOST_BUILD_CACHE_DIR=$RUNNER_TEMP/cm-host-build-cache"
+            echo "CM_ACCEPTANCE_BUILD_CACHE_DIR=$RUNNER_TEMP/cm-acceptance-build-cache"
             echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-linux-x64-evidence"
             echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-linux-x64-artifacts"
             echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-inputs"
@@ -173,6 +174,20 @@ jobs:
         run: python3 -B ci/scripts/runtime_consumer.py self-check
       - name: Check Host canonicalization and rejection before compiling
         run: python3 -B fixtures/host-baseline/test_identity.py 2>&1 | tee "$CM_CI_LOG_DIR/host-identity-tests.log"
+      - name: Seal exact acceptance compilation inputs and recipes
+        id: acceptance-identity
+        run: |
+          python3 -B ci/scripts/acceptance_cache.py self-check
+          python3 -B ci/scripts/acceptance_cache.py identity
+      - name: Restore linked acceptance executables and original build checks
+        id: acceptance-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}
+          key: ${{ steps.acceptance-identity.outputs.acceptance_key }}
+          enableCrossOsArchive: false
+      - name: Verify acceptance executable bytes inputs and original producer
+        run: python3 -B ci/scripts/acceptance_cache.py restore
       - name: Restore exact product-input Host binaries and original build evidence
         id: host-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -188,6 +203,8 @@ jobs:
           sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-host.json"
       - name: Run actual acceptance for the current mapped task
         run: python3 -B ci/scripts/linux_ci.py acceptance
+      - name: Verify complete acceptance compilation snapshot
+        run: python3 -B ci/scripts/acceptance_cache.py save
       - name: Prepare a verified Host snapshot after successful current acceptance
         if: ${{ success() && inputs.cache_mode == 'write' && steps.host-cache.outputs.cache-hit != 'true' }}
         run: python3 -B ci/scripts/host.py cache-save
@@ -255,6 +272,13 @@ jobs:
         with:
           path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
           key: ${{ steps.host-identity.outputs.host_key }}
+          enableCrossOsArchive: false
+      - name: Save linked acceptance executables without runtime results
+        if: ${{ success() && inputs.cache_mode == 'write' && steps.acceptance-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}
+          key: ${{ steps.acceptance-identity.outputs.acceptance_key }}
           enableCrossOsArchive: false
       - name: Upload logs compiler statistics and source/worker identities
         if: ${{ always() && steps.policy.outcome == 'success' }}
