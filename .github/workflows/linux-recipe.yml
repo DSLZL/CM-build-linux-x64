@@ -216,7 +216,7 @@ jobs:
         id: host-identity
         run: python3 -B ci/scripts/host.py seal 2>&1 | tee "$CM_CI_LOG_DIR/host-seal.log"
       - name: Check consumer observer before Host compilation
-        if: inputs.consumer_required
+        if: inputs.consumer_required && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/runtime_consumer.py self-check
       - name: Check Host canonicalization and rejection before compiling
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
