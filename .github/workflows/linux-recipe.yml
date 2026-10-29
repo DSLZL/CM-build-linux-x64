@@ -232,6 +232,7 @@ jobs:
         if: inputs.build_kind == 'qualification'
         run: python3 -B ci/scripts/host.py cache-restore
       - name: Check test and build only mapped current-task packages
+        id: host-quality
         if: inputs.build_kind == 'qualification'
         run: |
           python3 -B ci/scripts/linux_ci.py build-test
@@ -248,10 +249,12 @@ jobs:
           strace -f -qq -s 16384 -e trace=execve,execveat -o "$CM_CI_LOG_DIR/m05-author-exec.log" python3 -B ci/scripts/mod_author.py produce || status=$?
           CM_AUTHOR_BUILD_EXIT="$status" python3 -B ci/scripts/mod_author.py audit-mod-only
       - name: Verify complete acceptance compilation snapshot
-        if: inputs.build_kind == 'qualification'
+        id: acceptance-cache-prepare
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && steps.host-quality.outcome == 'success' }}
         run: python3 -B ci/scripts/acceptance_cache.py save
-      - name: Prepare a verified Host snapshot after successful current acceptance
-        if: ${{ success() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-cache.outputs.cache-hit != 'true' }}
+      - name: Prepare a verified Host snapshot from its successful producer baseline
+        id: host-cache-prepare
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-quality.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
         run: python3 -B ci/scripts/host.py cache-save
       - name: Capture compiler statistics and stop before archiving
         id: cache-stop
@@ -312,14 +315,14 @@ jobs:
           key: ${{ steps.cache-identity.outputs.sccache_key }}
           enableCrossOsArchive: false
       - name: Save successful trusted source Host binaries and original build checks
-        if: ${{ success() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-cache.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-cache-prepare.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
           key: ${{ steps.host-identity.outputs.host_key }}
           enableCrossOsArchive: false
       - name: Save linked acceptance executables without runtime results
-        if: ${{ success() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}
