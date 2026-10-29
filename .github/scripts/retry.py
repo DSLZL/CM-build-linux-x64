@@ -89,7 +89,8 @@ def test_inputs(root, revision):
     texts = {path: source(root, revision, path) for path in RUNTIME_FILES}
     common = {path: projection(texts[path]) for path in COMMON_TESTS}
     common["outer_audit"] = projection(source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
-    common["checkpoint_protocol"] = projection(source(root, revision, "ci/scripts/retry.py"), ("Checkpoints",))
+    # Control-flow/logging fixes preserve independently audited results; schema changes bump this version.
+    common["checkpoint_protocol"] = 1
     result = {}
     for label, entries in PHASES.items():
         files = {path: projection(texts[path], (entry,)) for path, entry in entries}
@@ -372,6 +373,7 @@ class Checkpoints:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.results = {}
+        self.commands = {}
         self.index = {"schema_version": 1, "provenance": runtime.provenance(),
             "environment": validation["environment"], "rootfs_key": rootfs_key(closure),
             "test_inputs": validation["test_inputs"], "steps": {}}
@@ -402,15 +404,16 @@ class Checkpoints:
         return (not name.startswith(("m01", "m02", "m03", "m04", "m05", "probe", "syscalls.",
                                      "failures/missing-library/", "recoveries/actual-missing-library/"))
                 and name not in reserved | {"outer-runtime-audit.json", "missing-library.json",
-                    "actual-missing-library-recovery.json", "recovery-environment.json", "step-results.json"})
+                    "actual-missing-library-recovery.json", "recovery-environment.json", "step-results.json", "isolation-probes.json"})
 
     def files(self, label):
         return [p for p in sorted(self.evidence.rglob("*")) if p.is_file() and not p.is_symlink()
+                and p.suffix in {".json", ".jsonl", ".log"}
                 and self.owns(label, p.relative_to(self.evidence))]
 
     def key(self, label):
         return digest({"rootfs": self.index["rootfs_key"], "environment": self.index["environment"],
-                       "test": self.index["test_inputs"][label]})
+                       "test": self.index["test_inputs"][label], "command": self.commands[label]})
 
     def restore(self, label):
         if not self.previous:
@@ -463,11 +466,15 @@ class Checkpoints:
     def run(self, logs, label, command, timeout):
         import ci_progress
         started = time.monotonic()
+        self.commands[label] = [part.replace(str(self.temp), "<consumer-root>")
+            .replace(os.environ.get("CM_CONSUMER_INPUT_DIR", "<unset-runtime-inputs>"), "<runtime-inputs>") for part in command]
         try:
             result = self.restore(label)
             if result is None:
                 completed = ci_progress.run(logs, label, command, timeout)
                 assert completed.returncode == 0, "Runtime step failed: " + label
+                for name in self.reports.get(label, ()):
+                    assert read(self.evidence / name)["status"] == "behavior_pass", "Incomplete step report: " + name
                 paths = self.files(label)
                 audit = self.runtime.observe(self.temp / "trusted-observer" / label, self.evidence,
                     consumer_root=self.temp, result_paths=[p for p in paths if p.name == "result.json"])
@@ -547,25 +554,34 @@ def checkpoint_self_check():
 
         env = {"CM_RUNTIME_CHECKPOINT_DIR": str(directory / "first"), "CM_RUNTIME_RESUME_DIR": ""}
         with patch.dict(os.environ, env), patch.object(ci_progress, "run", run), patch.object(runtime, "observe", return_value=audit):
+            write(evidence / "isolation-probes.json", {"current_probe": 1})
+            (evidence / "A.entered").touch()
             first = Checkpoints(runtime, validation, closure, temp, evidence, logs, reports, [])
             assert first.run(logs, labels[0], [], 1).returncode == 0
             assert first.run(logs, labels[1], [], 1).returncode != 0
             assert set(read(directory / "first/index.json")["steps"]) == {labels[0]}
             shutil.rmtree(evidence)
             evidence.mkdir()
+            write(evidence / "isolation-probes.json", {"current_probe": 2})
             os.environ.update(CM_RUNTIME_CHECKPOINT_DIR=str(directory / "second"), CM_RUNTIME_RESUME_DIR=str(directory / "first"))
             second = Checkpoints(runtime, validation, closure, temp, evidence, logs, reports, [])
             assert second.run(logs, labels[0], [], 1).returncode == 0
             assert second.run(logs, labels[1], [], 1).returncode == 0
             assert calls == [labels[0], labels[1], labels[1]], "A passed step executed again after a different step failed"
             assert second.results[labels[0]]["kind"] == "reused" and second.results[labels[0]]["origin"] == provenance
+            assert read(evidence / "isolation-probes.json") == {"current_probe": 2}
+            assert not (directory / "second" / labels[0] / "evidence/A.entered").exists()
             # A changed test reruns only that step; changed bytes and failed audits never become hits.
             validation["test_inputs"][labels[0]] = "changed"
             os.environ["CM_RUNTIME_CHECKPOINT_DIR"] = str(directory / "third")
             third = Checkpoints(runtime, validation, closure, temp, evidence, logs, reports, [])
+            third.commands[labels[0]] = []
             assert third.restore(labels[0]) is None
-            (directory / "first" / labels[0] / "audit.json").write_text("{}")
             validation["test_inputs"][labels[0]] = "a"
+            third.commands[labels[0]] = ["changed-runtime-command"]
+            assert third.restore(labels[0]) is None
+            third.commands[labels[0]] = []
+            (directory / "first" / labels[0] / "audit.json").write_text("{}")
             try:
                 third.restore(labels[0])
             except AssertionError:
