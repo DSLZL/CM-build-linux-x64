@@ -147,6 +147,16 @@ jobs:
       - name: Require real current-task mappings
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/linux_ci.py configure 2>&1 | tee "$CM_CI_LOG_DIR/configure.log"
+      - name: Check current independent case fingerprints before expensive work
+        if: inputs.consumer_required && inputs.build_kind == 'qualification'
+        run: |
+          python3 -B ci/scripts/retry.py self-check
+          python3 -B ci/scripts/turn_budget.py self-check
+      - name: Restore the qualified legacy Host reference for metadata rejection
+        if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B ci/scripts/turn_budget.py restore-legacy
       - name: Install exact reviewed Rust toolchain on the worker
         if: steps.reuse.outputs.reused != 'true'
         run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"

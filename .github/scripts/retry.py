@@ -21,6 +21,7 @@ RUNTIME_FILES = (
     "fixtures/runtime-consumer/driver.py", "fixtures/native-loader/core_acceptance.py",
     "fixtures/native-loader/tool_barrier.py", "fixtures/runtime-sdk/driver.py",
     "fixtures/managed-package/driver.py", "fixtures/state/driver.py", "fixtures/mod-author/driver.py",
+    "ci/scripts/turn_budget.py", "fixtures/turn-budget/driver.py",
 )
 PHASES = {
     "consumer-matrix": (("fixtures/runtime-consumer/driver.py", "matrix"),),
@@ -31,6 +32,12 @@ PHASES = {
     "m03-consumer-matrix": (("ci/scripts/managed_package.py", "driver"), ("fixtures/managed-package/driver.py", "matrix")),
     "m04-consumer-matrix": (("ci/scripts/runtime_state.py", "driver"), ("fixtures/state/driver.py", "matrix")),
     "m05-consumer-matrix": (("ci/scripts/mod_author.py", "driver"), ("fixtures/mod-author/driver.py", "matrix")),
+    "g02a-counting": (("fixtures/turn-budget/driver.py", "counting"),),
+    "g02a-reentry": (("fixtures/turn-budget/driver.py", "reentry"),),
+    "g02a-terminal": (("fixtures/turn-budget/driver.py", "terminal"),),
+    "g02a-scope": (("fixtures/turn-budget/driver.py", "scope"),),
+    "g02a-cancellation-recovery": (("fixtures/turn-budget/driver.py", "cancellation_recovery"),),
+    "g02a-plug-and-play": (("fixtures/turn-budget/driver.py", "plug_and_play"),),
 }
 COMMON_TESTS = ("fixtures/native-loader/core_acceptance.py", "fixtures/native-loader/tool_barrier.py",
                 "ci/scripts/ci_progress.py")
@@ -95,9 +102,9 @@ def test_inputs(root, revision):
     for label, entries in PHASES.items():
         files = {path: projection(texts[path], (entry,)) for path, entry in entries}
         # These wrappers call shared metadata and SDK helpers across modules.
-        if label.startswith(("m02-", "m03-", "m04-", "m05-")):
+        if label.startswith(("m02-", "m03-", "m04-", "m05-", "g02a-")):
             files["ci/scripts/mod_manifest.py"] = projection(texts["ci/scripts/mod_manifest.py"], exclude=("matrix", "self_check"))
-        if label.startswith(("m03-", "m04-", "m05-")):
+        if label.startswith(("m03-", "m04-", "m05-", "g02a-")):
             files["fixtures/runtime-sdk/driver.py"] = projection(texts["fixtures/runtime-sdk/driver.py"], exclude=("matrix", "self_check"))
         if label.startswith(("m04-", "m05-")):
             files["fixtures/managed-package/driver.py"] = projection(texts["fixtures/managed-package/driver.py"], exclude=("matrix", "self_check"))
@@ -110,6 +117,7 @@ def product_inputs(root, revision):
     files = {}
     runtime_modules = {"ci/scripts/" + name + ".py": {"matrix", "self_check"} for name in
                        ("mod_author", "mod_manifest", "runtime_sdk", "managed_package", "runtime_state")}
+    runtime_modules["ci/scripts/turn_budget.py"] = {"driver", "self_check"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json"}
@@ -424,11 +432,13 @@ class Checkpoints:
             return name == "missing-library.json" or name.startswith("failures/missing-library/")
         if label == "consumer-library-recovery":
             return name in ("actual-missing-library-recovery.json", "recovery-environment.json") or name.startswith("recoveries/actual-missing-library/")
+        if label.startswith("g02a-"):
+            return name.startswith("g02a/" + label.removeprefix("g02a-") + "/") or name in self.reports[label]
         if label.startswith("m0"):
             prefix = label.split("-")[0]
             return name.startswith(prefix + "/") or name.startswith(prefix + "-") or name in self.reports[label]
         reserved = {p for key, paths in self.reports.items() if key != label for p in paths}
-        return (not name.startswith(("m01", "m02", "m03", "m04", "m05", "probe", "syscalls.",
+        return (not name.startswith(("m01", "m02", "m03", "m04", "m05", "g02a", "probe", "syscalls.",
                                      "failures/missing-library/", "recoveries/actual-missing-library/"))
                 and name not in reserved | {"outer-runtime-audit.json", "missing-library.json",
                     "actual-missing-library-recovery.json", "recovery-environment.json", "step-results.json", "isolation-probes.json"})
@@ -549,7 +559,24 @@ def self_check():
         checkpoint_self_check()
     origin_self_check()
     request_self_check()
+    g02a_checkpoint_self_check()
     print("CM retry input/dependency/environment self-checks passed", flush=True)
+
+
+def g02a_checkpoint_self_check():
+    checkpoint = object.__new__(Checkpoints)
+    cases = {label: label.removeprefix("g02a-") for label in PHASES if label.startswith("g02a-")}
+    assert len(cases) == 6
+    checkpoint.reports = {label: ["budget-" + case + ".json"] for label, case in cases.items()}
+    checkpoint.reports["consumer-matrix"] = ["p04.json"]
+    for label, case in cases.items():
+        assert checkpoint.owns(label, Path("g02a") / case / "suite.json")
+        assert checkpoint.owns(label, Path("budget-" + case + ".json"))
+        for other, other_case in cases.items():
+            if other != label:
+                assert not checkpoint.owns(label, Path("g02a") / other_case / "suite.json")
+                assert not checkpoint.owns(label, Path("budget-" + other_case + ".json"))
+        assert not checkpoint.owns("consumer-matrix", Path("g02a") / case / "suite.json")
 
 
 def request_self_check():
