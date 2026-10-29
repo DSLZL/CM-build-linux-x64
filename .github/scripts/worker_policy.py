@@ -2,6 +2,7 @@
 """Trusted worker infrastructure; install in the builder, never run locally."""
 import json
 import base64
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from record_run import require_hosted_linux
 
 TARGET = "x86_64-unknown-linux-gnu"
@@ -56,8 +58,192 @@ def identities():
     return source, worker, sha, workflow_sha, request
 
 
+def parse_origin(value):
+    if not isinstance(value, dict) or set(value) != {"run_id", "run_attempt", "source_sha", "workflow_sha", "request_id",
+        *{prefix + suffix for prefix in ("input", "consumer", "receipt") for suffix in ("_artifact_id", "_artifact_sha256")}}:
+        raise RuntimeError("Expected an exact qualification origin record")
+    for key in ("run_id", "run_attempt", "input_artifact_id", "consumer_artifact_id", "receipt_artifact_id"):
+        if type(value[key]) is not int or value[key] <= 0:
+            raise RuntimeError("Invalid numeric qualification origin field")
+    for key in ("source_sha", "workflow_sha"):
+        checked(value[key], r"[0-9a-f]{40}", "qualification revision")
+    for prefix in ("input", "consumer", "receipt"):
+        checked(value[prefix + "_artifact_sha256"], r"[0-9a-f]{64}", "qualification artifact digest")
+    checked(value["request_id"], r"[A-Za-z0-9_.-]{1,128}", "qualification request")
+    return value
+
+
+def build_request():
+    kind = os.environ.get("CM_BUILD_KIND", "qualification")
+    raw = os.environ.get("CM_HOST_ORIGIN", "")
+    if kind not in ("qualification", "mod-only") or (kind == "qualification" and raw):
+        raise RuntimeError("Unsupported build kind or unexpected Host origin")
+    if kind == "qualification":
+        return kind, None
+    if not raw or len(raw) > 4096:
+        raise RuntimeError("Mod-only requires an explicit bounded qualification origin")
+    try:
+        origin = json.loads(raw)
+    except ValueError as error:
+        raise RuntimeError("Invalid qualification origin JSON") from error
+    return kind, parse_origin(origin)
+
+
+def verify_origin(origin, source, worker, workflow_sha):
+    parse_origin(origin)
+    path = "repos/" + worker + "/actions/runs/" + str(origin["run_id"])
+    run = api(path)
+    if (run.get("id") != origin["run_id"] or run.get("run_attempt") != origin["run_attempt"]
+        or run.get("status") != "completed" or run.get("conclusion") != "success"
+        or run.get("head_sha") != origin["workflow_sha"] or run.get("event") != "workflow_dispatch"
+        or run.get("repository", {}).get("full_name") != worker
+        or run.get("path") != ".github/workflows/build.yml"
+        or run.get("display_title") != "CM Linux x64 / " + origin["request_id"]):
+        raise RuntimeError("Host origin is not the exact successful qualification run/attempt")
+    for repository, base, head in ((worker, origin["workflow_sha"], workflow_sha),
+                                   (source, origin["source_sha"], os.environ["CM_SOURCE_SHA"])):
+        if api("repos/" + repository + "/compare/" + base + "..." + head).get("status") not in ("ahead", "identical"):
+            raise RuntimeError("Qualification origin must belong to the reviewed source/worker ancestry")
+    jobs = api(path + "/attempts/" + str(origin["run_attempt"]) + "/jobs?per_page=100")["jobs"]
+    producers = [row for row in jobs if row.get("name") in ("build-read / linux-x64", "build-write / linux-x64")
+        and row.get("conclusion") == "success"]
+    if len(producers) != 1:
+        raise RuntimeError("Qualification requires one successful actual producer")
+    for name in ("preflight", producers[0]["name"], "runtime-consumer", "receipt"):
+        successful_job(jobs, name)
+    artifacts = {}
+    for prefix, name in (("input", "cm-linux-x64-runtime-inputs-"),
+                         ("consumer", "cm-linux-x64-consumer-artifacts-"), ("receipt", "cm-build-receipt-")):
+        record = api("repos/" + worker + "/actions/artifacts/" + str(origin[prefix + "_artifact_id"]))
+        artifact_binding(record, origin[prefix + "_artifact_id"],
+            name + origin["request_id"] + "-" + str(origin["run_attempt"]),
+            origin[prefix + "_artifact_sha256"], origin["run_id"])
+        artifacts[prefix] = record
+    return {"run": run, "jobs": jobs, "artifacts": artifacts}
+
+
+def download_origin_archive(worker, record, destination):
+    class Redirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, fp, code, message, headers, url):
+            if not url.startswith("https://"):
+                raise RuntimeError("Artifact redirect must remain HTTPS")
+            redirected = super().redirect_request(request, fp, code, message, headers, url)
+            redirected.remove_header("Authorization")
+            return redirected
+    request = urllib.request.Request("https://api.github.com/repos/" + worker + "/actions/artifacts/" + str(record["id"]) + "/zip",
+        headers={"Authorization": "Bearer " + os.environ["CM_POLICY_TOKEN"], "User-Agent": "CM-build-policy"})
+    digest = hashlib.sha256()
+    started = heartbeat = time.monotonic()
+    size = 0
+    with urllib.request.build_opener(Redirect()).open(request, timeout=60) as response, destination.open("xb") as stream:
+        while chunk := response.read(1024 * 1024):
+            size += len(chunk)
+            if size > 4 * 1024 ** 3:
+                raise RuntimeError("Oversized qualification artifact")
+            digest.update(chunk)
+            stream.write(chunk)
+            if time.monotonic() - heartbeat >= 30:
+                print(json.dumps({"stage": "restore-qualified-origin", "status": "running",
+                    "bytes": size, "elapsed_seconds": round(time.monotonic() - started, 3)}), flush=True)
+                heartbeat = time.monotonic()
+    if "sha256:" + digest.hexdigest() != record["digest"]:
+        raise RuntimeError("Downloaded qualification artifact digest differs from GitHub metadata")
+    return zipfile.ZipFile(destination)
+
+
+def archive_json(archive, name):
+    entries = [entry for entry in archive.infolist() if entry.filename == name]
+    if len(entries) != 1 or entries[0].file_size > 16 * 1024 * 1024 or entries[0].is_dir():
+        raise RuntimeError("Missing, duplicate or oversized qualification JSON")
+    return json.loads(archive.read(entries[0]))
+
+
+def qualification_receipt(receipt, origin, jobs, source, worker):
+    ci = receipt["ci"]
+    if ci.get("job") not in ("build-read / linux-x64", "build-write / linux-x64"):
+        raise RuntimeError("Qualification receipt has no actual producer job")
+    expected = {"provider": "github_actions", "source_repository": source, "repository": worker,
+        "head_sha": origin["source_sha"], "source_sha": origin["source_sha"],
+        "workflow_sha": origin["workflow_sha"], "run_id": origin["run_id"], "run_attempt": origin["run_attempt"],
+        "request_id": origin["request_id"], "build_kind": "qualification", "execution_role": "platform_builder",
+        "cache_repository": worker, "workflow": ".github/workflows/build.yml", "target": TARGET,
+        "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": "X64",
+        **successful_job(jobs, ci["job"])}
+    if any(ci.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("Qualification receipt differs from exact origin or actual producer")
+    consumer = receipt["consumer"]
+    expected_consumer = {"execution_role": "runtime_consumer", "cache_mode": "none",
+        **successful_job(jobs, "runtime-consumer"), "producer_job_id": ci["job_id"],
+        **{key: expected[key] for key in ("source_sha", "workflow_sha", "run_id", "run_attempt", "request_id")}}
+    if (any(consumer.get(key) != value for key, value in expected_consumer.items())
+        or consumer["artifact_id"] != origin["consumer_artifact_id"]
+        or consumer["artifact_sha256"] != origin["consumer_artifact_sha256"]
+        or consumer["input_artifact"]["artifact_id"] != origin["input_artifact_id"]
+        or consumer["input_artifact"]["artifact_sha256"] != origin["input_artifact_sha256"]):
+        raise RuntimeError("Qualification receipt does not bind the exact consumer job and artifacts")
+    return ci
+
+
+def restore_origin():
+    source, worker, sha, workflow_sha, request = identities()
+    kind, origin = build_request()
+    if kind != "mod-only":
+        raise RuntimeError("Origin restore is only available to explicit Mod-only requests")
+    remote = verify_origin(origin, source, worker, workflow_sha)
+    directory = Path(os.environ["RUNNER_TEMP"]) / "cm-host-origin"
+    directory.mkdir()
+    with download_origin_archive(worker, remote["artifacts"]["receipt"], directory / "receipt.zip") as archive:
+        receipt = archive_json(archive, "worker-receipt.json")
+    ci = qualification_receipt(receipt, origin, remote["jobs"], source, worker)
+    with download_origin_archive(worker, remote["artifacts"]["input"], directory / "input.zip") as archive:
+        if archive.namelist() != ["runtime-inputs.tar"]:
+            raise RuntimeError("Unexpected qualification input archive")
+        with archive.open("runtime-inputs.tar") as stream, (directory / "runtime-inputs.tar").open("xb") as output_stream:
+            import shutil
+            shutil.copyfileobj(stream, output_stream)
+    destination = directory / "runtime-inputs"
+    with tarfile.open(directory / "runtime-inputs.tar", "r:") as archive:
+        extract_archive(archive, destination)
+    producer = json.loads((destination / "producer.json").read_text())
+    expected_provenance = {"CM_SOURCE_REPOSITORY": source, "CM_SOURCE_SHA": origin["source_sha"],
+        "GITHUB_REPOSITORY": worker, "GITHUB_WORKFLOW_SHA": origin["workflow_sha"],
+        "GITHUB_RUN_ID": str(origin["run_id"]), "GITHUB_RUN_ATTEMPT": str(origin["run_attempt"]),
+        "CM_REQUEST_ID": origin["request_id"]}
+    if (producer["provenance"] != expected_provenance or producer["task_id"] != "CM-M05"
+        or producer["m05"]["build_kind"] != "qualification"):
+        raise RuntimeError("Frozen producer inputs are not the declared M05 qualification")
+    reports = ("author-to-user-workflow.json", "source-only-authoring.json", "runtime-author-diagnostics.json",
+        "independent-mod-update.json", "metadata-diagnostics-boundary.json", "zero-build-cli-contract.json")
+    with download_origin_archive(worker, remote["artifacts"]["consumer"], directory / "consumer.zip") as archive:
+        acceptance = archive_json(archive, "acceptance.json")
+        if (acceptance.get("task_id") != "CM-M05" or acceptance.get("status") != "pass"
+            or acceptance.get("implementation_commit") != origin["source_sha"]
+            or {row["id"] for row in acceptance["checks"]} != {"CM-M05-AC0" + str(i) for i in range(1, 7)}
+            or any(row.get("status") != "pass" or not row.get("command") for row in acceptance["checks"])):
+            raise RuntimeError("All six actual M05 qualification checks are required")
+        for name in reports:
+            report = archive_json(archive, "evidence/" + name)
+            if (report.get("status") != "pass" or report.get("provenance") != expected_provenance
+                or report.get("host") != producer["host"] or report.get("consumer_cache_mode") != "none"
+                or report.get("outer_audit", {}).get("compiler_linker_jit_build_service_calls") != 0):
+                raise RuntimeError("Qualification behavior report has a different Host or execution origin")
+    binary = destination / "host/bin/codex"
+    with binary.open("rb") as stream:
+        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    if actual != producer["host"]["executable_sha256"]:
+        raise RuntimeError("Restored qualification Host bytes changed")
+    verified = {"origin": origin, "ci": ci, "host": producer["host"],
+        "sdk_revision": producer["m05"]["sdk_revision"], "qualification_acceptance": acceptance,
+        "verified": True, "worker_jobs": remote["jobs"]}
+    (directory / "verified-origin.json").write_text(json.dumps(verified, indent=2) + "\n")
+    with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as stream:
+        stream.write("CM_VERIFIED_ORIGIN_DIR=" + str(directory) + "\n")
+    print("Restored exact successful qualification Host and runtime fixtures; no compiler or rebuild fallback.", flush=True)
+
+
 def preflight():
     source, worker, sha, workflow_sha, request = identities()
+    kind, origin = build_request()
     # These APIs run before any requested CM source is checked out or executed.
     source_info = api("repos/" + source)
     worker_info = api("repos/" + worker)
@@ -79,11 +265,16 @@ def preflight():
     mode = "write" if sha == source_head else "read"
     config_record = api("repos/" + source + "/contents/.github/cm-ci.json?ref=" + sha)
     config = json.loads(base64.b64decode(config_record["content"]))
-    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02", "CM-M03", "CM-M04") else "false"
+    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02", "CM-M03", "CM-M04", "CM-M05") else "false"
+    if kind == "mod-only":
+        if config.get("task_id") != "CM-M05":
+            raise RuntimeError("Mod-only requires the reviewed M05 mapping")
+        verify_origin(origin, source, worker, workflow_sha)
     record = {"source_repository": source, "source_sha": sha, "source_default_branch": branch,
               "observed_source_default_sha": source_head, "builder_repository": worker,
               "workflow_sha": workflow_sha, "worker_default_branch": worker_branch,
-              "request_id": request, "target": TARGET, "cache_mode": mode, "consumer_required": consumer_required}
+              "request_id": request, "target": TARGET, "cache_mode": mode, "consumer_required": consumer_required,
+              "build_kind": kind}
     Path(os.environ["RUNNER_TEMP"], "cm-worker-preflight.json").write_text(json.dumps(record, indent=2) + "\n")
     output({**record, "source_default_sha_verified": "true" if mode == "write" else "false"})
     print(json.dumps(record, indent=2))
@@ -91,6 +282,7 @@ def preflight():
 
 def verify_checkout():
     source, worker, sha, workflow_sha, request = identities()
+    build_request()
     actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=os.environ["CM_SOURCE_DIR"], text=True).strip()
     if actual != sha:
         raise RuntimeError("Checked-out CM source differs from requested exact source SHA")
@@ -215,6 +407,86 @@ def self_check():
                lambda: artifact_binding(record, 1, "wrong", "a" * 64, 2),
                lambda: artifact_binding(record, 1, "input", "b" * 64, 2),
                lambda: artifact_binding(record, 1, "input", "a" * 64, 9)]
+    origin = {"run_id": 12, "run_attempt": 1, "source_sha": "a" * 40,
+        "workflow_sha": "b" * 40, "request_id": "cm-fixture-origin"}
+    for index, prefix in enumerate(("input", "consumer", "receipt"), 20):
+        origin.update({prefix + "_artifact_id": index, prefix + "_artifact_sha256": "c" * 64})
+    assert parse_origin(origin) == origin
+    invalid.extend([lambda: parse_origin({**origin, "run_attempt": True}),
+        lambda: parse_origin({**origin, "source_sha": "main"}),
+        lambda: parse_origin({**origin, "unexpected": "field"})])
+    for kind, raw in (("unknown", ""), ("qualification", "{}"), ("mod-only", ""), ("mod-only", "{")):
+        def reject_request(kind=kind, raw=raw):
+            with patch.dict(os.environ, {"CM_BUILD_KIND": kind, "CM_HOST_ORIGIN": raw}):
+                build_request()
+        invalid.append(reject_request)
+    with patch.dict(os.environ, {"CM_BUILD_KIND": "mod-only", "CM_HOST_ORIGIN": json.dumps(origin)}):
+        assert build_request() == ("mod-only", origin)
+    run_path = "repos/DSLZL/CM-build-linux-x64/actions/runs/12"
+    run = {"id": 12, "run_attempt": 1, "status": "completed", "conclusion": "success",
+        "head_sha": "b" * 40, "event": "workflow_dispatch", "repository": {"full_name": "DSLZL/CM-build-linux-x64"},
+        "path": ".github/workflows/build.yml", "display_title": "CM Linux x64 / cm-fixture-origin"}
+    jobs = [{"id": index, "name": name, "conclusion": "success"} for index, name in enumerate(
+        ("preflight", "build-write / linux-x64", "runtime-consumer", "receipt"), 30)]
+    ci = {"provider": "github_actions", "repository": "DSLZL/CM-build-linux-x64", "source_repository": "DSLZL/CM",
+        "head_sha": "a" * 40, "source_sha": "a" * 40, "workflow_sha": "b" * 40,
+        "run_id": 12, "run_attempt": 1, "request_id": "cm-fixture-origin", "build_kind": "qualification",
+        "execution_role": "platform_builder", "cache_repository": "DSLZL/CM-build-linux-x64",
+        "workflow": ".github/workflows/build.yml", "target": TARGET, "runner_environment": "github-hosted",
+        "runner_os": "Linux", "runner_arch": "X64", **successful_job(jobs, "build-write / linux-x64")}
+    consumer = {"execution_role": "runtime_consumer", "cache_mode": "none", "producer_job_id": 31,
+        **successful_job(jobs, "runtime-consumer"),
+        **{key: ci[key] for key in ("source_sha", "workflow_sha", "run_id", "run_attempt", "request_id")},
+        "artifact_id": 21, "artifact_sha256": "c" * 64,
+        "input_artifact": {"artifact_id": 20, "artifact_sha256": "c" * 64}}
+    receipt = {"ci": ci, "consumer": consumer}
+    assert qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64") == ci
+    for section, key, value in (("ci", "job_id", 999), ("ci", "cache_repository", "DSLZL/CM"),
+                                ("consumer", "job_id", 999), ("consumer", "cache_mode", "read"),
+                                ("consumer", "source_sha", "f" * 40), ("consumer", "producer_job_id", 999)):
+        changed = {**receipt, section: {**receipt[section], key: value}}
+        invalid.append(lambda changed=changed: qualification_receipt(
+            changed, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64"))
+    responses = {run_path: run, run_path + "/attempts/1/jobs?per_page=100": {"jobs": jobs},
+        "repos/DSLZL/CM-build-linux-x64/compare/" + "b" * 40 + "..." + "d" * 40: {"status": "ahead"},
+        "repos/DSLZL/CM/compare/" + "a" * 40 + "..." + "e" * 40: {"status": "ahead"}}
+    for prefix, name in (("input", "cm-linux-x64-runtime-inputs-"),
+                         ("consumer", "cm-linux-x64-consumer-artifacts-"), ("receipt", "cm-build-receipt-")):
+        identifier = origin[prefix + "_artifact_id"]
+        responses["repos/DSLZL/CM-build-linux-x64/actions/artifacts/" + str(identifier)] = {
+            "id": identifier, "name": name + "cm-fixture-origin-1", "digest": "sha256:" + "c" * 64,
+            "expired": False, "workflow_run": {"id": 12}}
+    with patch.dict(os.environ, {"CM_SOURCE_SHA": "e" * 40}), patch(__name__ + ".api", side_effect=responses.__getitem__):
+        assert verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)["run"] == run
+        for key, value in (("run_attempt", 2), ("conclusion", "failure"), ("head_sha", "f" * 40)):
+            changed = {**responses, run_path: {**run, key: value}}
+            with patch(__name__ + ".api", side_effect=changed.__getitem__):
+                try:
+                    verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Unqualified Host origin accepted")
+        for mutation in ("expired", "wrong-run", "wrong-digest", "skipped-consumer", "unrelated-source"):
+            changed = json.loads(json.dumps(responses))
+            artifact_key = "repos/DSLZL/CM-build-linux-x64/actions/artifacts/20"
+            if mutation == "expired":
+                changed[artifact_key]["expired"] = True
+            elif mutation == "wrong-run":
+                changed[artifact_key]["workflow_run"]["id"] = 999
+            elif mutation == "wrong-digest":
+                changed[artifact_key]["digest"] = "sha256:" + "f" * 64
+            elif mutation == "skipped-consumer":
+                changed[run_path + "/attempts/1/jobs?per_page=100"]["jobs"][2]["conclusion"] = "skipped"
+            else:
+                changed["repos/DSLZL/CM/compare/" + "a" * 40 + "..." + "e" * 40]["status"] = "diverged"
+            with patch(__name__ + ".api", side_effect=changed.__getitem__):
+                try:
+                    verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Invalid qualification artifact or job accepted")
     for conclusion in ("skipped", "failure", None):
         invalid.append(lambda conclusion=conclusion: successful_job([{"id": 3, "name": "consumer", "conclusion": conclusion}], "consumer"))
     invalid.extend([lambda: successful_job([], "consumer"),
@@ -277,6 +549,7 @@ def receipt():
           "run_url": "https://github.com/" + worker + "/actions/runs/" + os.environ["GITHUB_RUN_ID"],
           "workflow": ".github/workflows/build.yml", "job": os.environ["CM_BUILD_JOB"],
           "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": "X64",
+          "build_kind": build_request()[0],
           "target": TARGET, "conclusion": None, "artifact_name": artifact_name,
           "artifact_id": artifact_id, "artifact_sha256": digest, **producer_job}
     consumer = None
@@ -306,7 +579,7 @@ def receipt():
 if __name__ == "__main__":
     try:
         {"self-check": self_check, "preflight": preflight, "verify-checkout": verify_checkout, "verify-consumer": verify_consumer,
-         "extract-consumer": extract_consumer, "receipt": receipt}[sys.argv[1]]()
+         "extract-consumer": extract_consumer, "restore-origin": restore_origin, "receipt": receipt}[sys.argv[1]]()
     except (RuntimeError, KeyError, IndexError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print("CM worker blocked/failed: " + str(exc), file=sys.stderr)
         raise SystemExit(2)

@@ -18,9 +18,20 @@ on:
         required: true
         default: v1
         type: string
+      build_kind:
+        description: Full Host qualification or only the independent target Mod
+        required: true
+        default: qualification
+        type: choice
+        options: [qualification, mod-only]
+      host_origin:
+        description: Exact successful qualification origin JSON for mod-only
+        required: false
+        type: string
 
 permissions:
   contents: read
+  actions: read
 cache-mode: none
 
 concurrency:
@@ -38,6 +49,7 @@ jobs:
       source_sha: ${{ steps.policy.outputs.source_sha }}
       builder_repository: ${{ steps.policy.outputs.builder_repository }}
       consumer_required: ${{ steps.policy.outputs.consumer_required }}
+      build_kind: ${{ steps.policy.outputs.build_kind }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -54,6 +66,8 @@ jobs:
           CM_BUILDER_REPOSITORY: DSLZL/CM-build-linux-x64
           CM_SOURCE_SHA: ${{ inputs.source_sha }}
           CM_REQUEST_ID: ${{ inputs.request_id }}
+          CM_BUILD_KIND: ${{ inputs.build_kind }}
+          CM_HOST_ORIGIN: ${{ inputs.host_origin }}
           CM_POLICY_TOKEN: ${{ github.token }}
         run: |
           python3 -B .github/scripts/worker_policy.py self-check
@@ -71,6 +85,8 @@ jobs:
       request_id: ${{ inputs.request_id }}
       cache_epoch: ${{ inputs.cache_epoch }}
       cache_mode: read
+      build_kind: ${{ needs.preflight.outputs.build_kind }}
+      host_origin: ${{ inputs.host_origin }}
       consumer_required: ${{ needs.preflight.outputs.consumer_required == 'true' }}
 
   build-write:
@@ -85,6 +101,8 @@ jobs:
       request_id: ${{ inputs.request_id }}
       cache_epoch: ${{ inputs.cache_epoch }}
       cache_mode: write
+      build_kind: ${{ needs.preflight.outputs.build_kind }}
+      host_origin: ${{ inputs.host_origin }}
       consumer_required: ${{ needs.preflight.outputs.consumer_required == 'true' }}
 
   runtime-consumer:
@@ -108,6 +126,7 @@ jobs:
       CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
       CM_REQUEST_ID: ${{ inputs.request_id }}
       CM_EXECUTION_ROLE: runtime_consumer
+      CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
       CM_CACHE_MODE: none
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -196,6 +215,8 @@ jobs:
           CM_ARTIFACT_ID: ${{ needs.build-read.outputs.artifact_id || needs.build-write.outputs.artifact_id }}
           CM_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.artifact_digest || needs.build-write.outputs.artifact_digest }}
           CM_BUILD_JOB: ${{ needs.build-read.result == 'success' && 'build-read / linux-x64' || 'build-write / linux-x64' }}
+          CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
+          CM_HOST_ORIGIN: ${{ inputs.host_origin }}
           CM_CONSUMER_REQUIRED: ${{ needs.preflight.outputs.consumer_required }}
           CM_CONSUMER_ARTIFACT_ID: ${{ needs.runtime-consumer.outputs.artifact_id }}
           CM_CONSUMER_ARTIFACT_DIGEST: ${{ needs.runtime-consumer.outputs.artifact_digest }}
