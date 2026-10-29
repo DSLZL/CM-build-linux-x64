@@ -240,27 +240,31 @@ def select(root, logs):
     print("CM producer reuse:", plan["status"], plan["reason"], flush=True)
 
 
-def verify_production_origin(origin):
+def verify_production_origin(origin, *, worker=None, fetch=None):
     p = policy()
-    _, worker, _, _, _ = p.identities()
+    worker = worker or p.identities()[1]
+    fetch = fetch or p.api
     assert all(re.fullmatch(r"[0-9a-f]{40}", origin[key]) for key in ("source_sha", "workflow_sha"))
     assert origin["job"] in ("build-read / linux-x64", "build-write / linux-x64")
     assert type(origin["run_id"]) is int and origin["run_id"] > 0
     assert type(origin["run_attempt"]) is int and origin["run_attempt"] > 0
     run_id = int(origin["run_id"])
-    run = p.api("repos/" + worker + "/actions/runs/" + str(run_id))
+    run = fetch("repos/" + worker + "/actions/runs/" + str(run_id))
     if run["run_attempt"] != origin["run_attempt"] or run["head_sha"] != origin["workflow_sha"] or run["event"] != "workflow_dispatch" or run["path"] != ".github/workflows/build.yml" or run["display_title"] != "CM Linux x64 / " + origin["request_id"]:
         raise RuntimeError("Producer origin run/attempt/workflow/request changed")
-    jobs = p.api("repos/" + worker + "/actions/runs/" + str(run_id) + "/attempts/" + str(origin["run_attempt"]) + "/jobs?per_page=100")["jobs"]
+    jobs = fetch("repos/" + worker + "/actions/runs/" + str(run_id) + "/attempts/" + str(origin["run_attempt"]) + "/jobs?per_page=100")["jobs"]
     job = p.successful_job(jobs, origin["job"])
     if job["job_id"] != origin["job_id"]:
         raise RuntimeError("Producer origin job changed")
+    records = {}
     for key in ("product_artifact", "input_artifact"):
         expected = origin[key]
-        actual = checked_artifact(p.api("repos/" + worker + "/actions/artifacts/" + str(expected["id"])), run_id)
+        actual = checked_artifact(fetch("repos/" + worker + "/actions/artifacts/" + str(expected["id"])), run_id)
         prefix = "cm-linux-x64-" + ("task-artifacts-" if key == "product_artifact" else "runtime-inputs-")
         if artifact_ref(actual) != expected or actual["name"] != prefix + origin["request_id"] + "-" + str(origin["run_attempt"]):
             raise RuntimeError("Producer artifact identity changed")
+        records[key] = actual
+    return records
 
 
 def overlay(root, logs):
@@ -619,6 +623,7 @@ def origin_self_check():
                            api=api, successful_job=p.successful_job)
     with patch(__name__ + ".policy", return_value=stub):
         verify_production_origin(origin)
+        assert verify_production_origin(origin, worker="DSLZL/CM-build-linux-x64", fetch=api)["input_artifact"] == records[2]
         for key, value in (("expired", True), ("workflow_run", {"id": 11}), ("digest", "sha256:" + "d" * 64)):
             original = records[1][key]
             records[1][key] = value

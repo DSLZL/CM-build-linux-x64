@@ -115,9 +115,13 @@ def verify_origin(origin, source, worker, workflow_sha):
     for prefix, name in (("input", "cm-linux-x64-runtime-inputs-"),
                          ("consumer", "cm-linux-x64-consumer-artifacts-"), ("receipt", "cm-build-receipt-")):
         record = api("repos/" + worker + "/actions/artifacts/" + str(origin[prefix + "_artifact_id"]))
-        artifact_binding(record, origin[prefix + "_artifact_id"],
-            name + origin["request_id"] + "-" + str(origin["run_attempt"]),
-            origin[prefix + "_artifact_sha256"], origin["run_id"])
+        # A reused input is bound to its original producer after the exact qualification receipt is verified.
+        if prefix != "input" or record.get("workflow_run", {}).get("id") == origin["run_id"]:
+            artifact_binding(record, origin[prefix + "_artifact_id"],
+                name + origin["request_id"] + "-" + str(origin["run_attempt"]),
+                origin[prefix + "_artifact_sha256"], origin["run_id"])
+        elif record.get("expired") is not False or record.get("id") != origin["input_artifact_id"] or record.get("digest") != "sha256:" + origin["input_artifact_sha256"]:
+            raise RuntimeError("Reused qualification input artifact changed or expired")
         artifacts[prefix] = record
     return {"run": run, "jobs": jobs, "artifacts": artifacts}
 
@@ -181,6 +185,25 @@ def qualification_receipt(receipt, origin, jobs, source, worker):
         or consumer["input_artifact"]["artifact_id"] != origin["input_artifact_id"]
         or consumer["input_artifact"]["artifact_sha256"] != origin["input_artifact_sha256"]):
         raise RuntimeError("Qualification receipt does not bind the exact consumer job and artifacts")
+    production = ci.get("production_origin")
+    if production:
+        from retry import verify_production_origin
+        records = verify_production_origin(production, worker=worker, fetch=api)
+        if (consumer.get("production_origin") != production
+                or production["input_artifact"]["id"] != origin["input_artifact_id"]
+                or production["input_artifact"]["digest"] != "sha256:" + origin["input_artifact_sha256"]
+                or production["product_artifact"]["id"] != ci["artifact_id"]
+                or production["product_artifact"]["digest"] != "sha256:" + ci["artifact_sha256"]):
+            raise RuntimeError("Qualification receipt has a different original producer")
+        validation = consumer.get("validation_artifact") or {}
+        artifact_binding(api("repos/" + worker + "/actions/artifacts/" + str(validation["artifact_id"])),
+            validation["artifact_id"], "cm-linux-x64-validation-inputs-" + origin["request_id"] + "-" + str(origin["run_attempt"]),
+            validation["artifact_sha256"], origin["run_id"])
+        assert records["input_artifact"]["id"] == origin["input_artifact_id"]
+    else:
+        record = api("repos/" + worker + "/actions/artifacts/" + str(origin["input_artifact_id"]))
+        artifact_binding(record, origin["input_artifact_id"], "cm-linux-x64-runtime-inputs-" + origin["request_id"] + "-" + str(origin["run_attempt"]),
+                         origin["input_artifact_sha256"], origin["run_id"])
     return ci
 
 
@@ -209,7 +232,12 @@ def restore_origin():
         "GITHUB_REPOSITORY": worker, "GITHUB_WORKFLOW_SHA": origin["workflow_sha"],
         "GITHUB_RUN_ID": str(origin["run_id"]), "GITHUB_RUN_ATTEMPT": str(origin["run_attempt"]),
         "CM_REQUEST_ID": origin["request_id"]}
-    if (producer["provenance"] != expected_provenance or producer["task_id"] != "CM-M05"
+    production = ci.get("production_origin")
+    input_provenance = ({**expected_provenance, "CM_SOURCE_SHA": production["source_sha"],
+        "GITHUB_WORKFLOW_SHA": production["workflow_sha"], "GITHUB_RUN_ID": str(production["run_id"]),
+        "GITHUB_RUN_ATTEMPT": str(production["run_attempt"]), "CM_REQUEST_ID": production["request_id"]}
+        if production else expected_provenance)
+    if (producer["provenance"] != input_provenance or producer["task_id"] != "CM-M05"
         or producer["m05"]["build_kind"] != "qualification"):
         raise RuntimeError("Frozen producer inputs are not the declared M05 qualification")
     reports = ("author-to-user-workflow.json", "source-only-authoring.json", "runtime-author-diagnostics.json",
@@ -227,6 +255,8 @@ def restore_origin():
                 or report.get("host") != producer["host"] or report.get("consumer_cache_mode") != "none"
                 or report.get("outer_audit", {}).get("compiler_linker_jit_build_service_calls") != 0):
                 raise RuntimeError("Qualification behavior report has a different Host or execution origin")
+            if production and report.get("production_origin") != production:
+                raise RuntimeError("Qualification behavior report has a different frozen producer origin")
     binary = destination / "host/bin/codex"
     with binary.open("rb") as stream:
         actual = hashlib.file_digest(stream, "sha256").hexdigest()
@@ -466,7 +496,6 @@ def self_check():
         "artifact_id": 21, "artifact_sha256": "c" * 64,
         "input_artifact": {"artifact_id": 20, "artifact_sha256": "c" * 64}}
     receipt = {"ci": ci, "consumer": consumer}
-    assert qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64") == ci
     for section, key, value in (("ci", "job_id", 999), ("ci", "cache_repository", "DSLZL/CM"),
                                 ("consumer", "job_id", 999), ("consumer", "cache_mode", "read"),
                                 ("consumer", "source_sha", "f" * 40), ("consumer", "producer_job_id", 999)):
@@ -483,12 +512,14 @@ def self_check():
             "id": identifier, "name": name + "cm-fixture-origin-1", "digest": "sha256:" + "c" * 64,
             "expired": False, "workflow_run": {"id": 12}}
     with patch.dict(os.environ, {"CM_SOURCE_SHA": "e" * 40}), patch(__name__ + ".api", side_effect=responses.__getitem__):
+        assert qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64") == ci
         assert verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)["run"] == run
         for key, value in (("run_attempt", 2), ("conclusion", "failure"), ("head_sha", "f" * 40)):
             changed = {**responses, run_path: {**run, key: value}}
             with patch(__name__ + ".api", side_effect=changed.__getitem__):
                 try:
                     verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)
+                    qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64")
                 except RuntimeError:
                     pass
                 else:
@@ -509,10 +540,40 @@ def self_check():
             with patch(__name__ + ".api", side_effect=changed.__getitem__):
                 try:
                     verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)
+                    qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64")
                 except RuntimeError:
                     pass
                 else:
                     raise AssertionError("Invalid qualification artifact or job accepted")
+    production = {"run_id": 11, "run_attempt": 1, "source_sha": "9" * 40, "workflow_sha": "8" * 40,
+        "request_id": "cm-original-producer", "job": "build-write / linux-x64", "job_id": 19}
+    reused_responses = json.loads(json.dumps(responses))
+    for key, identifier, name in (("input_artifact", 20, "runtime-inputs"), ("product_artifact", 23, "task-artifacts")):
+        record = {"id": identifier, "name": "cm-linux-x64-" + name + "-cm-original-producer-1",
+            "digest": "sha256:" + "c" * 64, "size_in_bytes": 1, "expired": False, "workflow_run": {"id": 11}}
+        reused_responses["repos/DSLZL/CM-build-linux-x64/actions/artifacts/" + str(identifier)] = record
+        production[key] = {key: record[key] for key in ("id", "name", "digest", "size_in_bytes")}
+    reused_responses["repos/DSLZL/CM-build-linux-x64/actions/runs/11"] = {
+        **run, "id": 11, "head_sha": "8" * 40, "display_title": "CM Linux x64 / cm-original-producer"}
+    reused_responses["repos/DSLZL/CM-build-linux-x64/actions/runs/11/attempts/1/jobs?per_page=100"] = {
+        "jobs": [{"id": 19, "name": "build-write / linux-x64", "conclusion": "success"}]}
+    reused_responses["repos/DSLZL/CM-build-linux-x64/actions/artifacts/24"] = {
+        "id": 24, "name": "cm-linux-x64-validation-inputs-cm-fixture-origin-1", "digest": "sha256:" + "c" * 64,
+        "expired": False, "workflow_run": {"id": 12}}
+    reused_receipt = {"ci": {**ci, "artifact_id": 23, "artifact_sha256": "c" * 64, "production_origin": production},
+        "consumer": {**consumer, "production_origin": production,
+            "validation_artifact": {"artifact_id": 24, "artifact_sha256": "c" * 64}}}
+    with patch.dict(os.environ, {"CM_SOURCE_SHA": "e" * 40}), patch(__name__ + ".api", side_effect=reused_responses.__getitem__):
+        assert verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)["run"] == run
+        assert qualification_receipt(reused_receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64") == reused_receipt["ci"]
+        for key, value in (("production_origin", {}), ("validation_artifact", {"artifact_id": 24, "artifact_sha256": "f" * 64})):
+            changed = {**reused_receipt, "consumer": {**reused_receipt["consumer"], key: value}}
+            try:
+                qualification_receipt(changed, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64")
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Reused qualification accepted mismatched producer or current validation")
     for conclusion in ("skipped", "failure", None):
         invalid.append(lambda conclusion=conclusion: successful_job([{"id": 3, "name": "consumer", "conclusion": conclusion}], "consumer"))
     invalid.extend([lambda: successful_job([], "consumer"),
