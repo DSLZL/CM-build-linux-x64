@@ -151,6 +151,7 @@ jobs:
         if: inputs.consumer_required && inputs.build_kind == 'qualification'
         run: |
           python3 -B ci/scripts/retry.py self-check
+          python3 -B ci/scripts/mod_author.py self-check
           python3 -B ci/scripts/turn_budget.py self-check
       - name: Restore the qualified legacy Host reference for metadata rejection
         if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
