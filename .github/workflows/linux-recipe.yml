@@ -42,6 +42,12 @@ on:
         value: ${{ jobs.linux-x64.outputs.input_artifact_id }}
       input_artifact_digest:
         value: ${{ jobs.linux-x64.outputs.input_artifact_digest }}
+      production_origin:
+        value: ${{ jobs.linux-x64.outputs.production_origin }}
+      validation_artifact_id:
+        value: ${{ jobs.linux-x64.outputs.validation_artifact_id }}
+      validation_artifact_digest:
+        value: ${{ jobs.linux-x64.outputs.validation_artifact_digest }}
 
 permissions:
   contents: read
@@ -57,10 +63,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     outputs:
-      artifact_id: ${{ steps.payload.outputs.artifact-id }}
-      artifact_digest: ${{ steps.payload.outputs.artifact-digest }}
-      input_artifact_id: ${{ steps.runtime-inputs.outputs.artifact-id }}
-      input_artifact_digest: ${{ steps.runtime-inputs.outputs.artifact-digest }}
+      artifact_id: ${{ steps.reuse.outputs.artifact_id || steps.payload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.reuse.outputs.artifact_digest || steps.payload.outputs.artifact-digest }}
+      input_artifact_id: ${{ steps.reuse.outputs.input_artifact_id || steps.runtime-inputs.outputs.artifact-id }}
+      input_artifact_digest: ${{ steps.reuse.outputs.input_artifact_digest || steps.runtime-inputs.outputs.artifact-digest }}
+      production_origin: ${{ steps.validation.outputs.production_origin }}
+      validation_artifact_id: ${{ steps.validation-upload.outputs.artifact-id }}
+      validation_artifact_digest: ${{ steps.validation-upload.outputs.artifact-digest }}
     env:
       CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
       CM_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
@@ -109,6 +118,8 @@ jobs:
             echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-linux-x64-artifacts"
             echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-inputs"
             echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer"
+            echo "CM_VALIDATION_INPUT_DIR=$RUNNER_TEMP/cm-validation-inputs"
+            echo "CM_WORKER_POLICY_DIR=$GITHUB_WORKSPACE/.cm-worker/.github/scripts"
           } >> "$GITHUB_ENV"
       - name: Verify source SHA and platform-enforced cache authority
         id: policy
@@ -117,6 +128,11 @@ jobs:
           CM_POLICY_TOKEN: ${{ github.token }}
       - name: Record source identity separately from worker identity
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
+      - name: Reuse exact completed producer before installing or compiling
+        id: reuse
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/retry.py" plan
       - name: Restore exact successful qualification without executing requested source
         if: inputs.build_kind == 'mod-only'
         env:
@@ -126,37 +142,39 @@ jobs:
         if: inputs.build_kind == 'mod-only'
         run: python3 -B ci/scripts/mod_author.py configure
       - name: Materialize exact upstream and the reviewed Host overlay
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/host.py prepare 2>&1 | tee "$CM_CI_LOG_DIR/host-prepare.log"
       - name: Require real current-task mappings
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/linux_ci.py configure 2>&1 | tee "$CM_CI_LOG_DIR/configure.log"
       - name: Install exact reviewed Rust toolchain on the worker
+        if: steps.reuse.outputs.reused != 'true'
         run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
       - name: Enable upstream-required user namespaces on this ephemeral CI runner
+        if: steps.reuse.outputs.reused != 'true'
         run: |
           sudo sysctl -w kernel.unprivileged_userns_clone=1 | tee "$CM_CI_LOG_DIR/userns-setup.log"
           if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 | tee -a "$CM_CI_LOG_DIR/userns-setup.log"
           fi
       - name: Install required Linux native dependencies
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev libssl-dev bubblewrap
           python3 -B ci/scripts/host.py native 2>&1 | tee "$CM_CI_LOG_DIR/native-inputs.log"
       - name: Install pinned sccache
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
           disable_annotations: true
       - name: Identify compatible cache namespace inside this builder repository
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: cache-identity
         run: python3 -B ci/scripts/linux_ci.py identity 2>&1 | tee "$CM_CI_LOG_DIR/cache-identity.log"
       - name: Restore this worker repository's Cargo downloads
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -168,7 +186,7 @@ jobs:
           restore-keys: ${{ steps.cache-identity.outputs.cargo_prefix }}
           enableCrossOsArchive: false
       - name: Restore this worker repository's sccache snapshot
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: sccache-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -179,38 +197,38 @@ jobs:
             ${{ steps.cache-identity.outputs.sccache_legacy_prefix }}
           enableCrossOsArchive: false
       - name: Start sccache after restoring its worker-local snapshot
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: sccache-start
         run: |
           sccache --start-server 2>&1 | tee "$CM_CI_LOG_DIR/sccache-start.log"
           sccache --zero-stats
           sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-restored.json"
       - name: Fetch locked dependencies
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/linux_ci.py fetch
       - name: Build and bind the bundled sandbox helper before Host compilation
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: |
           python3 -B ci/scripts/host.py helper
           sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-helper.json"
       - name: Seal complete Host inputs and the compiled helper digest
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: host-identity
         run: python3 -B ci/scripts/host.py seal 2>&1 | tee "$CM_CI_LOG_DIR/host-seal.log"
       - name: Check consumer observer before Host compilation
         if: inputs.consumer_required
         run: python3 -B ci/scripts/runtime_consumer.py self-check
       - name: Check Host canonicalization and rejection before compiling
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B fixtures/host-baseline/test_identity.py 2>&1 | tee "$CM_CI_LOG_DIR/host-identity-tests.log"
       - name: Seal exact acceptance compilation inputs and recipes
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: acceptance-identity
         run: |
           python3 -B ci/scripts/acceptance_cache.py self-check
           python3 -B ci/scripts/acceptance_cache.py identity
       - name: Restore linked acceptance executables and original build checks
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: acceptance-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -218,10 +236,10 @@ jobs:
           key: ${{ steps.acceptance-identity.outputs.acceptance_key }}
           enableCrossOsArchive: false
       - name: Verify acceptance executable bytes inputs and original producer
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/acceptance_cache.py restore
       - name: Restore exact product-input Host binaries and original build evidence
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: host-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -229,16 +247,16 @@ jobs:
           key: ${{ steps.host-identity.outputs.host_key }}
           enableCrossOsArchive: false
       - name: Verify restored Host bytes identity and original producer
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/host.py cache-restore
       - name: Check test and build only mapped current-task packages
         id: host-quality
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: |
           python3 -B ci/scripts/linux_ci.py build-test
           sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-host.json"
       - name: Run actual acceptance for the current mapped task
-        if: inputs.build_kind == 'qualification'
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/linux_ci.py acceptance
       - name: Build only the current author Mod with actual compiler execution evidence
         if: inputs.build_kind == 'mod-only'
@@ -280,7 +298,7 @@ jobs:
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/record_run.py" "$CM_CI_LOG_DIR"
       - name: Upload actual current-task artifacts
         id: payload
-        if: ${{ success() }}
+        if: ${{ success() && steps.reuse.outputs.reused != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cm-linux-x64-task-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
@@ -289,7 +307,7 @@ jobs:
           retention-days: 14
       - name: Upload exact frozen runtime inputs for the separate consumer
         id: runtime-inputs
-        if: ${{ success() && inputs.consumer_required }}
+        if: ${{ success() && inputs.consumer_required && steps.reuse.outputs.reused != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cm-linux-x64-runtime-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
@@ -297,8 +315,25 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
+      - name: Prepare current tests separately from the original frozen product
+        if: inputs.consumer_required
+        id: validation
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+          CM_CURRENT_ARTIFACT_ID: ${{ steps.payload.outputs.artifact-id }}
+          CM_CURRENT_INPUT_ARTIFACT_ID: ${{ steps.runtime-inputs.outputs.artifact-id }}
+        run: python3 -B ci/scripts/retry.py overlay
+      - name: Upload only current runtime tests and exact origin references
+        if: inputs.consumer_required
+        id: validation-upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-validation-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_VALIDATION_INPUT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
       - name: Save successful trusted source Cargo downloads
-        if: ${{ success() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        if: ${{ success() && steps.reuse.outputs.reused != 'true' && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

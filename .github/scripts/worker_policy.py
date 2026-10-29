@@ -307,13 +307,39 @@ def verify_consumer():
     artifact_id = int(os.environ["CM_INPUT_ARTIFACT_ID"])
     digest = checked(os.environ["CM_INPUT_ARTIFACT_DIGEST"].removeprefix("sha256:"), r"[0-9a-f]{64}", "input artifact digest")
     artifact = api("repos/" + worker + "/actions/artifacts/" + str(artifact_id))
-    expected_name = "cm-linux-x64-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
-    artifact_binding(artifact, artifact_id, expected_name, digest, int(os.environ["GITHUB_RUN_ID"]))
-    output({"input_artifact_name": expected_name})
+    origin = production_origin()
+    input_run = origin["run_id"] if origin else int(os.environ["GITHUB_RUN_ID"])
+    expected_name = origin["input_artifact"]["name"] if origin else "cm-linux-x64-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    artifact_binding(artifact, artifact_id, expected_name, digest, input_run)
+    if origin and (artifact_id != origin["input_artifact"]["id"] or "sha256:" + digest != origin["input_artifact"]["digest"]):
+        raise RuntimeError("Consumer input differs from the verified producer origin")
+    validation = validation_artifact()
+    output({"input_artifact_name": expected_name, "input_run_id": input_run,
+            "validation_artifact_name": validation["artifact_name"]})
     path = Path(os.environ["CM_CI_LOG_DIR"])
     path.mkdir(parents=True, exist_ok=True)
     (path / "consumer-input-artifact.json").write_text(json.dumps({"artifact": artifact, "source_sha": sha,
-        "workflow_sha": workflow_sha, "source_repository": source, "cache_mode": "none", "request_id": request}, indent=2) + "\n")
+        "workflow_sha": workflow_sha, "source_repository": source, "cache_mode": "none", "request_id": request,
+        "production_origin": origin, "validation_artifact": validation}, indent=2) + "\n")
+
+
+def production_origin():
+    value = os.environ.get("CM_PRODUCTION_ORIGIN")
+    if not value:
+        return None
+    origin = json.loads(value)
+    from retry import verify_production_origin
+    verify_production_origin(origin)
+    return origin
+
+
+def validation_artifact():
+    _, worker, _, _, request = identities()
+    artifact_id = int(os.environ["CM_VALIDATION_ARTIFACT_ID"])
+    digest = os.environ["CM_VALIDATION_ARTIFACT_DIGEST"].removeprefix("sha256:")
+    name = "cm-linux-x64-validation-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    return artifact_binding(api("repos/" + worker + "/actions/artifacts/" + str(artifact_id)),
+                            artifact_id, name, digest, int(os.environ["GITHUB_RUN_ID"]))
 
 
 def artifact_binding(record, artifact_id, name, digest, run_id):
@@ -534,9 +560,12 @@ def receipt():
         raise RuntimeError("Actual upload artifact ID is required")
     digest = os.environ["CM_ARTIFACT_DIGEST"].removeprefix("sha256:")
     checked(digest, r"[0-9a-f]{64}", "actual upload artifact digest")
-    artifact_name = "cm-linux-x64-task-artifacts-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    origin = production_origin()
+    artifact_name = origin["product_artifact"]["name"] if origin else "cm-linux-x64-task-artifacts-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     actual = api("repos/" + worker + "/actions/artifacts/" + str(artifact_id))
-    artifact_binding(actual, artifact_id, artifact_name, digest, int(os.environ["GITHUB_RUN_ID"]))
+    artifact_binding(actual, artifact_id, artifact_name, digest, origin["run_id"] if origin else int(os.environ["GITHUB_RUN_ID"]))
+    if origin and (artifact_id != origin["product_artifact"]["id"] or "sha256:" + digest != origin["product_artifact"]["digest"]):
+        raise RuntimeError("Receipt product differs from the verified producer origin")
     names = [os.environ["CM_BUILD_JOB"]]
     if os.environ.get("CM_CONSUMER_REQUIRED") == "true":
         names.append("runtime-consumer")
@@ -551,7 +580,8 @@ def receipt():
           "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": "X64",
           "build_kind": build_request()[0],
           "target": TARGET, "conclusion": None, "artifact_name": artifact_name,
-          "artifact_id": artifact_id, "artifact_sha256": digest, **producer_job}
+          "artifact_id": artifact_id, "artifact_sha256": digest, **producer_job,
+          "production_origin": origin}
     consumer = None
     if os.environ.get("CM_CONSUMER_REQUIRED") == "true":
         consumer_id = int(os.environ["CM_CONSUMER_ARTIFACT_ID"])
@@ -562,14 +592,15 @@ def receipt():
         actual_job = successful_job(jobs, "runtime-consumer")
         input_id = int(os.environ["CM_INPUT_ARTIFACT_ID"])
         input_digest = os.environ["CM_INPUT_ARTIFACT_DIGEST"].removeprefix("sha256:")
-        input_name = "cm-linux-x64-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        input_name = origin["input_artifact"]["name"] if origin else "cm-linux-x64-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
         input_record = api("repos/" + worker + "/actions/artifacts/" + str(input_id))
-        inputs = artifact_binding(input_record, input_id, input_name, input_digest, int(os.environ["GITHUB_RUN_ID"]))
+        inputs = artifact_binding(input_record, input_id, input_name, input_digest, origin["run_id"] if origin else int(os.environ["GITHUB_RUN_ID"]))
         consumer = {"execution_role": "runtime_consumer", "cache_mode": "none", "job": "runtime-consumer",
             **actual_job, "producer_job_id": producer_job["job_id"], "input_artifact": inputs,
             "artifact_id": consumer_id, "artifact_name": consumer_name,
             "artifact_sha256": consumer_digest, "source_sha": sha, "workflow_sha": workflow_sha,
-            "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "request_id": request}
+            "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "request_id": request,
+            "production_origin": origin, "validation_artifact": validation_artifact()}
     out = Path(os.environ["RUNNER_TEMP"], "cm-worker-receipt")
     out.mkdir(exist_ok=True)
     (out / "worker-receipt.json").write_text(json.dumps({"schema_version": 1, "ci": ci, "consumer": consumer,

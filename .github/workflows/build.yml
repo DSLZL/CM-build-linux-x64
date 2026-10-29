@@ -127,6 +127,9 @@ jobs:
       CM_REQUEST_ID: ${{ inputs.request_id }}
       CM_EXECUTION_ROLE: runtime_consumer
       CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
+      CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
+      CM_VALIDATION_ARTIFACT_ID: ${{ needs.build-read.outputs.validation_artifact_id || needs.build-write.outputs.validation_artifact_id }}
+      CM_VALIDATION_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.validation_artifact_digest || needs.build-write.outputs.validation_artifact_digest }}
       CM_CACHE_MODE: none
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -143,6 +146,9 @@ jobs:
           echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer" >> "$GITHUB_ENV"
           echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-runtime-evidence" >> "$GITHUB_ENV"
           echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-runtime-artifacts" >> "$GITHUB_ENV"
+          echo "CM_VALIDATION_INPUT_DIR=$RUNNER_TEMP/cm-validation-inputs" >> "$GITHUB_ENV"
+          echo "CM_RUNTIME_CHECKPOINT_DIR=$RUNNER_TEMP/cm-runtime-checkpoints" >> "$GITHUB_ENV"
+          echo "CM_WORKER_POLICY_DIR=$GITHUB_WORKSPACE/.github/scripts" >> "$GITHUB_ENV"
       - name: Verify and export runner-injected cache-none authority
         uses: ./.github/actions/cache-authority
       - name: Verify exact producer artifact and actual cache-none authority
@@ -154,13 +160,18 @@ jobs:
         run: /usr/bin/python3 -B .github/scripts/worker_policy.py verify-consumer
       - name: Record independent consumer without a product source checkout
         run: /usr/bin/python3 -B .github/scripts/record_run.py "$CM_CI_LOG_DIR"
-      - name: Download the verified same-run producer handoff
+      - name: Download original frozen inputs and the current small test overlay
         env:
           GH_TOKEN: ${{ github.token }}
           CM_INPUT_ARTIFACT_NAME: ${{ steps.input.outputs.input_artifact_name }}
+          CM_INPUT_RUN_ID: ${{ steps.input.outputs.input_run_id }}
+          CM_VALIDATION_ARTIFACT_NAME: ${{ steps.input.outputs.validation_artifact_name }}
+          CM_POLICY_TOKEN: ${{ github.token }}
         run: |
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_INPUT_ARTIFACT_NAME" --dir "$CM_CONSUMER_TRANSFER_DIR"
+          gh run download "$CM_INPUT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_INPUT_ARTIFACT_NAME" --dir "$CM_CONSUMER_TRANSFER_DIR"
           /usr/bin/python3 -B .github/scripts/worker_policy.py extract-consumer
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_VALIDATION_ARTIFACT_NAME" --dir "$CM_VALIDATION_INPUT_DIR"
+          /usr/bin/python3 -B "$CM_VALIDATION_INPUT_DIR/retry.py" refresh
       - name: Prepare observation tools and user namespaces before consumption
         run: |
           sudo apt-get update
@@ -187,6 +198,14 @@ jobs:
           name: cm-linux-x64-consumer-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_LOG_DIR }}
           if-no-files-found: error
+          retention-days: 14
+      - name: Retain independently audited passed steps even when another step fails
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-consumer-checkpoints-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_RUNTIME_CHECKPOINT_DIR }}
+          if-no-files-found: warn
           retention-days: 14
 
   receipt:
@@ -216,6 +235,9 @@ jobs:
           CM_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.artifact_digest || needs.build-write.outputs.artifact_digest }}
           CM_BUILD_JOB: ${{ needs.build-read.result == 'success' && 'build-read / linux-x64' || 'build-write / linux-x64' }}
           CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
+          CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
+          CM_VALIDATION_ARTIFACT_ID: ${{ needs.build-read.outputs.validation_artifact_id || needs.build-write.outputs.validation_artifact_id }}
+          CM_VALIDATION_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.validation_artifact_digest || needs.build-write.outputs.validation_artifact_digest }}
           CM_HOST_ORIGIN: ${{ inputs.host_origin }}
           CM_CONSUMER_REQUIRED: ${{ needs.preflight.outputs.consumer_required }}
           CM_CONSUMER_ARTIFACT_ID: ${{ needs.runtime-consumer.outputs.artifact_id }}
