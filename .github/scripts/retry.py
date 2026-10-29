@@ -164,14 +164,14 @@ def small_archive(worker, record, destination):
 def select(root, logs):
     p = policy()
     source_repo, worker, sha, workflow_sha, request = p.identities()
+    kind, host_origin = p.build_request()
     plan = {"status": "miss", "production_inputs_sha256": digest(product_inputs(root, "HEAD")),
-            "environment": environment(), "reason": "No compatible completed producer"}
+            "environment": environment(), "build_request": {"kind": kind, "host_origin": host_origin},
+            "reason": "No compatible completed producer"}
     explicit = os.environ.get("CM_REUSE_RUN_ID", "")
     if explicit and not re.fullmatch(r"[1-9][0-9]*", explicit):
         raise RuntimeError("Invalid explicit reuse run ID")
-    if os.environ.get("CM_BUILD_KIND") != "qualification":
-        candidates = []
-    elif explicit:
+    if explicit:
         candidates = [p.api("repos/" + worker + "/actions/runs/" + explicit)]
     else:
         candidates = p.api("repos/" + worker + "/actions/workflows/build.yml/runs?event=workflow_dispatch&per_page=12")["workflow_runs"]
@@ -213,7 +213,12 @@ def select(root, logs):
             git(root, "merge-base", "--is-ancestor", origin["source_sha"], "HEAD")
             if p.api("repos/" + worker + "/compare/" + origin["workflow_sha"] + "..." + workflow_sha).get("status") not in ("ahead", "identical"):
                 continue
-            verify_production_origin(origin)
+            verified = verify_production_origin(origin)
+            previous_request = old.get("build_request") if indexes else None
+            if previous_request is None:
+                previous_request = legacy_request(producers[0], worker, verified["product_artifact"])
+            if previous_request != plan["build_request"]:
+                continue
             resume = [a for a in records if a["name"].startswith("cm-linux-x64-consumer-checkpoints-") and not a["expired"]]
             plan.update(status="hit", reason="Exact production inputs and runner image unchanged", production_origin=origin,
                         checkpoint_origin={"run_id": run["id"], "run_attempt": run["run_attempt"],
@@ -238,6 +243,23 @@ def select(root, logs):
                        production_origin=json.dumps(origin, separators=(",", ":")))
     p.output(outputs)
     print("CM producer reuse:", plan["status"], plan["reason"], flush=True)
+
+
+def legacy_request(producer, worker, artifact):
+    steps = [step for step in producer.get("steps", ())
+             if step["name"] == "Restore exact successful qualification without executing requested source"]
+    if len(steps) != 1:
+        raise RuntimeError("Legacy producer build kind is unbound")
+    if steps[0]["conclusion"] == "skipped":
+        return {"kind": "qualification", "host_origin": None}
+    if steps[0]["conclusion"] != "success":
+        raise RuntimeError("Legacy Mod-only origin restoration did not pass")
+    with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+        with small_archive(worker, artifact, Path(directory) / "author.zip") as archive:
+            receipt = policy().archive_json(archive, "author-receipt.json")
+    if receipt["build_kind"] != "mod-only" or receipt["host_origin"].get("verified") is not True:
+        raise RuntimeError("Legacy Mod-only producer origin is unverified")
+    return {"kind": "mod-only", "host_origin": policy().parse_origin(receipt["host_origin"]["origin"])}
 
 
 def verify_production_origin(origin, *, worker=None, fetch=None):
@@ -301,6 +323,7 @@ def overlay(root, logs):
     baseline = plan.get("checkpoint_origin")
     write(destination / "validation.json", {"schema_version": 1, "provenance": runtime_consumer.provenance(),
         "environment": environment(), "production_inputs_sha256": plan["production_inputs_sha256"],
+        "build_request": plan["build_request"],
         "production_origin": origin, "checkpoint_origin": baseline,
         "test_inputs": test_inputs(root, "HEAD"),
         "baseline_test_inputs": test_inputs(root, baseline["source_sha"]) if baseline else {},
@@ -525,7 +548,43 @@ def self_check():
             "CM_SOURCE_SHA": git(root, "rev-parse", "HEAD").decode().strip(), "CM_REQUEST_ID": "retry-self-check"}):
         checkpoint_self_check()
     origin_self_check()
+    request_self_check()
     print("CM retry input/dependency/environment self-checks passed", flush=True)
+
+
+def request_self_check():
+    from contextlib import nullcontext
+    from unittest.mock import patch
+    p = policy()
+    host = {"run_id": 10, "run_attempt": 1, "source_sha": "a" * 40,
+            "workflow_sha": "b" * 40, "request_id": "request-self-check"}
+    for number, prefix in enumerate(("input", "consumer", "receipt"), 1):
+        host.update({prefix + "_artifact_id": number, prefix + "_artifact_sha256": "c" * 64})
+    producer = {"steps": [{"name": "Restore exact successful qualification without executing requested source",
+                           "conclusion": "skipped"}]}
+    with patch(__name__ + ".small_archive", return_value=nullcontext(None)) as download:
+        qualification = legacy_request(producer, "worker", {})
+        assert qualification == {"kind": "qualification", "host_origin": None} and not download.called
+        producer["steps"][0]["conclusion"] = "success"
+        receipt = {"build_kind": "mod-only", "host_origin": {"verified": True, "origin": host}}
+        with patch.object(p, "archive_json", return_value=receipt):
+            mod = legacy_request(producer, "worker", {})
+            assert mod == {"kind": "mod-only", "host_origin": host} and mod != qualification
+            assert mod != {**mod, "host_origin": {**host, "run_id": 11}}
+            receipt["host_origin"]["verified"] = False
+            try:
+                legacy_request(producer, "worker", {})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Unverified Mod-only producer request accepted")
+    for steps in ([], [{**producer["steps"][0], "conclusion": "failure"}]):
+        try:
+            legacy_request({"steps": steps}, "worker", {})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Missing or failed legacy producer kind accepted")
 
 
 def checkpoint_self_check():

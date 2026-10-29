@@ -134,12 +134,12 @@ jobs:
           CM_POLICY_TOKEN: ${{ github.token }}
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/retry.py" plan
       - name: Restore exact successful qualification without executing requested source
-        if: inputs.build_kind == 'mod-only'
+        if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
         env:
           CM_POLICY_TOKEN: ${{ github.token }}
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/worker_policy.py" restore-origin
       - name: Configure the independent Mod-only toolchain
-        if: inputs.build_kind == 'mod-only'
+        if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/mod_author.py configure
       - name: Materialize exact upstream and the reviewed Host overlay
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
@@ -259,7 +259,7 @@ jobs:
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/linux_ci.py acceptance
       - name: Build only the current author Mod with actual compiler execution evidence
-        if: inputs.build_kind == 'mod-only'
+        if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential strace
