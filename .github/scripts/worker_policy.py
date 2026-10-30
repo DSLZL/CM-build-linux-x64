@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -30,8 +31,17 @@ def api(path):
     if os.environ.get("CM_POLICY_TOKEN"):
         headers["Authorization"] = "Bearer " + os.environ["CM_POLICY_TOKEN"]
     request = urllib.request.Request("https://api.github.com/" + path, headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code not in (502, 503, 504) or attempt == 2:
+                raise
+            error.close()
+            delay = 5 * (attempt + 1)
+            print(f"CM policy: GitHub API HTTP {error.code}; retry {attempt + 1}/2 in {delay}s", flush=True)
+            time.sleep(delay)
 
 
 def output(values):
@@ -440,8 +450,32 @@ def extract_consumer():
 
 def self_check():
     require_hosted_linux()
+    import io
     from unittest.mock import patch
 
+    unavailable = urllib.error.HTTPError("https://api.github.com/fixture", 502, "unavailable", {}, None)
+    with patch("urllib.request.urlopen", side_effect=[unavailable, io.BytesIO(b'{"ok": true}')]) as fetch, patch("time.sleep") as pause:
+        assert api("fixture") == {"ok": True}
+        assert fetch.call_count == 2
+        pause.assert_called_once_with(5)
+    for code, calls in ((403, 1), (404, 1), (429, 1), (502, 3), (503, 3), (504, 3)):
+        error = urllib.error.HTTPError("https://api.github.com/fixture", code, "rejected", {}, None)
+        with patch("urllib.request.urlopen", side_effect=error) as fetch, patch("time.sleep") as pause:
+            try:
+                api("fixture")
+            except urllib.error.HTTPError as actual:
+                assert actual.code == code
+            else:
+                raise AssertionError("GitHub API failure was accepted")
+            assert fetch.call_count == calls and pause.call_count == calls - 1
+    with patch("urllib.request.urlopen", return_value=io.BytesIO(b"not JSON")) as fetch, patch("time.sleep") as pause:
+        try:
+            api("fixture")
+        except json.JSONDecodeError:
+            pass
+        else:
+            raise AssertionError("Malformed GitHub response was accepted")
+        assert fetch.call_count == 1 and pause.call_count == 0
     record = {"id": 1, "name": "input", "digest": "sha256:" + "a" * 64,
               "expired": False, "workflow_run": {"id": 2}}
     assert artifact_binding(record, 1, "input", "a" * 64, 2)["artifact_id"] == 1
