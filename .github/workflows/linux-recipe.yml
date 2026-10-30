@@ -33,6 +33,9 @@ on:
       host_origin:
         required: false
         type: string
+      reuse_run_id:
+        required: false
+        type: string
     outputs:
       artifact_id:
         value: ${{ jobs.linux-x64.outputs.artifact_id }}
@@ -132,6 +135,7 @@ jobs:
         id: reuse
         env:
           CM_POLICY_TOKEN: ${{ github.token }}
+          CM_REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
         run: python3 -B "$GITHUB_WORKSPACE/.cm-worker/.github/scripts/retry.py" plan
       - name: Restore exact successful qualification without executing requested source
         if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'

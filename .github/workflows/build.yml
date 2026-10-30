@@ -28,6 +28,10 @@ on:
         description: Exact successful qualification origin JSON for mod-only
         required: false
         type: string
+      reuse_run_id:
+        description: Require this completed producer run; fail if its frozen products cannot be reused
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -87,6 +91,7 @@ jobs:
       cache_mode: read
       build_kind: ${{ needs.preflight.outputs.build_kind }}
       host_origin: ${{ inputs.host_origin }}
+      reuse_run_id: ${{ inputs.reuse_run_id }}
       consumer_required: ${{ needs.preflight.outputs.consumer_required == 'true' }}
 
   build-write:
@@ -103,6 +108,7 @@ jobs:
       cache_mode: write
       build_kind: ${{ needs.preflight.outputs.build_kind }}
       host_origin: ${{ inputs.host_origin }}
+      reuse_run_id: ${{ inputs.reuse_run_id }}
       consumer_required: ${{ needs.preflight.outputs.consumer_required == 'true' }}
 
   runtime-consumer:
