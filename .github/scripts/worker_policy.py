@@ -389,10 +389,11 @@ def successful_job(jobs, name):
     return {"job": name, "job_id": matches[0]["id"], "job_conclusion": "success"}
 
 
-def receipt_jobs(path, names):
+def receipt_jobs(path, names, *, fetch=None):
     # A dependent job can start before its predecessor is visible as completed in the API.
+    fetch = fetch or api
     for attempt in range(12):
-        jobs = api(path)["jobs"]
+        jobs = fetch(path)["jobs"]
         pending = any(not any(job.get("name") == name and job.get("status") == "completed"
                               for job in jobs) for name in names)
         if not pending:
@@ -556,7 +557,7 @@ def self_check():
     reused_responses["repos/DSLZL/CM-build-linux-x64/actions/runs/11"] = {
         **run, "id": 11, "head_sha": "8" * 40, "display_title": "CM Linux x64 / cm-original-producer"}
     reused_responses["repos/DSLZL/CM-build-linux-x64/actions/runs/11/attempts/1/jobs?per_page=100"] = {
-        "jobs": [{"id": 19, "name": "build-write / linux-x64", "conclusion": "success"}]}
+        "jobs": [{"id": 19, "name": "build-write / linux-x64", "status": "completed", "conclusion": "success"}]}
     reused_responses["repos/DSLZL/CM-build-linux-x64/actions/artifacts/24"] = {
         "id": 24, "name": "cm-linux-x64-validation-inputs-cm-fixture-origin-1", "digest": "sha256:" + "c" * 64,
         "expired": False, "workflow_run": {"id": 12}}

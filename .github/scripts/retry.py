@@ -297,7 +297,8 @@ def verify_production_origin(origin, *, worker=None, fetch=None):
     run = fetch("repos/" + worker + "/actions/runs/" + str(run_id))
     if run["run_attempt"] != origin["run_attempt"] or run["head_sha"] != origin["workflow_sha"] or run["event"] != "workflow_dispatch" or run["path"] != ".github/workflows/build.yml" or run["display_title"] != "CM Linux x64 / " + origin["request_id"]:
         raise RuntimeError("Producer origin run/attempt/workflow/request changed")
-    jobs = fetch("repos/" + worker + "/actions/runs/" + str(run_id) + "/attempts/" + str(origin["run_attempt"]) + "/jobs?per_page=100")["jobs"]
+    jobs_path = "repos/" + worker + "/actions/runs/" + str(run_id) + "/attempts/" + str(origin["run_attempt"]) + "/jobs?per_page=100"
+    jobs = p.receipt_jobs(jobs_path, (origin["job"],), fetch=fetch)
     job = p.successful_job(jobs, origin["job"])
     if job["job_id"] != origin["job_id"]:
         raise RuntimeError("Producer origin job changed")
@@ -716,17 +717,38 @@ def origin_self_check():
 
     def api(path):
         if path.endswith("/jobs?per_page=100"):
-            return {"jobs": [{"name": origin["job"], "id": 20, "conclusion": "success"}]}
+            return {"jobs": [{"name": origin["job"], "id": 20, "status": "completed", "conclusion": "success"}]}
         if "/actions/artifacts/" in path:
             return records[int(path.rsplit("/", 1)[1])]
         return {"run_attempt": 1, "head_sha": "b" * 40, "event": "workflow_dispatch",
                 "path": ".github/workflows/build.yml", "display_title": "CM Linux x64 / retry-self-check"}
 
     stub = SimpleNamespace(identities=lambda: ("DSLZL/CM", "DSLZL/CM-build-linux-x64", "a" * 40, "b" * 40, "retry-self-check"),
-                           api=api, successful_job=p.successful_job)
+                           api=api, successful_job=p.successful_job, receipt_jobs=p.receipt_jobs)
     with patch(__name__ + ".policy", return_value=stub):
         verify_production_origin(origin)
         assert verify_production_origin(origin, worker="DSLZL/CM-build-linux-x64", fetch=api)["input_artifact"] == records[2]
+        jobs_path = "repos/DSLZL/CM-build-linux-x64/actions/runs/10/attempts/1/jobs?per_page=100"
+        pending = {"jobs": [{"name": origin["job"], "id": 20, "status": "in_progress", "conclusion": None}]}
+        with patch("time.sleep") as pause:
+            responses = iter((pending, api(jobs_path)))
+            def delayed(path):
+                return next(responses) if path == jobs_path else api(path)
+            assert verify_production_origin(origin, fetch=delayed)["input_artifact"] == records[2]
+            pause.assert_called_once_with(5)
+        for conclusion in ("failure", "cancelled", "skipped"):
+            def failed(path):
+                if path == jobs_path:
+                    return {"jobs": [{"name": origin["job"], "id": 20, "status": "completed", "conclusion": conclusion}]}
+                return api(path)
+            with patch("time.sleep") as pause:
+                try:
+                    verify_production_origin(origin, fetch=failed)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Failed producer origin accepted")
+                pause.assert_not_called()
         for key, value in (("expired", True), ("workflow_run", {"id": 11}), ("digest", "sha256:" + "d" * 64)):
             original = records[1][key]
             records[1][key] = value
