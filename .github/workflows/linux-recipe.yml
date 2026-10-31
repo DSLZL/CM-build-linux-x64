@@ -309,6 +309,23 @@ jobs:
           stop_status=$?
           cat "$CM_CI_LOG_DIR/sccache-stats.txt"
           if (( stats_status != 0 || json_status != 0 || stop_status != 0 )); then exit 1; fi
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+
+          stats = (Path(os.environ["CM_CI_LOG_DIR"]) / "sccache-stats.txt").read_text()
+          counters = {}
+          for label in ("Compilations", "Compilation failures", "Cache write errors"):
+              values = re.findall(rf"^{re.escape(label)}\s+(\d+)\s*$", stats, re.MULTILINE)
+              assert len(values) == 1, f"Expected exactly one sccache counter: {label}"
+              counters[label] = int(values[0])
+          assert counters["Compilations"] >= counters["Compilation failures"]
+          new_entries = counters["Compilations"] - counters["Compilation failures"] - counters["Cache write errors"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"has_new_entries={str(new_entries > 0).lower()}\n")
+          print(f"Successful new compiler cache entries: {max(0, new_entries)}")
+          PY
       - name: Record final identity and cache observations
         if: ${{ always() && steps.policy.outcome == 'success' }}
         env:
@@ -364,8 +381,8 @@ jobs:
             ${{ env.CARGO_HOME }}/git/db
           key: ${{ steps.cache-identity.outputs.cargo_key }}
           enableCrossOsArchive: false
-      - name: Save successful trusted source compiler snapshot
-        if: ${{ success() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cache-stop.outcome == 'success' && steps.sccache-cache.outputs.cache-hit != 'true' }}
+      - name: Save new successful compiler entries from this trusted source
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cache-stop.outcome == 'success' && steps.cache-stop.outputs.has_new_entries == 'true' && steps.sccache-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.SCCACHE_DIR }}
