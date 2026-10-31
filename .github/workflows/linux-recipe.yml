@@ -310,21 +310,16 @@ jobs:
           cat "$CM_CI_LOG_DIR/sccache-stats.txt"
           if (( stats_status != 0 || json_status != 0 || stop_status != 0 )); then exit 1; fi
           python3 - <<'PY'
+          import json
           import os
           from pathlib import Path
-          import re
 
-          stats = (Path(os.environ["CM_CI_LOG_DIR"]) / "sccache-stats.txt").read_text()
-          counters = {}
-          for label in ("Compilations", "Compilation failures", "Cache write errors"):
-              values = re.findall(rf"^{re.escape(label)}\s+(\d+)\s*$", stats, re.MULTILINE)
-              assert len(values) == 1, f"Expected exactly one sccache counter: {label}"
-              counters[label] = int(values[0])
-          assert counters["Compilations"] >= counters["Compilation failures"]
-          new_entries = counters["Compilations"] - counters["Compilation failures"] - counters["Cache write errors"]
+          stats = json.loads((Path(os.environ["CM_CI_LOG_DIR"]) / "sccache-stats.json").read_text())
+          new_entries = stats["stats"]["cache_writes"]
+          assert type(new_entries) is int and new_entries >= 0, "Invalid sccache cache_writes"
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"has_new_entries={str(new_entries > 0).lower()}\n")
-          print(f"Successful new compiler cache entries: {max(0, new_entries)}")
+          print(f"Successful new compiler cache entries: {new_entries}")
           PY
       - name: Record final identity and cache observations
         if: ${{ always() && steps.policy.outcome == 'success' }}
