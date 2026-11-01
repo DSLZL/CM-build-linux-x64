@@ -160,6 +160,7 @@ jobs:
           python3 -B ci/scripts/turn_budget.py self-check
           python3 -B ci/scripts/review_before_send.py self-check
           python3 -B ci/scripts/tool_concurrency.py self-check
+          python3 -B ci/scripts/runtime_qualification.py self-check
       - name: Restore the qualified legacy Host reference for metadata rejection
         if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         env:

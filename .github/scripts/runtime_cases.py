@@ -41,13 +41,15 @@ GROUPS = {
     "m03": ("install", "process", "terminal", "live", "rejections", "legacy", "writers", "backends"),
     "m04": ("query", "restart", "rollback", "interruption", "stdio", "terminal", "ownership"),
     "m05": ("update", "failures", "metadata", "commands"),
+    "g04": ("missing-bwrap", "missing-rg", "missing-code-mode", "missing-inventory", "damaged-package", "abi", "loader-environment", "missing-library"),
 }
 DRIVERS = {"p04": "fixtures/runtime-consumer/driver.py", "m01": "ci/scripts/mod_manifest.py",
            "m02": "fixtures/runtime-sdk/driver.py", "m03": "fixtures/managed-package/driver.py",
-           "m04": "fixtures/state/driver.py", "m05": "fixtures/mod-author/driver.py"}
+           "m04": "fixtures/state/driver.py", "m05": "fixtures/mod-author/driver.py",
+           "g04": "fixtures/runtime-qualification/driver.py"}
 MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
     ("mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
-     "turn_budget", "review_before_send", "tool_concurrency", "runtime_cases")},
+     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_cases")},
     "core": "fixtures/native-loader/core_acceptance.py", "core_acceptance": "fixtures/native-loader/core_acceptance.py",
     "tool_barrier": "fixtures/native-loader/tool_barrier.py"}
 DYNAMIC = {"sdk": DRIVERS["m02"], "m": DRIVERS["m03"], "packages": "ci/scripts/mod_manifest.py",
