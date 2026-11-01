@@ -1,5 +1,7 @@
 """Stable runtime transactions and their bounded Python dependency closure."""
 import ast
+from copy import deepcopy
+from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
@@ -137,6 +139,11 @@ class Business(ast.NodeTransformer):
     visit_AsyncFunctionDef = visit_FunctionDef
 
 
+@lru_cache(maxsize=64)
+def business_module(text):
+    return Business().visit(ast.parse(text))
+
+
 def bindings(module):
     result = {}
     for node in module.body:
@@ -164,8 +171,9 @@ def closure(texts, entries, dispatch=None):
                     and node.value.func.id == "globals"):
                 return ast.Name(id=self.function, ctx=ast.Load())
             return self.generic_visit(node)
-    modules = {path: Business().visit(ast.parse(text)) for path, text in texts.items()}
+    modules = {path: business_module(text) for path, text in texts.items()}
     for path, selected in dispatch.items():
+        modules[path] = deepcopy(modules[path])
         for node in modules[path].body:
             if isinstance(node, ast.FunctionDef) and node.name == "matrix":
                 Dispatch(selected).visit(node)
@@ -338,6 +346,8 @@ def self_check():
             [(controlled, "matrix")], {controlled: "case_zip"})
         assert selected == closure({controlled: texts[controlled].replace("return 0", "return 2")},
             [(controlled, "matrix")], {controlled: "case_zip"})
+        assert closure(texts, [(controlled, "matrix")], {controlled: "case_order"}) != selected
+        assert closure(texts, [(controlled, "matrix")], {controlled: "case_zip"}) == selected
     resource = EXECUTED_RESOURCES["tool_barrier.py"]
     texts = {"a.py": 'def entry():return Path("tool_barrier.py")\n', resource: 'print("tool protocol")\n'}
     selected = closure(texts, [("a.py", "entry")])
