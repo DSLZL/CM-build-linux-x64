@@ -978,12 +978,19 @@ def self_check():
     entry = "def case_query(m, sdk, frozen, authored):\n"
     assert state_text.count(entry) == 1
     changed_state = state_text.replace(entry, entry + '    assert False, "dependency self-check only"\n')
+    manifest_path = "ci/scripts/mod_manifest.py"
+    manifest_text = source(root, "HEAD", manifest_path)
+    zip_entry = "def case_zip(inputs, binary, evidence, work, case):\n"
+    assert manifest_text.count(zip_entry) == 1
+    changed_manifest = manifest_text.replace(zip_entry, zip_entry + '    assert False, "dependency self-check only"\n')
     original_source = source
     with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, path:
-            changed_state if path == state_path else original_source(directory, revision, path)):
+            changed_state if path == state_path else changed_manifest if path == manifest_path
+            else original_source(directory, revision, path)):
         changed = test_inputs(root, "HEAD")
     affected = {label for label in current if current[label] != changed[label]}
-    assert affected == {"m04-query"}, ("Private matrix case dependency leak", sorted(affected))
+    expected = {"m04-query", *("m01-zip-" + name for name in runtime_cases.ZIP_INVALID)}
+    assert affected == expected, ("Private matrix case dependency leak", sorted(affected))
     assert product_inputs(root, "HEAD")["files"]
     base = {"packages": {"libc6": "1"}, "files": [{"path": "usr/bin/python3", "sha256": "a"}, {"path": "fixture/test.py", "sha256": "a"}]}
     changed = json.loads(json.dumps(base))

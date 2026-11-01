@@ -158,10 +158,10 @@ def closure(texts, entries, dispatch=None):
     class Dispatch(ast.NodeTransformer):
         def __init__(self, function):
             self.function = function
-        def visit_Call(self, node):
-            if (isinstance(node.func, ast.Subscript) and isinstance(node.func.value, ast.Call)
-                    and isinstance(node.func.value.func, ast.Name) and node.func.value.func.id == "globals"):
-                node.func = ast.Name(id=self.function, ctx=ast.Load())
+        def visit_Subscript(self, node):
+            if (isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "globals"):
+                return ast.Name(id=self.function, ctx=ast.Load())
             return self.generic_visit(node)
     modules = {path: Business().visit(ast.parse(text)) for path, text in texts.items()}
     for path, selected in dispatch.items():
@@ -324,6 +324,16 @@ def self_check():
     assert original != closure({"a.py": texts["a.py"].replace("USED=2", "USED=9")}, [("a.py", "entry")])
     assert original == closure({"a.py": texts["a.py"].replace("return USED", 'ci_progress.emit("heartbeat", "running")\n return USED')},
                                [("a.py", "entry")])
+    controlled = "ci/scripts/mod_manifest.py"
+    for call in ("return globals()[runtime_cases.function(case)]()",
+                 "selected = globals()[runtime_cases.function(case)]\n return selected()"):
+        texts = {controlled: "def matrix(case):\n " + call + "\ndef case_zip():return helper()\n"
+            "def case_order():return 0\ndef helper():return 1\n"}
+        selected = closure(texts, [(controlled, "matrix")], {controlled: "case_zip"})
+        assert selected != closure({controlled: texts[controlled].replace("return 1", "return 2")},
+            [(controlled, "matrix")], {controlled: "case_zip"})
+        assert selected == closure({controlled: texts[controlled].replace("return 0", "return 2")},
+            [(controlled, "matrix")], {controlled: "case_zip"})
     protocol_output = {"a.py": 'def entry():print("protocol-reply")\n'}
     assert closure(protocol_output, [("a.py", "entry")]) != closure({
         "a.py": protocol_output["a.py"].replace("protocol-reply", "different-reply")}, [("a.py", "entry")])
