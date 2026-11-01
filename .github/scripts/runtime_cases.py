@@ -51,6 +51,7 @@ MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
 DYNAMIC = {"sdk": DRIVERS["m02"], "m": DRIVERS["m03"], "packages": "ci/scripts/mod_manifest.py",
            "budget": "fixtures/turn-budget/driver.py", "review": "fixtures/review-before-send/driver.py"}
 PROTOCOL = 2
+EXECUTED_RESOURCES = {"tool_barrier.py": MODULES["tool_barrier"]}
 
 
 def digest(value):
@@ -292,6 +293,9 @@ def closure(texts, entries, dispatch=None):
                     if isinstance(assigned, ast.Name) and target:
                         (aliases if isinstance(target, str) else classes)[assigned.id] = target
         for item in ast.walk(node):
+            if isinstance(item, ast.Constant) and isinstance(item.value, str) and item.value in EXECUTED_RESOURCES:
+                target = EXECUTED_RESOURCES[item.value]
+                dependencies[target + ":<executed-resource>"] = digest(ast.dump(modules[target], include_attributes=False))
             if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Load) and item.id in table:
                 target = aliases.get(item.id)
                 pending.append((path, item.id))
@@ -334,6 +338,10 @@ def self_check():
             [(controlled, "matrix")], {controlled: "case_zip"})
         assert selected == closure({controlled: texts[controlled].replace("return 0", "return 2")},
             [(controlled, "matrix")], {controlled: "case_zip"})
+    resource = EXECUTED_RESOURCES["tool_barrier.py"]
+    texts = {"a.py": 'def entry():return Path("tool_barrier.py")\n', resource: 'print("tool protocol")\n'}
+    selected = closure(texts, [("a.py", "entry")])
+    assert selected != closure({**texts, resource: 'print("different protocol")\n'}, [("a.py", "entry")])
     protocol_output = {"a.py": 'def entry():print("protocol-reply")\n'}
     assert closure(protocol_output, [("a.py", "entry")]) != closure({
         "a.py": protocol_output["a.py"].replace("protocol-reply", "different-reply")}, [("a.py", "entry")])
