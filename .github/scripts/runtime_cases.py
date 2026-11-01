@@ -314,7 +314,7 @@ def closure(texts, entries, dispatch=None):
     return {"dependencies": dict(sorted(dependencies.items())), "conservative_reasons": sorted(set(reasons))}
 
 def self_check():
-    texts = {"a.py": "UNUSED=1\nUSED=2\ndef other():return UNUSED\ndef entry():return USED\n"}
+    texts = {"a.py": "UNUSED=1\nUSED=2\ndef other():return UNUSED\ndef entry():\n return USED\n"}
     original = closure(texts, [("a.py", "entry")])
     assert original == closure({"a.py": texts["a.py"].replace("UNUSED=1", "UNUSED=9")}, [("a.py", "entry")])
     assert original != closure({"a.py": texts["a.py"].replace("USED=2", "USED=9")}, [("a.py", "entry")])
