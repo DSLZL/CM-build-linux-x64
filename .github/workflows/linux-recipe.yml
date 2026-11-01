@@ -121,6 +121,7 @@ jobs:
             echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-linux-x64-artifacts"
             echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-inputs"
             echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer"
+            echo "CM_TEST_BUILD_DIR=$RUNNER_TEMP/cm-test-builds"
             echo "CM_VALIDATION_INPUT_DIR=$RUNNER_TEMP/cm-validation-inputs"
             echo "CM_WORKER_POLICY_DIR=$GITHUB_WORKSPACE/.cm-worker/.github/scripts"
           } >> "$GITHUB_ENV"
@@ -146,10 +147,10 @@ jobs:
         if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/mod_author.py configure
       - name: Materialize exact upstream and the reviewed Host overlay
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: python3 -B ci/scripts/host.py prepare 2>&1 | tee "$CM_CI_LOG_DIR/host-prepare.log"
       - name: Require real current-task mappings
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: python3 -B ci/scripts/linux_ci.py configure 2>&1 | tee "$CM_CI_LOG_DIR/configure.log"
       - name: Check current independent case fingerprints before expensive work
         if: inputs.consumer_required && inputs.build_kind == 'qualification'
@@ -167,33 +168,33 @@ jobs:
           python3 -B ci/scripts/turn_budget.py restore-legacy
           python3 -B ci/scripts/review_before_send.py restore-reference
       - name: Install exact reviewed Rust toolchain on the worker
-        if: steps.reuse.outputs.reused != 'true'
+        if: (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
       - name: Enable upstream-required user namespaces on this ephemeral CI runner
-        if: steps.reuse.outputs.reused != 'true'
+        if: (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: |
           sudo sysctl -w kernel.unprivileged_userns_clone=1 | tee "$CM_CI_LOG_DIR/userns-setup.log"
           if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 | tee -a "$CM_CI_LOG_DIR/userns-setup.log"
           fi
       - name: Install required Linux native dependencies
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev libssl-dev bubblewrap
           python3 -B ci/scripts/host.py native 2>&1 | tee "$CM_CI_LOG_DIR/native-inputs.log"
       - name: Install pinned sccache
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
           disable_annotations: true
       - name: Identify compatible cache namespace inside this builder repository
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         id: cache-identity
         run: python3 -B ci/scripts/linux_ci.py identity 2>&1 | tee "$CM_CI_LOG_DIR/cache-identity.log"
       - name: Restore this worker repository's Cargo downloads
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -205,7 +206,7 @@ jobs:
           restore-keys: ${{ steps.cache-identity.outputs.cargo_prefix }}
           enableCrossOsArchive: false
       - name: Restore this worker repository's sccache snapshot
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         id: sccache-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -216,14 +217,14 @@ jobs:
             ${{ steps.cache-identity.outputs.sccache_legacy_prefix }}
           enableCrossOsArchive: false
       - name: Start sccache after restoring its worker-local snapshot
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         id: sccache-start
         run: |
           sccache --start-server 2>&1 | tee "$CM_CI_LOG_DIR/sccache-start.log"
           sccache --zero-stats
           sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-restored.json"
       - name: Fetch locked dependencies
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: python3 -B ci/scripts/linux_ci.py fetch
       - name: Build and bind the bundled sandbox helper before Host compilation
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
@@ -243,22 +244,83 @@ jobs:
       - name: Check Host canonicalization and rejection before compiling
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B fixtures/host-baseline/test_identity.py 2>&1 | tee "$CM_CI_LOG_DIR/host-identity-tests.log"
+      - name: Restore immutable base inputs for changed private probes
+        if: steps.reuse.outputs.probe_build_required == 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: python3 -B ci/scripts/retry.py probe-prepare
       - name: Seal exact acceptance compilation inputs and recipes
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         id: acceptance-identity
         run: |
           python3 -B ci/scripts/acceptance_cache.py self-check
           python3 -B ci/scripts/acceptance_cache.py identity
-      - name: Restore linked acceptance executables and original build checks
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
-        id: acceptance-cache
+      - name: Restore compiled target host-core-baseline-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.host_core_baseline_build != ''
+        id: acceptance-host-core-baseline-build
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}
-          key: ${{ steps.acceptance-identity.outputs.acceptance_key }}
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/host-core-baseline-build
+          key: ${{ steps.acceptance-identity.outputs.host_core_baseline_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target mod-adapter-clippy
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.mod_adapter_clippy != ''
+        id: acceptance-mod-adapter-clippy
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-adapter-clippy
+          key: ${{ steps.acceptance-identity.outputs.mod_adapter_clippy }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target mod-host-abi-probe-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.mod_host_abi_probe_build != ''
+        id: acceptance-mod-host-abi-probe-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-host-abi-probe-build
+          key: ${{ steps.acceptance-identity.outputs.mod_host_abi_probe_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target mod-pinned-snapshot-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.mod_pinned_snapshot_build != ''
+        id: acceptance-mod-pinned-snapshot-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-pinned-snapshot-build
+          key: ${{ steps.acceptance-identity.outputs.mod_pinned_snapshot_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target m02-native-probe-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.m02_native_probe_build != ''
+        id: acceptance-m02-native-probe-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/m02-native-probe-build
+          key: ${{ steps.acceptance-identity.outputs.m02_native_probe_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target review-tui-probe-build
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.review_tui_probe_build != ''
+        id: acceptance-review-tui-probe-build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/review-tui-probe-build
+          key: ${{ steps.acceptance-identity.outputs.review_tui_probe_build }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g03-local-backend-contract
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g03_local_backend_contract != ''
+        id: acceptance-g03-local-backend-contract
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g03-local-backend-contract
+          key: ${{ steps.acceptance-identity.outputs.g03_local_backend_contract }}
+          enableCrossOsArchive: false
+      - name: Restore verified legacy snapshot for one-time target migration
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true' && (steps.acceptance-host-core-baseline-build.outputs.cache-hit != 'true' || steps.acceptance-mod-adapter-clippy.outputs.cache-hit != 'true' || steps.acceptance-mod-host-abi-probe-build.outputs.cache-hit != 'true' || steps.acceptance-mod-pinned-snapshot-build.outputs.cache-hit != 'true' || steps.acceptance-m02-native-probe-build.outputs.cache-hit != 'true' || steps.acceptance-review-tui-probe-build.outputs.cache-hit != 'true' || steps.acceptance-g03-local-backend-contract.outputs.cache-hit != 'true')
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/legacy
+          key: ${{ steps.acceptance-identity.outputs.legacy_acceptance_key }}
           enableCrossOsArchive: false
       - name: Verify acceptance executable bytes inputs and original producer
-        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        id: acceptance-cache-verified
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: python3 -B ci/scripts/acceptance_cache.py restore
       - name: Restore exact product-input Host binaries and original build evidence
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
@@ -280,6 +342,10 @@ jobs:
       - name: Run actual acceptance for the current mapped task
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/linux_ci.py acceptance
+      - name: Build only changed private probes against the frozen product
+        id: probe-build
+        if: steps.reuse.outputs.probe_build_required == 'true'
+        run: python3 -B ci/scripts/retry.py probe-build
       - name: Build only the current author Mod with actual compiler execution evidence
         if: inputs.build_kind == 'mod-only' && steps.reuse.outputs.reused != 'true'
         run: |
@@ -288,9 +354,9 @@ jobs:
           status=0
           strace -f -qq -s 16384 -e trace=execve,execveat -o "$CM_CI_LOG_DIR/m05-author-exec.log" python3 -B ci/scripts/mod_author.py produce || status=$?
           CM_AUTHOR_BUILD_EXIT="$status" python3 -B ci/scripts/mod_author.py audit-mod-only
-      - name: Verify complete acceptance compilation snapshot
+      - name: Verify independently completed acceptance targets
         id: acceptance-cache-prepare
-        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && steps.host-quality.outcome == 'success' }}
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && steps.acceptance-cache-verified.outcome == 'success' }}
         run: python3 -B ci/scripts/acceptance_cache.py save
       - name: Prepare a verified Host snapshot from its successful producer baseline
         id: host-cache-prepare
@@ -349,11 +415,31 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
+      - name: Upload only the changed Core test build
+        id: core-probe-upload
+        if: steps.probe-build.outputs.core_probe == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-test-build-m02-native-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/m02-native-probe-build
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only the changed TUI test build
+        id: tui-probe-upload
+        if: steps.probe-build.outputs.tui_probe == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-test-build-review-tui-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_TEST_BUILD_DIR }}/review-tui-probe-build
+          if-no-files-found: error
+          retention-days: 14
       - name: Prepare current tests separately from the original frozen product
         if: inputs.consumer_required
         id: validation
         env:
           CM_POLICY_TOKEN: ${{ github.token }}
+          CM_CORE_PROBE_ARTIFACT_ID: ${{ steps.core-probe-upload.outputs.artifact-id }}
+          CM_TUI_PROBE_ARTIFACT_ID: ${{ steps.tui-probe-upload.outputs.artifact-id }}
           CM_CURRENT_ARTIFACT_ID: ${{ steps.payload.outputs.artifact-id }}
           CM_CURRENT_INPUT_ARTIFACT_ID: ${{ steps.runtime-inputs.outputs.artifact-id }}
         run: python3 -B ci/scripts/retry.py overlay
@@ -367,7 +453,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Save successful trusted source Cargo downloads
-        if: ${{ success() && steps.reuse.outputs.reused != 'true' && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cargo-cache.outputs.cache-hit != 'true' }}
+        if: ${{ success() && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -390,12 +476,54 @@ jobs:
           path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
           key: ${{ steps.host-identity.outputs.host_key }}
           enableCrossOsArchive: false
-      - name: Save linked acceptance executables without runtime results
-        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache.outputs.cache-hit != 'true' }}
+      - name: Save successful compiled target host-core-baseline-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_host_core_baseline_build == 'true' && steps.acceptance-host-core-baseline-build.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}
-          key: ${{ steps.acceptance-identity.outputs.acceptance_key }}
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/host-core-baseline-build
+          key: ${{ steps.acceptance-identity.outputs.host_core_baseline_build }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target mod-adapter-clippy
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_adapter_clippy == 'true' && steps.acceptance-mod-adapter-clippy.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-adapter-clippy
+          key: ${{ steps.acceptance-identity.outputs.mod_adapter_clippy }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target mod-host-abi-probe-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_host_abi_probe_build == 'true' && steps.acceptance-mod-host-abi-probe-build.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-host-abi-probe-build
+          key: ${{ steps.acceptance-identity.outputs.mod_host_abi_probe_build }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target mod-pinned-snapshot-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_pinned_snapshot_build == 'true' && steps.acceptance-mod-pinned-snapshot-build.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-pinned-snapshot-build
+          key: ${{ steps.acceptance-identity.outputs.mod_pinned_snapshot_build }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target m02-native-probe-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_m02_native_probe_build == 'true' && steps.acceptance-m02-native-probe-build.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/m02-native-probe-build
+          key: ${{ steps.acceptance-identity.outputs.m02_native_probe_build }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target review-tui-probe-build
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_review_tui_probe_build == 'true' && steps.acceptance-review-tui-probe-build.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/review-tui-probe-build
+          key: ${{ steps.acceptance-identity.outputs.review_tui_probe_build }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g03-local-backend-contract
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g03_local_backend_contract == 'true' && steps.acceptance-g03-local-backend-contract.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g03-local-backend-contract
+          key: ${{ steps.acceptance-identity.outputs.g03_local_backend_contract }}
           enableCrossOsArchive: false
       - name: Upload logs compiler statistics and source/worker identities
         if: ${{ always() && steps.policy.outcome == 'success' }}

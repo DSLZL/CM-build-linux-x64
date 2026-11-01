@@ -15,6 +15,8 @@ import threading
 import time
 import urllib.error
 
+import runtime_cases
+
 RUNTIME_FILES = (
     "ci/scripts/mod_author.py", "ci/scripts/mod_manifest.py", "ci/scripts/runtime_sdk.py",
     "ci/scripts/managed_package.py", "ci/scripts/runtime_state.py", "ci/scripts/ci_progress.py",
@@ -23,7 +25,7 @@ RUNTIME_FILES = (
     "fixtures/managed-package/driver.py", "fixtures/state/driver.py", "fixtures/mod-author/driver.py",
     "ci/scripts/turn_budget.py", "fixtures/turn-budget/driver.py",
     "ci/scripts/review_before_send.py", "fixtures/review-before-send/driver.py",
-    "ci/scripts/tool_concurrency.py", "fixtures/tool-concurrency/driver.py",
+    "ci/scripts/tool_concurrency.py", "fixtures/tool-concurrency/driver.py", "ci/scripts/runtime_cases.py",
 )
 PHASES = {
     "consumer-matrix": (("fixtures/runtime-consumer/driver.py", "matrix"),),
@@ -54,8 +56,22 @@ PHASES = {
     "concurrency-backend-scope": (("fixtures/tool-concurrency/driver.py", "backend_scope"),),
     "concurrency-plug-and-play": (("fixtures/tool-concurrency/driver.py", "plug_and_play"),),
 }
-COMMON_TESTS = ("fixtures/native-loader/core_acceptance.py", "fixtures/native-loader/tool_barrier.py",
-                "ci/scripts/ci_progress.py")
+for _label in ("consumer-matrix", *(phase + "-consumer-matrix" for phase in ("m01", "m02", "m03", "m04", "m05"))):
+    PHASES.pop(_label)
+PHASES.update({label: ((runtime_cases.DRIVERS[phase], "matrix"),)
+               for label, (phase, case) in runtime_cases.labels().items()})
+
+PRIVATE_PROBES = {
+    "fixtures/runtime-sdk/host_scopes.rs": "m02-native-probe-build",
+    "fixtures/turn-budget/scope_probe.rs": "m02-native-probe-build",
+    "fixtures/tool-concurrency/core_probe.rs": "m02-native-probe-build",
+    "fixtures/tool-concurrency/steer_probe.rs": "m02-native-probe-build",
+    "fixtures/review-before-send/composer_probe.rs": "review-tui-probe-build",
+    "fixtures/review-before-send/dispatch_probe.rs": "review-tui-probe-build",
+    "fixtures/review-before-send/app_probe.rs": "review-tui-probe-build",
+    "fixtures/tool-concurrency/backend_probe.rs": "review-tui-probe-build",
+}
+
 
 
 def write(path, value):
@@ -87,78 +103,73 @@ def source(root, revision, path):
 
 
 def projection(text, entries=None, exclude=()):
-    module = ast.parse(text)
-    definitions = {node.name: node for node in module.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
-    if entries is None:
-        wanted = set(definitions) - set(exclude)
-    else:
-        wanted = set(entries)
-        assert wanted <= definitions.keys(), "Unknown runtime test entry point"
-        pending = list(wanted)
-        while pending:
-            for node in ast.walk(definitions[pending.pop()]):
-                if isinstance(node, ast.Name) and node.id in definitions and node.id not in wanted:
-                    wanted.add(node.id)
-                    pending.append(node.id)
-    nodes = [node for node in module.body if
-             (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in wanted)
-             or (not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                 and not (isinstance(node, ast.If) and ast.unparse(node.test) == "__name__ == '__main__'"))]
-    return digest([ast.dump(node, include_attributes=False) for node in nodes])
+    module = runtime_cases.Business().visit(ast.parse(text))
+    table = runtime_cases.bindings(module)
+    definitions = {name for name, node in table.items() if isinstance(node,
+        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    wanted = set(entries) if entries is not None else {name for name in definitions
+        if name not in exclude and not name.startswith("case_")}
+    assert wanted <= definitions, "Unknown runtime entry"
+    pending = list(wanted)
+    while pending:
+        for node in ast.walk(table[pending.pop()]):
+            if isinstance(node, ast.Name) and node.id in table and node.id not in wanted:
+                wanted.add(node.id)
+                pending.append(node.id)
+    return digest({name: ast.dump(table[name], include_attributes=False) for name in sorted(wanted)})
 
 
 def test_inputs(root, revision):
-    texts = {path: source(root, revision, path) for path in RUNTIME_FILES}
-    common = {path: projection(texts[path]) for path in COMMON_TESTS}
-    common["outer_audit"] = projection(source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
-    # Control-flow/logging fixes preserve independently audited results; schema changes bump this version.
-    common["checkpoint_protocol"] = 1
+    texts = {path: source(root, revision, path) for path in RUNTIME_FILES if not path.endswith("ci_progress.py")}
+    audit = projection(source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
+    observer = projection(source(root, revision, "ci/scripts/runtime_composition.py"),
+        ("audit_executions", "audit_network", "bound_bwrap_executions", "bound_sandbox_aliases",
+         "complete_syscalls", "check_network_audit", "kernel_route_sockets", "provider_tcp_connections"))
     result = {}
     for label, entries in PHASES.items():
-        files = {path: projection(texts[path], (entry,)) for path, entry in entries}
-        # These wrappers call shared metadata and SDK helpers across modules.
-        if label.startswith(("m02-", "m03-", "m04-", "m05-", "g02a-")):
-            files["ci/scripts/mod_manifest.py"] = projection(texts["ci/scripts/mod_manifest.py"], exclude=("matrix", "self_check"))
-        if label.startswith(("m03-", "m04-", "m05-", "g02a-")):
-            files["fixtures/runtime-sdk/driver.py"] = projection(texts["fixtures/runtime-sdk/driver.py"], exclude=("matrix", "self_check"))
-        if label.startswith(("m04-", "m05-")):
-            files["fixtures/managed-package/driver.py"] = projection(texts["fixtures/managed-package/driver.py"], exclude=("matrix", "self_check"))
-        if label.startswith("review-"):
-            files["ci/scripts/mod_manifest.py"] = projection(texts["ci/scripts/mod_manifest.py"], exclude=("matrix", "self_check"))
-            files["fixtures/runtime-sdk/driver.py"] = projection(texts["fixtures/runtime-sdk/driver.py"],
-                ("Provider", "install", "environment", "command", "rows", "text_values"))
-            files["fixtures/managed-package/driver.py"] = projection(texts["fixtures/managed-package/driver.py"],
-                ("tui_configuration", "tui_message_visible", "tui_mcp_listener", "identity", "launch_command", "cm", "state"))
-            files["fixtures/turn-budget/driver.py"] = projection(texts["fixtures/turn-budget/driver.py"], ("cm",))
-        if label.startswith("concurrency-"):
-            files["ci/scripts/mod_manifest.py"] = projection(texts["ci/scripts/mod_manifest.py"], exclude=("matrix", "self_check"))
-            files["fixtures/runtime-sdk/driver.py"] = projection(texts["fixtures/runtime-sdk/driver.py"],
-                ("Client", "install", "environment", "command", "rows", "text_values", "title_request"))
-            files["fixtures/turn-budget/driver.py"] = projection(texts["fixtures/turn-budget/driver.py"],
-                ("cm", "policy", "write", "complete", "admissions", "charged"))
-            if label == "concurrency-value-flow":
-                files["fixtures/review-before-send/driver.py"] = projection(texts["fixtures/review-before-send/driver.py"], ("Terminal",))
-                files["fixtures/managed-package/driver.py"] = projection(texts["fixtures/managed-package/driver.py"],
-                    ("tui_configuration", "tui_message_visible", "tui_mcp_listener", "identity", "launch_command", "cm", "state"))
-        result[label] = digest({"protocol": 1, "common": common, "files": files})
+        selected = runtime_cases.labels().get(label)
+        dispatch = {runtime_cases.DRIVERS[selected[0]]: runtime_cases.function(selected[1])} if selected else {}
+        if selected:
+            wrapper = {"m02": ("ci/scripts/runtime_sdk.py", "matrix"),
+                "m03": ("ci/scripts/managed_package.py", "driver"), "m04": ("ci/scripts/runtime_state.py", "driver"),
+                "m05": ("ci/scripts/mod_author.py", "driver")}.get(selected[0])
+            if wrapper:
+                entries = (*entries, wrapper)
+            cli = wrapper[0] if wrapper else runtime_cases.DRIVERS[selected[0]]
+        else:
+            cli = entries[0][0]
+        value = runtime_cases.closure(texts, entries, dispatch=dispatch)
+        module = runtime_cases.Business().visit(ast.parse(texts[cli]))
+        value["dependencies"][cli + ":<entrypoint>"] = digest([ast.dump(node, include_attributes=False)
+            for node in module.body if isinstance(node, ast.If) and any(
+                isinstance(item, ast.Name) and item.id == "__name__" for item in ast.walk(node.test))])
+        value.update(protocol=runtime_cases.PROTOCOL, audit=digest({"outer": audit, "observer": observer}))
+        result[label] = value
     return result
+
+
+def probe_inputs(root, revision):
+    return {path: hashlib.sha256(source(root, revision, path).encode()).hexdigest() for path in PRIVATE_PROBES}
 
 
 def product_inputs(root, revision):
     tree = git(root, "ls-tree", "-rz", revision).split(b"\0")
     files = {}
-    runtime_modules = {"ci/scripts/" + name + ".py": {"matrix", "self_check"} for name in
+    runtime_modules = {"ci/scripts/" + name + ".py": {"matrix", "driver", "self_check"} for name in
                        ("mod_author", "mod_manifest", "runtime_sdk", "managed_package", "runtime_state")}
+    runtime_modules["ci/scripts/mod_manifest.py"].update({"rejection_cases", "zip_rejections",
+        "lock_integrity", "config_rejections", "remote_rejection"})
     runtime_modules["ci/scripts/turn_budget.py"] = {"driver", "self_check"}
     runtime_modules["ci/scripts/review_before_send.py"] = {"driver", "self_check"}
     runtime_modules["ci/scripts/tool_concurrency.py"] = {"driver", "self_check"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
-                      "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json"}
+                      "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
+                      "ci/scripts/runtime_cases.py", "ci/scripts/acceptance_cache.py"}
     for row in filter(None, tree):
         metadata, name = row.split(b"\t", 1)
         path = name.decode()
-        if (path in administrative or path.endswith(".md") or path.startswith(("docs/", ".github/workflows/", "ci/worker/"))
+        if (path in administrative or path in PRIVATE_PROBES or path.endswith(".md") or path.startswith(("docs/", ".github/workflows/", "ci/worker/"))
                 or path.startswith("fixtures/") and path.endswith(".py")
                 or "/.vscode/" in path or "/.github/" in path):
             continue
@@ -213,10 +224,11 @@ def select(root, logs):
     explicit = os.environ.get("CM_REUSE_RUN_ID", "")
     if explicit and not re.fullmatch(r"[1-9][0-9]*", explicit):
         raise RuntimeError("Invalid explicit reuse run ID")
+    history = p.api("repos/" + worker + "/actions/workflows/build.yml/runs?event=workflow_dispatch&per_page=12")["workflow_runs"]
     if explicit:
         candidates = [p.api("repos/" + worker + "/actions/runs/" + explicit)]
     else:
-        candidates = p.api("repos/" + worker + "/actions/workflows/build.yml/runs?event=workflow_dispatch&per_page=12")["workflow_runs"]
+        candidates = history
     for run in candidates:
         if run["id"] == int(os.environ["GITHUB_RUN_ID"]) or run.get("path") != ".github/workflows/build.yml":
             continue
@@ -244,11 +256,11 @@ def select(root, logs):
                             continue
                         origin = {"source_sha": ci["source_sha"], "workflow_sha": ci["workflow_sha"], "run_id": run["id"],
                                   "run_attempt": run["run_attempt"], "request_id": ci["request_id"], "job": producers[0]["name"], "job_id": producers[0]["id"]}
-                        for kind, prefix in (("product", "cm-linux-x64-task-artifacts-"), ("input", "cm-linux-x64-runtime-inputs-")):
+                        for artifact_kind, prefix in (("product", "cm-linux-x64-task-artifacts-"), ("input", "cm-linux-x64-runtime-inputs-")):
                             items = [a for a in records if a["name"] == prefix + ci["request_id"] + "-" + str(run["run_attempt"])]
                             if len(items) != 1:
                                 raise RuntimeError("Missing exact producer artifact")
-                            origin[kind + "_artifact"] = artifact_ref(checked_artifact(items[0], run["id"]))
+                            origin[artifact_kind + "_artifact"] = artifact_ref(checked_artifact(items[0], run["id"]))
                         old_environment = {key: metadata["context"].get(key) for key in environment()}
             if old_environment != environment() or digest(product_inputs(root, origin["source_sha"])) != plan["production_inputs_sha256"]:
                 continue
@@ -263,6 +275,7 @@ def select(root, logs):
                 continue
             resume = [a for a in records if a["name"].startswith("cm-linux-x64-consumer-checkpoints-") and not a["expired"]]
             plan.update(status="hit", reason="Exact production inputs and runner image unchanged", production_origin=origin,
+                        test_builds=old.get("test_builds", {}) if indexes else {},
                         checkpoint_origin={"run_id": run["id"], "run_attempt": run["run_attempt"],
                                            "source_sha": old["provenance"]["CM_SOURCE_SHA"] if indexes else origin["source_sha"],
                                            "workflow_sha": run["head_sha"],
@@ -276,8 +289,32 @@ def select(root, logs):
             print("CM retry: rejected candidate", run["id"], type(error).__name__, flush=True)
     if explicit and plan["status"] != "hit":
         raise RuntimeError("Explicit producer environment or inputs changed; refusing an implicit rebuild")
+    plan["checkpoint_origins"] = checkpoint_history(root, history, worker, workflow_sha)
+    plan["probe_inputs"] = probe_inputs(root, "HEAD")
+    if plan["status"] == "hit":
+        old_probes = probe_inputs(root, plan["production_origin"]["source_sha"])
+        changed = {PRIVATE_PROBES[path] for path, value in plan["probe_inputs"].items()
+                   if plan["build_request"]["kind"] == "qualification" and old_probes[path] != value}
+        test_builds = {}
+        for label, item in plan.get("test_builds", {}).items():
+            if label not in changed or item["inputs"] != {
+                    path: value for path, value in plan["probe_inputs"].items() if PRIVATE_PROBES[path] == label}:
+                continue
+            try:
+                verify_test_build(item)
+                git(root, "merge-base", "--is-ancestor", item["source_sha"], "HEAD")
+                test_builds[label] = item
+            except (AssertionError, KeyError, RuntimeError, subprocess.SubprocessError, urllib.error.HTTPError) as error:
+                if isinstance(error, urllib.error.HTTPError) and error.code not in (404, 410):
+                    raise
+                print("CM test build: unavailable", label, type(error).__name__, flush=True)
+        plan["test_builds"] = test_builds
+        plan["changed_probes"] = sorted(changed - test_builds.keys())
+    else:
+        plan["changed_probes"] = []
     write(logs / "retry-plan.json", plan)
-    outputs = {"reused": str(plan["status"] == "hit").lower()}
+    outputs = {"reused": str(plan["status"] == "hit").lower(),
+               "probe_build_required": str(bool(plan["changed_probes"])).lower()}
     if plan["status"] == "hit":
         origin = plan["production_origin"]
         outputs.update(artifact_id=origin["product_artifact"]["id"], artifact_digest=origin["product_artifact"]["digest"],
@@ -285,6 +322,89 @@ def select(root, logs):
                        production_origin=json.dumps(origin, separators=(",", ":")))
     p.output(outputs)
     print("CM producer reuse:", plan["status"], plan["reason"], flush=True)
+
+
+
+def checkpoint_history(root, runs, worker, workflow_sha):
+    """Find compatible passed cases independently of the chosen product producer."""
+    wanted, origins, seen = test_inputs(root, "HEAD"), [], set()
+    for run in runs:
+        if run["id"] == int(os.environ["GITHUB_RUN_ID"]) or run.get("path") != ".github/workflows/build.yml":
+            continue
+        records = policy().api("repos/" + worker + "/actions/runs/" + str(run["id"]) + "/artifacts?per_page=100")["artifacts"]
+        expected = "cm-linux-x64-consumer-checkpoints-" + run["display_title"].removeprefix("CM Linux x64 / ") + "-" + str(run["run_attempt"])
+        matches = [row for row in records if row["name"] == expected and not row["expired"]]
+        if not matches:
+            continue
+        assert len(matches) == 1
+        record = checked_artifact(matches[0], run["id"])
+        try:
+            with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+                with small_archive(worker, record, Path(directory) / "index.zip") as archive:
+                    index = policy().archive_json(archive, "index.json")
+            if index.get("schema_version") != 2 or index["environment"] != environment():
+                continue
+            provenance = index["provenance"]
+            expected_provenance = {"GITHUB_REPOSITORY": worker, "GITHUB_RUN_ID": str(run["id"]),
+                "GITHUB_RUN_ATTEMPT": str(run["run_attempt"]), "GITHUB_WORKFLOW_SHA": run["head_sha"],
+                "CM_SOURCE_REPOSITORY": os.environ["CM_SOURCE_REPOSITORY"]}
+            assert all(provenance[key] == value for key, value in expected_provenance.items())
+            git(root, "merge-base", "--is-ancestor", provenance["CM_SOURCE_SHA"], "HEAD")
+            if policy().api("repos/" + worker + "/compare/" + run["head_sha"] + "..." + workflow_sha).get("status") not in ("ahead", "identical"):
+                continue
+            compatible = []
+            for label, step in index["steps"].items():
+                identity = (label, step["key"])
+                if (label in wanted and step["status"] == "pass" and index["test_inputs"].get(label) == wanted[label]
+                        and identity not in seen):
+                    compatible.append(label)
+                    seen.add(identity)
+            summary = {key: index[key] for key in ("schema_version", "environment", "provenance")}
+            summary["test_inputs"] = {label: digest(value) for label, value in index["test_inputs"].items()}
+            summary["steps"] = {}
+            for label, step in index["steps"].items():
+                row = {key: step[key] for key in ("status", "key", "origin", "inputs") if key in step}
+                a, b = index["test_inputs"].get(label, {}), wanted.get(label, {})
+                row["dependency_changes"] = sorted(key for key in a.get("dependencies", {}).keys() |
+                    b.get("dependencies", {}).keys() if a.get("dependencies", {}).get(key) !=
+                    b.get("dependencies", {}).get(key)) if isinstance(a, dict) and isinstance(b, dict) else []
+                summary["steps"][label] = row
+            origins.append({"run_id": run["id"], "run_attempt": run["run_attempt"],
+                "source_sha": provenance["CM_SOURCE_SHA"], "workflow_sha": run["head_sha"],
+                "artifact": artifact_ref(record), "labels": compatible, "index_fingerprint": digest(index), "index": summary})
+        except (AssertionError, KeyError, ValueError, RuntimeError, subprocess.SubprocessError, urllib.error.HTTPError) as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code not in (404, 410):
+                raise
+            print("CM checkpoints: rejected", run["id"], repr(error), flush=True)
+    print("CM checkpoints: compatible origins", len(origins), "cases", len({label for row in origins for label in row["labels"]}), flush=True)
+    return origins
+
+
+def extract_checkpoint(worker, checkpoint, destination):
+    record = checked_artifact(policy().api("repos/" + worker + "/actions/artifacts/" + str(checkpoint["artifact"]["id"])), checkpoint["run_id"])
+    assert artifact_ref(record) == checkpoint["artifact"]
+    destination.mkdir(parents=True)
+    with small_archive(worker, record, destination.parent / (str(record["id"]) + ".zip")) as archive:
+        total, seen = 0, set()
+        for entry in archive.infolist():
+            path = Path(entry.filename)
+            if (path.is_absolute() or ".." in path.parts or "\\" in entry.filename
+                    or entry.filename in seen or entry.file_size > 16 * 1024 ** 2
+                    or stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                raise RuntimeError("Invalid runtime checkpoint path/size")
+            seen.add(entry.filename)
+            if entry.is_dir():
+                continue
+            total += entry.file_size
+            assert total <= 512 * 1024 ** 2
+            data = archive.read(entry)
+            data.decode("utf-8")
+            assert b"\0" not in data
+            target = destination / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+    index = read(destination / "index.json")
+    assert digest(index) == checkpoint["index_fingerprint"], "Checkpoint index changed after selection"
 
 
 def legacy_request(producer, worker, artifact):
@@ -332,6 +452,201 @@ def verify_production_origin(origin, *, worker=None, fetch=None):
     return records
 
 
+
+def probe_prepare(root, logs):
+    """Restore immutable inputs on the hosted builder without rebuilding their payloads."""
+    import host
+    import runtime_consumer
+    import tarfile
+    plan = read(logs / "retry-plan.json")
+    assert plan["status"] == "hit" and plan["changed_probes"]
+    records = verify_production_origin(plan["production_origin"])
+    destination = Path(os.environ["RUNNER_TEMP"]) / "cm-probe-base/runtime-inputs"
+    with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+        directory = Path(directory)
+        with policy().download_origin_archive(os.environ["GITHUB_REPOSITORY"], records["input_artifact"], directory / "inputs.zip") as archive:
+            matches = [entry for entry in archive.infolist() if entry.filename == "runtime-inputs.tar"]
+            assert len(matches) == 1 and matches[0].file_size <= 4 * 1024 ** 3
+            with archive.open(matches[0]) as src, (directory / "runtime-inputs.tar").open("xb") as target:
+                shutil.copyfileobj(src, target)
+        with tarfile.open(directory / "runtime-inputs.tar", "r:") as archive:
+            policy().extract_archive(archive, destination)
+    runtime_consumer.validate_inputs(destination)
+    frozen = read(destination / "producer.json")["host"]
+    host.write(logs / "host-identity.json", frozen["host_identity"])
+    with open(os.environ["GITHUB_ENV"], "a") as output:
+        output.write("CM_PROBE_BUILD_TARGETS=" + json.dumps(plan["changed_probes"], separators=(",", ":")) + "\n")
+        output.write("CODEX_BWRAP_SHA256=" + frozen["host_identity"]["inputs"]["helper"]["sha256"] + "\n")
+        output.write("CM_HOST_IDENTITY_JSON=" + str(logs / "host-identity.json") + "\n")
+
+
+def probe_build(root, logs):
+    import acceptance_cache
+    import runtime_consumer
+    import runtime_sdk
+    import turn_budget
+    plan = read(logs / "retry-plan.json")
+    inputs = Path(os.environ["RUNNER_TEMP"]) / "cm-probe-base/runtime-inputs"
+    producer = read(inputs / "producer.json")
+    destination = Path(os.environ["CM_TEST_BUILD_DIR"])
+    for label in plan["changed_probes"]:
+        target = destination / label
+        target.mkdir(parents=True)
+        metadata = {}
+        if label == "m02-native-probe-build":
+            metadata["native_scope_probe"] = runtime_sdk.native_probe(root, logs, inputs, inputs / "host", producer["host"])
+            if producer.get("g02a"):
+                metadata["budget_scope_probe"] = turn_budget.native_probe(root, logs, inputs, producer["host"],
+                    {"native_scope_probe": metadata["native_scope_probe"]})
+            for name in ("m02-native-probe.json", "m02-native-scopes.json", "m02-native-events.jsonl", "m02-native-trace.jsonl",
+                         *(("g02a-native-probe.json", "g02a-native-scopes.json", "g02a-native-trace.jsonl")
+                           if producer.get("g02a") else ())):
+                (target / "fixture").mkdir(exist_ok=True)
+                shutil.copyfile(inputs / "fixture" / name, target / "fixture" / name)
+        binary = acceptance_cache.run(root, logs, label)
+        shutil.copy2(binary, target / "binary")
+        receipt = read(Path(os.environ["CM_ACCEPTANCE_BUILD_CACHE_DIR"]) / label / "build.json")
+        metadata["source_sha256"] = receipt["inputs"]["instrumented_source_sha256"]
+        shutil.copyfile(Path(os.environ["CM_ACCEPTANCE_BUILD_CACHE_DIR"]) / label / "build.json", target / "build.json")
+        write(target / "test-build.json", {"schema_version": 1, "target": label,
+            "provenance": runtime_consumer.provenance(),
+            "inputs": {path: value for path, value in plan["probe_inputs"].items() if PRIVATE_PROBES[path] == label},
+            "metadata": metadata, "files": runtime_consumer.inventory(target)})
+        policy().output({("core_probe" if label == "m02-native-probe-build" else "tui_probe"): "true"})
+
+
+def verify_test_build(item, *, worker=None, fetch=None):
+    worker = worker or os.environ["GITHUB_REPOSITORY"]
+    fetch = fetch or policy().api
+    assert item["target"] in set(PRIVATE_PROBES.values())
+    assert item["job"] in ("build-read / linux-x64", "build-write / linux-x64")
+    assert all(re.fullmatch(r"[0-9a-f]{40}", item[key]) for key in ("source_sha", "workflow_sha"))
+    assert all(type(item[key]) is int and item[key] > 0 for key in ("run_id", "run_attempt", "job_id"))
+    run = fetch("repos/" + worker + "/actions/runs/" + str(item["run_id"]))
+    assert run["run_attempt"] == item["run_attempt"] and run["head_sha"] == item["workflow_sha"]
+    assert run["event"] == "workflow_dispatch" and run["path"] == ".github/workflows/build.yml"
+    assert run["display_title"] == "CM Linux x64 / " + item["request_id"]
+    jobs = policy().receipt_jobs("repos/" + worker + "/actions/runs/" + str(item["run_id"]) + "/attempts/"
+        + str(item["run_attempt"]) + "/jobs?per_page=100", (item["job"],), fetch=fetch)
+    assert policy().successful_job(jobs, item["job"])["job_id"] == item["job_id"]
+    record = checked_artifact(fetch("repos/" + worker + "/actions/artifacts/" + str(item["artifact"]["id"])), item["run_id"])
+    assert artifact_ref(record) == item["artifact"]
+    assert record["name"] == "cm-linux-x64-test-build-" + item["target"] + "-" + item["request_id"] + "-" + str(item["run_attempt"])
+    return record
+
+
+def refresh_probes(inputs, validation):
+    import runtime_consumer as runtime
+    metadata = {}
+    for label, item in validation.get("test_builds", {}).items():
+        assert label in set(PRIVATE_PROBES.values()) and item["target"] == label
+        expected = {path: value for path, value in validation["probe_inputs"].items() if PRIVATE_PROBES[path] == label}
+        assert item["inputs"] == expected
+        record = verify_test_build(item)
+        with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+            directory = Path(directory)
+            with policy().download_origin_archive(os.environ["GITHUB_REPOSITORY"], record, directory / "probe.zip") as archive:
+                proof = policy().archive_json(archive, "test-build.json")
+                assert proof["schema_version"] == 1 and proof["target"] == label and proof["inputs"] == expected
+                origin = proof["provenance"]
+                assert all(origin[key] == value for key, value in {
+                    "GITHUB_RUN_ID": str(item["run_id"]), "GITHUB_RUN_ATTEMPT": str(item["run_attempt"]),
+                    "GITHUB_WORKFLOW_SHA": item["workflow_sha"], "CM_SOURCE_SHA": item["source_sha"],
+                    "GITHUB_REPOSITORY": os.environ["GITHUB_REPOSITORY"],
+                    "CM_SOURCE_REPOSITORY": os.environ["CM_SOURCE_REPOSITORY"],
+                    "CM_REQUEST_ID": item["request_id"]}.items())
+                required_metadata = {"source_sha256"}
+                if label == "m02-native-probe-build":
+                    required_metadata.add("native_scope_probe")
+                    if read(inputs / "producer.json").get("g02a"):
+                        required_metadata.add("budget_scope_probe")
+                assert set(proof["metadata"]) == required_metadata
+                allowed = {"binary", "build.json"}
+                if label == "m02-native-probe-build":
+                    allowed.update("fixture/" + name for name in ("m02-native-probe.json", "m02-native-scopes.json",
+                        "m02-native-events.jsonl", "m02-native-trace.jsonl"))
+                    if "budget_scope_probe" in proof["metadata"]:
+                        allowed.update("fixture/" + name for name in ("g02a-native-probe.json",
+                            "g02a-native-scopes.json", "g02a-native-trace.jsonl"))
+                assert {entry["path"] for entry in proof["files"]} == allowed
+                names = [entry.filename for entry in archive.infolist() if not entry.is_dir()]
+                assert len(names) == len(set(names)) and set(names) == allowed | {"test-build.json"}
+                assert sum(entry.file_size for entry in archive.infolist()) <= 4 * 1024 ** 3
+                extracted = directory / "files"
+                extracted.mkdir()
+                for name in allowed:
+                    entry = archive.getinfo(name)
+                    assert stat.S_IFMT(entry.external_attr >> 16) in (0, stat.S_IFREG) and entry.file_size <= 2 * 1024 ** 3
+                    target = extracted / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(entry) as src, target.open("xb") as out:
+                        shutil.copyfileobj(src, out)
+                    target.chmod(0o755 if name == "binary" else 0o644)
+                assert runtime.inventory(extracted) == proof["files"], "Test-build bytes differ"
+                build = read(extracted / "build.json")
+                assert build["inputs"]["instrumented_source_sha256"] == proof["metadata"]["source_sha256"]
+                assert set(build["checks"]) == {label} and build["checks"][label]["return_code"] == 0
+                compiled = next(row for row in build["files"] if row["path"] == label + ".bin")
+                assert compiled["sha256"] == runtime.sha(extracted / "binary")
+                assert build["checks"][label]["recipe"] == build["inputs"]["recipes"][label]
+                assert build["origin"]["CM_SOURCE_REPOSITORY"] == os.environ["CM_SOURCE_REPOSITORY"]
+                assert build["origin"]["GITHUB_REPOSITORY"] == os.environ["GITHUB_REPOSITORY"]
+                for field, name in (("native_scope_probe", "m02-native-probe.json"),
+                                    ("budget_scope_probe", "g02a-native-probe.json")):
+                    if field in proof["metadata"]:
+                        assert proof["metadata"][field] == read(extracted / "fixture" / name)
+                        assert proof["metadata"][field]["binary_sha256"] == compiled["sha256"]
+                destinations = ("probes/cm-concurrency-core",) if label == "m02-native-probe-build" else (
+                    "probes/cm-review-tui", "probes/cm-concurrency-backend")
+                for relative in destinations:
+                    target = inputs / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    assert not target.is_symlink()
+                    shutil.copy2(extracted / "binary", target)
+                for name in allowed:
+                    if name.startswith("fixture/"):
+                        shutil.copyfile(extracted / name, inputs / name)
+                metadata[label] = {"binary_sha256": runtime.sha(extracted / "binary"), **proof["metadata"]}
+    write(inputs / "test-build-overlays.json", metadata)
+
+
+def effective_producer(inputs):
+    value = read(inputs / "producer.json")
+    path = inputs / "test-build-overlays.json"
+    if not path.is_file():
+        return value
+    for label, metadata in read(path).items():
+        if label == "m02-native-probe-build":
+            probe = metadata["native_scope_probe"]
+            value["runtime_sdk"]["native_scope_probe"] = probe
+            if value.get("g02a") and "budget_scope_probe" in metadata:
+                value["g02a"]["private_core_probe"] = metadata["budget_scope_probe"]
+            if value.get("concurrency"):
+                value["concurrency"]["probe"].update(sha256=metadata["binary_sha256"],
+                    source_sha256=probe["native_fixture_source_manifest_sha256"], test_environment=probe["test_environment"])
+        elif label == "review-tui-probe-build":
+            if value.get("review"):
+                value["review"]["probe"].update(sha256=metadata["binary_sha256"], source_sha256=metadata["source_sha256"])
+            if value.get("concurrency"):
+                value["concurrency"]["backend_probe"].update(sha256=metadata["binary_sha256"], source_sha256=metadata["source_sha256"])
+        else:
+            raise AssertionError("Unknown test-build overlay")
+    return value
+
+
+def current_producer_job():
+    p = policy()
+    for attempt in range(12):
+        jobs = p.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100")["jobs"]
+        producers = [j for j in jobs if j["name"] in ("build-read / linux-x64", "build-write / linux-x64") and j["status"] == "in_progress"]
+        if len(producers) == 1:
+            break
+        if attempt < 11:
+            time.sleep(5)
+    assert len(producers) == 1, "Actual producer job identity unavailable"
+    return producers[0]
+
+
 def overlay(root, logs):
     import runtime_consumer
     import runtime_composition
@@ -340,15 +655,7 @@ def overlay(root, logs):
     if plan["status"] == "hit":
         origin = plan["production_origin"]
     else:
-        for attempt in range(12):
-            jobs = p.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100")["jobs"]
-            producers = [j for j in jobs if j["name"] in ("build-read / linux-x64", "build-write / linux-x64") and j["status"] == "in_progress"]
-            if len(producers) == 1:
-                break
-            if attempt < 11:
-                time.sleep(5)
-        assert len(producers) == 1, "Actual producer job identity unavailable"
-        producer = producers[0]
+        producer = current_producer_job()
         origin = {"source_sha": os.environ["CM_SOURCE_SHA"], "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
                   "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
                   "request_id": os.environ["CM_REQUEST_ID"], "job": producer["name"], "job_id": producer["id"]}
@@ -360,16 +667,32 @@ def overlay(root, logs):
         target = destination / "fixture" / path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / path, target)
-    for name in ("runtime_consumer.py", "ci_progress.py", "retry.py"):
+    for name in ("runtime_consumer.py", "ci_progress.py", "retry.py", "runtime_cases.py"):
         shutil.copyfile(root / "ci/scripts" / name, destination / name)
     (destination / "observer.py").write_text(runtime_consumer.runtime_observer_source(runtime_composition), encoding="utf-8")
+    test_builds = dict(plan.get("test_builds", {}))
+    probe_producer = current_producer_job() if plan["changed_probes"] else None
+    for label, variable in (("m02-native-probe-build", "CM_CORE_PROBE_ARTIFACT_ID"),
+                            ("review-tui-probe-build", "CM_TUI_PROBE_ARTIFACT_ID")):
+        if os.environ.get(variable):
+            record = checked_artifact(p.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/artifacts/" + os.environ[variable]),
+                                      int(os.environ["GITHUB_RUN_ID"]))
+            test_builds[label] = {**{key: origin[key] for key in ("source_sha", "workflow_sha", "run_id", "run_attempt",
+                "request_id", "job", "job_id")}, "source_sha": os.environ["CM_SOURCE_SHA"],
+                "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"], "run_id": int(os.environ["GITHUB_RUN_ID"]),
+                "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "request_id": os.environ["CM_REQUEST_ID"],
+                "job": probe_producer["name"], "job_id": probe_producer["id"],
+                "target": label, "artifact": artifact_ref(record),
+                "inputs": {path: value for path, value in plan["probe_inputs"].items() if PRIVATE_PROBES[path] == label}}
     baseline = plan.get("checkpoint_origin")
-    write(destination / "validation.json", {"schema_version": 1, "provenance": runtime_consumer.provenance(),
+    write(destination / "validation.json", {"schema_version": 2, "provenance": runtime_consumer.provenance(),
         "environment": environment(), "production_inputs_sha256": plan["production_inputs_sha256"],
         "build_request": plan["build_request"],
         "production_origin": origin, "checkpoint_origin": baseline,
+        "checkpoint_origins": plan.get("checkpoint_origins", []), "probe_inputs": plan["probe_inputs"],
+        "test_builds": test_builds,
         "test_inputs": test_inputs(root, "HEAD"),
-        "baseline_test_inputs": test_inputs(root, baseline["source_sha"]) if baseline else {},
+        "baseline_test_inputs": {},
         "files": runtime_consumer.inventory(destination)})
     p.output({"production_origin": json.dumps(origin, separators=(",", ":"))})
 
@@ -386,50 +709,60 @@ def refresh():
     old = original["files"]
     for entry in validation["files"]:
         assert "link" not in entry and entry["path"] in {
-            "runtime_consumer.py", "ci_progress.py", "retry.py", "observer.py", *("fixture/" + path for path in RUNTIME_FILES)}
+            "runtime_consumer.py", "ci_progress.py", "retry.py", "runtime_cases.py", "observer.py", *("fixture/" + path for path in RUNTIME_FILES)}
         target = inputs / entry["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(overlay_dir / entry["path"], target)
     allowed = {e["path"] for e in validation["files"]}
     assert [e for e in old if e["path"] not in allowed] == [e for e in runtime.inventory(inputs) if e["path"] not in allowed | {"input-manifest.json"}]
+    refresh_probes(inputs, validation)
     validation["original_input_manifest_sha256"] = original["sha256"]
     write(inputs / "validation.json", validation)
     entries = [e for e in runtime.inventory(inputs) if e["path"] != "input-manifest.json"]
     write(inputs / "input-manifest.json", {"files": entries, "sha256": runtime.digest(entries)})
-    checkpoint = validation["checkpoint_origin"]
-    if checkpoint:
-        worker = os.environ["GITHUB_REPOSITORY"]
-        record = checked_artifact(policy().api("repos/" + worker + "/actions/artifacts/" + str(checkpoint["artifact"]["id"])), checkpoint["run_id"])
-        assert artifact_ref(record) == checkpoint["artifact"]
-        destination = Path(os.environ["RUNNER_TEMP"]) / "cm-runtime-resume"
-        destination.mkdir()
-        with small_archive(worker, record, destination / "checkpoint.zip") as archive:
-            total = 0
-            seen = set()
-            for entry in archive.infolist():
-                path = Path(entry.filename)
-                if (path.is_absolute() or ".." in path.parts or "\\" in entry.filename
-                        or entry.filename in seen or entry.file_size > 16 * 1024 ** 2
-                        or stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG, stat.S_IFDIR)):
-                    raise RuntimeError("Invalid runtime checkpoint path/size")
-                seen.add(entry.filename)
-                if entry.is_dir():
-                    continue
-                total += entry.file_size
-                assert total <= 512 * 1024 ** 2
-                data = archive.read(entry)
-                data.decode("utf-8")
-                assert b"\0" not in data
-                target = destination / path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
-        with open(os.environ["GITHUB_ENV"], "a") as stream:
-            stream.write("CM_RUNTIME_RESUME_DIR=" + str(destination) + "\n")
-
 
 def rootfs_key(closure):
     return digest({"packages": closure["packages"], "files": [entry for entry in closure["files"]
         if not entry["path"].startswith("fixture/") and entry["path"] != "inputs/producer.json"]})
+
+
+
+def native_key(closure, label):
+    phase = label.split("-", 1)[0]
+    mods = {
+        "p04": ("inputs/mods/a/", "inputs/mods/b/"),
+        "consumer": ("inputs/mods/a/", "inputs/mods/b/"),
+        "m01": ("inputs/mods/m01-", "inputs/mods/a/", "inputs/mods/b/"),
+        "m02": ("inputs/mods/m02/",),
+        "m03": ("inputs/mods/",), "m04": ("inputs/mods/m04/", "inputs/mods/m02/"),
+        "m05": ("inputs/mods/m05/", "inputs/mods/m02/"),
+        "g02a": ("inputs/mods/g02a/", "inputs/mods/m02/"),
+        "review": ("inputs/mods/g02b/", "inputs/mods/m02/"),
+        "concurrency": ("inputs/mods/g03/", "inputs/mods/g02a/", "inputs/mods/g02b/", "inputs/mods/m02/"),
+    }.get(phase)
+    assert mods is not None, "Undeclared native dependency: " + label
+    probes = []
+    if phase == "review":
+        probes.append("inputs/probes/cm-review-tui")
+    if phase == "concurrency" and label not in ("concurrency-value-flow", "concurrency-leaf-bound", "concurrency-plug-and-play"):
+        probes.append("inputs/probes/cm-concurrency-core")
+        if label == "concurrency-backend-scope":
+            probes.append("inputs/probes/cm-concurrency-backend")
+    if label == "m02-authoring":
+        probes.extend("fixture/" + name for name in ("m02-native-probe.json", "m02-native-scopes.json",
+            "m02-native-events.jsonl", "m02-native-trace.jsonl"))
+    if phase == "g02a" and label in ("g02a-counting", "g02a-reentry", "g02a-scope", "g02a-cancellation-recovery"):
+        probes.extend("fixture/" + name for name in ("g02a-native-probe.json", "g02a-native-scopes.json",
+            "g02a-native-trace.jsonl"))
+    prefixes = ("inputs/host/", "inputs/official/", *mods)
+    return digest({"packages": closure["packages"], "files": [entry for entry in closure["files"]
+        if entry["path"].startswith(prefixes) or entry["path"] in probes
+        or not entry["path"].startswith(("inputs/", "fixture/"))],
+        "required_paths": probes, "mod_prefixes": mods,
+        "static_fixture_data": [entry for entry in closure["files"] if entry["path"].startswith("fixture/")
+            and not entry["path"].endswith((".py", ".rs", ".patch"))
+            and not re.search(r"(?:producer|native-probe|native-scopes|native-events|native-trace|context)\.(?:json|jsonl)$",
+                             entry["path"])]})
 
 
 class Checkpoints:
@@ -444,25 +777,32 @@ class Checkpoints:
         self.lock = threading.Lock()
         self.results = {}
         self.commands = {}
-        self.index = {"schema_version": 1, "provenance": runtime.provenance(),
+        self.constraints = {}
+        self.index = {"schema_version": 2, "provenance": runtime.provenance(),
             "environment": validation["environment"], "rootfs_key": rootfs_key(closure),
             "test_inputs": validation["test_inputs"], "steps": {}}
-        self.previous = None
+        self.previous = []
+        self.download_lock = threading.Lock()
+        for candidate in validation.get("checkpoint_origins", ()):
+            old = candidate["index"]
+            assert old["schema_version"] == 2 and old["environment"] == validation["environment"]
+            self.previous.append((None, old, candidate))
         previous = os.environ.get("CM_RUNTIME_RESUME_DIR")
         if previous and (Path(previous) / "index.json").is_file():
             old = read(Path(previous) / "index.json")
             origin = validation["checkpoint_origin"]
             expected = {"GITHUB_RUN_ID": str(origin["run_id"]), "GITHUB_RUN_ATTEMPT": str(origin["run_attempt"]),
                         "GITHUB_WORKFLOW_SHA": origin["workflow_sha"], "CM_SOURCE_SHA": origin["source_sha"]}
-            if (old["schema_version"] == 1 and old["environment"] == self.index["environment"]
-                    and old["rootfs_key"] == self.index["rootfs_key"]
-                    and old["test_inputs"] == validation["baseline_test_inputs"]
+            if (old["schema_version"] == 2 and old["environment"] == self.index["environment"]
                     and all(old["provenance"].get(k) == v for k, v in expected.items())):
-                self.previous = (Path(previous), old)
+                self.previous.append((Path(previous), old, origin))
         write(self.directory / "index.json", self.index)
 
     def owns(self, label, path):
         name = path.as_posix()
+        selected = runtime_cases.labels().get(label)
+        if selected:
+            return name.startswith(selected[0] + "/" + selected[1] + "/")
         if label == "consumer-missing-library":
             return name == "missing-library.json" or name.startswith("failures/missing-library/")
         if label == "consumer-library-recovery":
@@ -487,17 +827,55 @@ class Checkpoints:
                 and p.suffix in {".json", ".jsonl", ".log"}
                 and self.owns(label, p.relative_to(self.evidence))]
 
+    def key_inputs(self, label):
+        return {"native": native_key(self.closure, label), "environment": self.index["environment"],
+                "test": digest(self.index["test_inputs"][label]), "command": self.commands[label],
+                "constraints": self.constraints.get(label, {})}
+
     def key(self, label):
-        return digest({"rootfs": self.index["rootfs_key"], "environment": self.index["environment"],
-                       "test": self.index["test_inputs"][label], "command": self.commands[label]})
+        return digest(self.key_inputs(label))
+
+    def decision(self, label):
+        current = self.key_inputs(label)
+        comparisons = []
+        for _, old, candidate in self.previous:
+            step = old["steps"].get(label)
+            if not step:
+                comparisons.append({"run_id": candidate["run_id"], "reason": "case_missing"})
+                continue
+            before = step.get("inputs", {})
+            changed = [key for key in current if current[key] != before.get(key)]
+            previous_test = old["test_inputs"].get(label, {})
+            now = self.index["test_inputs"][label]
+            dependency_changes = step.get("dependency_changes", [])
+            if isinstance(previous_test, dict) and isinstance(now, dict):
+                a, b = previous_test.get("dependencies", {}), now.get("dependencies", {})
+                dependency_changes = sorted(key for key in a.keys() | b.keys() if a.get(key) != b.get(key))
+            comparisons.append({"run_id": candidate["run_id"], "reason": "inputs_changed" if changed else step["status"],
+                "changed": changed, "dependency_changes": dependency_changes})
+        return {"reason": "no_compatible_pass", "comparisons": comparisons,
+                "dependency_fingerprint": current["test"],
+                "conservative_reasons": self.index["test_inputs"][label].get("conservative_reasons", [])
+                    if isinstance(self.index["test_inputs"][label], dict) else []}
 
     def restore(self, label):
-        if not self.previous:
+        selected = None
+        for directory, old, candidate in self.previous:
+            step = old["steps"].get(label)
+            if (step and step["status"] == "pass" and step["key"] == self.key(label)
+                    and step.get("inputs", {}).get("test") == digest(self.index["test_inputs"][label])):
+                selected = directory, old, candidate, step
+                break
+        if selected is None:
             return None
-        directory, old = self.previous
-        step = old["steps"].get(label)
-        if not step or step["status"] != "pass" or step["key"] != self.key(label):
-            return None
+        directory, old, candidate, step = selected
+        if directory is None:
+            directory = Path(os.environ["RUNNER_TEMP"]) / "cm-runtime-resume" / str(candidate["artifact"]["id"])
+            with self.download_lock:
+                if not (directory / "index.json").is_file():
+                    extract_checkpoint(os.environ["GITHUB_REPOSITORY"], candidate, directory)
+        step = read(directory / "index.json")["steps"][label]
+        assert step["status"] == "pass" and step["key"] == self.key(label)
         source_dir = directory / label
         assert self.runtime.inventory(source_dir) == step["files"], "Checkpoint bytes changed"
         audit = read(source_dir / "audit.json")
@@ -517,7 +895,7 @@ class Checkpoints:
             self.index["steps"][label] = step
             write(self.directory / "index.json", self.index)
         return {"status": "pass", "kind": "reused", "origin": step["origin"], "audit": audit,
-                "checkpoint_artifact": self.validation["checkpoint_origin"]["artifact"]}
+                "checkpoint_artifact": candidate["artifact"], "reason": "verified_case_inputs"}
 
     def save(self, label, audit):
         import mod_manifest
@@ -533,11 +911,12 @@ class Checkpoints:
         write(destination / "audit.json", audit)
         self.runtime.check_evidence_redaction(list(destination.rglob("*")))
         step = {"status": "pass", "key": self.key(label), "origin": self.runtime.provenance(),
-                "files": self.runtime.inventory(destination)}
+                "files": self.runtime.inventory(destination), "inputs": self.key_inputs(label)}
         with self.lock:
             self.index["steps"][label] = step
             write(self.directory / "index.json", self.index)
-        return {"status": "pass", "kind": "executed", "origin": step["origin"], "audit": audit}
+        return {"status": "pass", "kind": "executed", "origin": step["origin"], "audit": audit,
+                **self.decision(label)}
 
     def run(self, logs, label, command, timeout):
         import ci_progress
@@ -547,6 +926,8 @@ class Checkpoints:
         try:
             result = self.restore(label)
             if result is None:
+                decision = self.decision(label)
+                print("CM runtime execute:", label, json.dumps(decision["comparisons"], separators=(",", ":")), flush=True)
                 completed = ci_progress.run(logs, label, command, timeout)
                 assert completed.returncode == 0, "Runtime step failed: " + label
                 for name in self.reports.get(label, ()):
@@ -567,7 +948,8 @@ class Checkpoints:
             return subprocess.CompletedProcess(command, 0)
         except Exception as error:
             with self.lock:
-                self.results[label] = {"status": "failed", "kind": "executed", "error": repr(error)}
+                self.results[label] = {"status": "failed", "kind": "executed", "error": repr(error),
+                    **self.decision(label)}
             ci_progress.emit(label, "failed", started)
             return subprocess.CompletedProcess(command, 1)
         finally:
@@ -582,6 +964,10 @@ def self_check():
     assert projection(text, ("passed",)) == projection(text.replace("return 0", "return 1"), ("passed",))
     assert projection(text, ("failed",)) != projection(text.replace("return 0", "return 1"), ("failed",))
     assert projection(text, ("passed",)) != projection(text.replace("X = 1", "X = 2"), ("passed",))
+    wrappers = "def driver(): return 1\ndef produce(): return 2\n"
+    assert projection(wrappers, exclude=("driver",)) == projection(
+        wrappers.replace("return 1", "return 3"), exclude=("driver",))
+    runtime_cases.self_check()
     root = Path(os.environ["GITHUB_WORKSPACE"])
     if not (root / "ci/scripts").is_dir():
         root = Path(os.environ["CM_SOURCE_DIR"])
@@ -593,13 +979,162 @@ def self_check():
     assert rootfs_key(base) == rootfs_key(changed)
     changed["packages"]["libc6"] = "2"
     assert rootfs_key(base) != rootfs_key(changed)
-    with patch.dict(os.environ, {"CM_SOURCE_REPOSITORY": os.environ["GITHUB_REPOSITORY"],
+    with patch.dict(os.environ, {"CM_SOURCE_REPOSITORY": os.environ.get("CM_SOURCE_REPOSITORY", os.environ["GITHUB_REPOSITORY"]),
             "CM_SOURCE_SHA": git(root, "rev-parse", "HEAD").decode().strip(), "CM_REQUEST_ID": "retry-self-check"}):
         checkpoint_self_check()
+        history_self_check()
+        native_self_check()
+        probe_overlay_self_check()
     origin_self_check()
     request_self_check()
     g02a_checkpoint_self_check()
     print("CM retry input/dependency/environment self-checks passed", flush=True)
+
+
+def native_self_check():
+    from copy import deepcopy
+    labels = ("p04-states", "m02-authoring", "m04-query", "review-key-events",
+              "g02a-counting", "concurrency-backend-scope", "concurrency-lock-domains")
+    files = ("inputs/host/bin/codex", "inputs/mods/m02/example/payload.so", "inputs/probes/cm-review-tui",
+        "inputs/probes/cm-concurrency-core", "inputs/probes/cm-concurrency-backend",
+        "fixture/m02-native-probe.json", "fixture/g02a-native-probe.json", "fixture/concurrency-models.json")
+    closure = {"packages": {"libc6": "1"}, "files": [{"path": path, "sha256": "before"} for path in files]}
+    before = {label: native_key(closure, label) for label in labels}
+    expected = {
+        "inputs/probes/cm-review-tui": {"review-key-events"},
+        "inputs/probes/cm-concurrency-core": {"concurrency-backend-scope", "concurrency-lock-domains"},
+        "inputs/probes/cm-concurrency-backend": {"concurrency-backend-scope"},
+        "fixture/m02-native-probe.json": {"m02-authoring"},
+        "fixture/g02a-native-probe.json": {"g02a-counting"},
+    }
+    for path, affected in expected.items():
+        changed = deepcopy(closure)
+        next(row for row in changed["files"] if row["path"] == path)["sha256"] = "after"
+        assert {label for label in labels if before[label] != native_key(changed, label)} == affected, path
+    changed = deepcopy(closure)
+    changed["files"][0]["sha256"] = "changed-host"
+    assert all(before[label] != native_key(changed, label) for label in labels)
+    changed = deepcopy(closure)
+    changed["packages"]["libc6"] = "2"
+    assert all(before[label] != native_key(changed, label) for label in labels)
+    import runtime_consumer
+    import runtime_sdk
+    assert runtime_cases.ENTRY_INVALID == runtime_consumer.ENTRY_INVALID
+    assert runtime_cases.CALL_INVALID == runtime_consumer.CALL_INVALID
+    assert runtime_cases.SDK_INVALID == runtime_sdk.NEGATIVE
+
+
+def history_self_check():
+    from contextlib import nullcontext
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    worker, workflow = "DSLZL/CM-build-linux-x64", "b" * 40
+    wanted = {"p04-states": "a", "m04-query": "b"}
+    indexes, records = {}, {}
+    runs = []
+    for number, labels in ((9014, ()), (9013, ()), (9012, ("m04-query",)), (9011, ("p04-states",))):
+        runs.append({"id": number, "run_attempt": 1, "head_sha": workflow, "event": "workflow_dispatch",
+            "path": ".github/workflows/build.yml", "display_title": "CM Linux x64 / history-" + str(number)})
+        record = {"id": number, "name": "cm-linux-x64-consumer-checkpoints-history-" + str(number) + "-1",
+            "digest": "sha256:" + "c" * 64, "size_in_bytes": 1, "expired": number == 9013,
+            "workflow_run": {"id": number}}
+        records[number] = record
+        indexes[number] = {"schema_version": 2, "environment": environment(),
+            "provenance": {"GITHUB_REPOSITORY": worker, "GITHUB_RUN_ID": str(number), "GITHUB_RUN_ATTEMPT": "1",
+                "GITHUB_WORKFLOW_SHA": workflow, "CM_SOURCE_SHA": "a" * 40,
+                "CM_SOURCE_REPOSITORY": "DSLZL/CM"},
+            "test_inputs": wanted, "steps": {label: {"status": "pass", "key": label} for label in labels}}
+    def api(path):
+        if "/compare/" in path:
+            return {"status": "ahead"}
+        number = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+        return {"artifacts": [] if number == 9014 else [records[number]]}
+    stub = SimpleNamespace(api=api, archive_json=lambda archive, name: deepcopy(indexes[archive["id"]]))
+    with patch(__name__ + ".policy", return_value=stub), patch(__name__ + ".git"), \
+            patch(__name__ + ".test_inputs", return_value=wanted), \
+            patch(__name__ + ".small_archive", side_effect=lambda worker, record, path: nullcontext(record)):
+        selected = checkpoint_history(None, runs, worker, workflow)
+        assert {row["run_id"] for row in selected} == {9012, 9011}
+        assert {label for row in selected for label in row["labels"]} == set(wanted)
+        indexes[9012]["provenance"]["GITHUB_RUN_ID"] = "other-run"
+        selected = checkpoint_history(None, runs, worker, workflow)
+        assert {row["run_id"] for row in selected} == {9011}, "Invalid latest index hid an earlier pass"
+        indexes[9011]["schema_version"] = 1
+        assert not checkpoint_history(None, runs, worker, workflow), "Legacy combined matrix was reused"
+
+
+def probe_overlay_self_check():
+    from contextlib import nullcontext
+    from copy import deepcopy
+    from io import BytesIO
+    from unittest.mock import patch
+    import runtime_consumer as runtime
+    import zipfile
+    label = "review-tui-probe-build"
+    expected = {path: "a" * 64 for path, target in PRIVATE_PROBES.items() if target == label}
+    origin = runtime.provenance()
+    item = {"target": label, "inputs": expected, "run_id": int(origin["GITHUB_RUN_ID"]),
+        "run_attempt": int(origin["GITHUB_RUN_ATTEMPT"]), "workflow_sha": origin["GITHUB_WORKFLOW_SHA"],
+        "source_sha": origin["CM_SOURCE_SHA"], "request_id": origin["CM_REQUEST_ID"]}
+    def archive(path):
+        data = BytesIO()
+        with zipfile.ZipFile(data, "w") as output:
+            for file in sorted(path.rglob("*")):
+                if file.is_file():
+                    output.write(file, file.relative_to(path).as_posix())
+        data.seek(0)
+        return zipfile.ZipFile(data)
+    with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
+        root = Path(temporary)
+        artifact, inputs = root / "artifact", root / "inputs"
+        artifact.mkdir()
+        (inputs / "host/bin").mkdir(parents=True)
+        (inputs / "host/bin/codex").write_bytes(b"frozen-host")
+        write(inputs / "producer.json", {"host": {"unchanged": True}})
+        (artifact / "binary").write_bytes(b"private-tui-probe")
+        (artifact / "binary").chmod(0o755)
+        recipe = {"binary": "codex_tui"}
+        write(artifact / "build.json", {"origin": origin, "inputs": {
+            "instrumented_source_sha256": "f" * 64, "recipes": {label: recipe}},
+            "checks": {label: {"return_code": 0, "recipe": recipe}},
+            "files": [{"path": label + ".bin", "sha256": runtime.sha(artifact / "binary")}]})
+        proof = {"schema_version": 1, "target": label, "inputs": expected, "provenance": origin,
+            "metadata": {"source_sha256": "f" * 64}, "files": runtime.inventory(artifact)}
+        write(artifact / "test-build.json", proof)
+        validation = {"probe_inputs": expected, "test_builds": {label: item}}
+        before = runtime.inventory(inputs / "host")
+        p = policy()
+        with patch(__name__ + ".verify_test_build", return_value={}), \
+                patch.object(p, "download_origin_archive", side_effect=lambda worker, record, path: archive(artifact)):
+            refresh_probes(inputs, validation)
+            assert runtime.inventory(inputs / "host") == before
+            assert (inputs / "probes/cm-review-tui").read_bytes() == b"private-tui-probe"
+            assert (inputs / "probes/cm-concurrency-backend").read_bytes() == b"private-tui-probe"
+            original = deepcopy(proof)
+            for mutation in ("unknown-target", "host-overwrite", "wrong-origin", "wrong-bytes", "wrong-recipe"):
+                candidate = deepcopy(original)
+                if mutation == "unknown-target":
+                    candidate["target"] = "host"
+                elif mutation == "host-overwrite":
+                    candidate["files"][0]["path"] = "host/bin/codex"
+                elif mutation == "wrong-origin":
+                    candidate["provenance"]["GITHUB_RUN_ID"] = "other-run"
+                elif mutation == "wrong-bytes":
+                    candidate["files"][0]["sha256"] = "wrong"
+                else:
+                    receipt = read(artifact / "build.json")
+                    receipt["checks"][label]["return_code"] = 1
+                    write(artifact / "build.json", receipt)
+                    candidate["files"] = [row for row in runtime.inventory(artifact) if row["path"] != "test-build.json"]
+                write(artifact / "test-build.json", candidate)
+                try:
+                    refresh_probes(inputs, validation)
+                except (AssertionError, KeyError):
+                    pass
+                else:
+                    raise AssertionError("Invalid test-build overlay accepted: " + mutation)
+                assert runtime.inventory(inputs / "host") == before
 
 
 def g02a_checkpoint_self_check():
@@ -700,6 +1235,30 @@ def checkpoint_self_check():
             assert second.results[labels[0]]["kind"] == "reused" and second.results[labels[0]]["origin"] == provenance
             assert read(evidence / "isolation-probes.json") == {"current_probe": 2}
             assert not (directory / "second" / labels[0] / "evidence/A.entered").exists()
+            # The newest run may have no checkpoint; different passed cases can come from different runs.
+            previous = []
+            sources = {}
+            for number, source_dir, included in ((13, directory / "second", ()),
+                    (12, directory / "second", (labels[1],)), (11, directory / "first", (labels[0],))):
+                snapshot = directory / ("history-" + str(number))
+                snapshot.mkdir()
+                index = read(source_dir / "index.json")
+                index["steps"] = {label: index["steps"][label] for label in included}
+                for label in included:
+                    shutil.copytree(source_dir / label, snapshot / label)
+                write(snapshot / "index.json", index)
+                sources[number] = snapshot
+                previous.append({**origin, "run_id": number, "artifact": {"id": number}, "index": index})
+            os.environ.update(CM_RUNTIME_CHECKPOINT_DIR=str(directory / "multi"), CM_RUNTIME_RESUME_DIR="")
+            multi = Checkpoints(runtime, {**validation, "checkpoint_origins": previous},
+                closure, temp, evidence, logs, reports, [])
+            def extract(worker, candidate, destination):
+                shutil.copytree(sources[candidate["artifact"]["id"]], destination)
+            with patch(__name__ + ".extract_checkpoint", side_effect=extract) as download:
+                assert all(multi.run(logs, label, [], 1).returncode == 0 for label in labels)
+                assert [multi.results[label]["checkpoint_artifact"]["id"] for label in labels] == [11, 12]
+                assert download.call_count == 2 and calls == [labels[0], labels[1], labels[1]]
+            os.environ["CM_RUNTIME_RESUME_DIR"] = str(directory / "first")
             # A changed test reruns only that step; changed bytes and failed audits never become hits.
             validation["test_inputs"][labels[0]] = "changed"
             os.environ["CM_RUNTIME_CHECKPOINT_DIR"] = str(directory / "third")
@@ -757,6 +1316,18 @@ def origin_self_check():
                 return next(responses) if path == jobs_path else api(path)
             assert verify_production_origin(origin, fetch=delayed)["input_artifact"] == records[2]
             pause.assert_called_once_with(5)
+        test_record = {**records[1], "id": 3,
+            "name": "cm-linux-x64-test-build-review-tui-probe-build-retry-self-check-1"}
+        records[3] = test_record
+        test_build = {**origin, "target": "review-tui-probe-build", "artifact": artifact_ref(test_record)}
+        assert verify_test_build(test_build, worker="DSLZL/CM-build-linux-x64", fetch=api) == test_record
+        for key, changed in (("job_id", 21), ("run_attempt", 2), ("target", "host")):
+            try:
+                verify_test_build({**test_build, key: changed}, worker="DSLZL/CM-build-linux-x64", fetch=api)
+            except (AssertionError, RuntimeError):
+                pass
+            else:
+                raise AssertionError("Unbound test-build run/job/target accepted")
         for conclusion in ("failure", "cancelled", "skipped"):
             def failed(path):
                 if path == jobs_path:
@@ -791,4 +1362,4 @@ if __name__ == "__main__":
     else:
         root = Path(os.environ["CM_SOURCE_DIR"])
         logs = Path(os.environ["CM_CI_LOG_DIR"])
-        {"plan": select, "overlay": overlay}[sys.argv[1]](root, logs)
+        {"plan": select, "overlay": overlay, "probe-prepare": probe_prepare, "probe-build": probe_build}[sys.argv[1]](root, logs)

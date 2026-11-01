@@ -187,6 +187,8 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Consume runtime inputs in a strict minimal rootfs
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
         run: /usr/bin/python3 -B "$CM_CONSUMER_INPUT_DIR/runtime_consumer.py" consume
       - name: Upload actual consumer product evidence
         id: payload

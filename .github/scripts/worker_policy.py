@@ -697,6 +697,22 @@ def receipt():
             "artifact_sha256": consumer_digest, "source_sha": sha, "workflow_sha": workflow_sha,
             "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "request_id": request,
             "production_origin": origin, "validation_artifact": validation_artifact()}
+        from retry import checked_artifact, small_archive, verify_test_build
+        validation_ref = consumer["validation_artifact"]
+        validation_record = checked_artifact(api("repos/" + worker + "/actions/artifacts/" +
+            str(validation_ref["artifact_id"])), int(os.environ["GITHUB_RUN_ID"]))
+        with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+            with small_archive(worker, validation_record, Path(directory) / "validation.zip") as archive:
+                validation = archive_json(archive, "validation.json")
+        assert validation["schema_version"] == 2 and validation["production_origin"] == origin
+        expected = {"CM_SOURCE_REPOSITORY": source, "CM_SOURCE_SHA": sha, "GITHUB_REPOSITORY": worker,
+            "GITHUB_WORKFLOW_SHA": workflow_sha, "GITHUB_RUN_ID": os.environ["GITHUB_RUN_ID"],
+            "GITHUB_RUN_ATTEMPT": os.environ["GITHUB_RUN_ATTEMPT"], "CM_REQUEST_ID": request}
+        assert validation["provenance"] == expected
+        for label, test_build in validation["test_builds"].items():
+            assert label == test_build["target"]
+            verify_test_build(test_build)
+        consumer["test_builds"] = validation["test_builds"]
     out = Path(os.environ["RUNNER_TEMP"], "cm-worker-receipt")
     out.mkdir(exist_ok=True)
     (out / "worker-receipt.json").write_text(json.dumps({"schema_version": 1, "ci": ci, "consumer": consumer,
