@@ -971,7 +971,19 @@ def self_check():
     root = Path(os.environ["GITHUB_WORKSPACE"])
     if not (root / "ci/scripts").is_dir():
         root = Path(os.environ["CM_SOURCE_DIR"])
-    assert set(test_inputs(root, "HEAD")) == set(PHASES)
+    current = test_inputs(root, "HEAD")
+    assert set(current) == set(PHASES)
+    state_path = "fixtures/state/driver.py"
+    state_text = source(root, "HEAD", state_path)
+    entry = "def case_query(m, sdk, frozen, authored):\n"
+    assert state_text.count(entry) == 1
+    changed_state = state_text.replace(entry, entry + '    assert False, "dependency self-check only"\n')
+    original_source = source
+    with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, path:
+            changed_state if path == state_path else original_source(directory, revision, path)):
+        changed = test_inputs(root, "HEAD")
+    affected = {label for label in current if current[label] != changed[label]}
+    assert affected == {"m04-query"}, ("Private matrix case dependency leak", sorted(affected))
     assert product_inputs(root, "HEAD")["files"]
     base = {"packages": {"libc6": "1"}, "files": [{"path": "usr/bin/python3", "sha256": "a"}, {"path": "fixture/test.py", "sha256": "a"}]}
     changed = json.loads(json.dumps(base))
