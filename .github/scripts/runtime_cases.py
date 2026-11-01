@@ -314,6 +314,10 @@ def closure(texts, entries, dispatch=None):
     return {"dependencies": dict(sorted(dependencies.items())), "conservative_reasons": sorted(set(reasons))}
 
 def self_check():
+    root = Path(__file__).resolve().parents[2]
+    for phase, path in DRIVERS.items():
+        missing = {"WORK", "PROFILE", "EVIDENCE"} - bindings(ast.parse((root / path).read_text())).keys()
+        assert not missing, ("Missing case roots", phase, sorted(missing))
     texts = {"a.py": "UNUSED=1\nUSED=2\ndef other():return UNUSED\ndef entry():\n return USED\n"}
     original = closure(texts, [("a.py", "entry")])
     assert original == closure({"a.py": texts["a.py"].replace("UNUSED=1", "UNUSED=9")}, [("a.py", "entry")])
