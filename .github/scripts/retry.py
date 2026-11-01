@@ -494,13 +494,17 @@ def probe_build(root, logs):
         target.mkdir(parents=True)
         metadata = {}
         if label == "m02-native-probe-build":
+            names = ("m02-native-probe.json", "m02-native-scopes.json", "m02-native-events.jsonl", "m02-native-trace.jsonl",
+                *(("g02a-native-probe.json", "g02a-native-scopes.json", "g02a-native-trace.jsonl")
+                  if producer.get("g02a") else ()))
+            # Frozen proof outputs must not collide with create_new traces or append into old events.
+            for name in names:
+                (inputs / "fixture" / name).unlink(missing_ok=True)
             metadata["native_scope_probe"] = runtime_sdk.native_probe(root, logs, inputs, inputs / "host", producer["host"])
             if producer.get("g02a"):
                 metadata["budget_scope_probe"] = turn_budget.native_probe(root, logs, inputs, producer["host"],
                     {"native_scope_probe": metadata["native_scope_probe"]})
-            for name in ("m02-native-probe.json", "m02-native-scopes.json", "m02-native-events.jsonl", "m02-native-trace.jsonl",
-                         *(("g02a-native-probe.json", "g02a-native-scopes.json", "g02a-native-trace.jsonl")
-                           if producer.get("g02a") else ())):
+            for name in names:
                 (target / "fixture").mkdir(exist_ok=True)
                 shutil.copyfile(inputs / "fixture" / name, target / "fixture" / name)
         binary = acceptance_cache.run(root, logs, label)
@@ -1003,6 +1007,7 @@ def self_check():
         checkpoint_self_check()
         history_self_check()
         native_self_check()
+        probe_build_self_check()
         probe_overlay_self_check()
     origin_self_check()
     request_self_check()
@@ -1081,6 +1086,51 @@ def history_self_check():
         assert {row["run_id"] for row in selected} == {9011}, "Invalid latest index hid an earlier pass"
         indexes[9011]["schema_version"] = 1
         assert not checkpoint_history(None, runs, worker, workflow), "Legacy combined matrix was reused"
+
+
+def probe_build_self_check():
+    from unittest.mock import patch
+    import acceptance_cache
+    import runtime_sdk
+    import turn_budget
+    names = {
+        "m02": ("m02-native-probe.json", "m02-native-scopes.json", "m02-native-events.jsonl", "m02-native-trace.jsonl"),
+        "g02a": ("g02a-native-probe.json", "g02a-native-scopes.json", "g02a-native-trace.jsonl")}
+    with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
+        root = Path(temporary)
+        inputs = root / "cm-probe-base/runtime-inputs"
+        (inputs / "fixture").mkdir(parents=True)
+        write(inputs / "producer.json", {"host": {}, "g02a": {"enabled": True}})
+        (inputs / "host").mkdir()
+        (inputs / "host/codex").write_bytes(b"frozen-host")
+        for group in names.values():
+            for name in group:
+                (inputs / "fixture" / name).write_text("stale")
+        label = "m02-native-probe-build"
+        logs, output, cache = root / "logs", root / "test-build", root / "cache"
+        write(logs / "retry-plan.json", {"changed_probes": [label], "probe_inputs": {}})
+        write(cache / label / "build.json", {"inputs": {"instrumented_source_sha256": "f" * 64}})
+        binary = root / "binary"
+        binary.write_bytes(b"private-core-probe")
+        before = {path: (inputs / path).read_bytes() for path in ("producer.json", "host/codex")}
+
+        def proof(group):
+            assert all(not (inputs / "fixture" / name).exists() for name in names[group]), "Frozen proof output leaked"
+            for name in names[group]:
+                with (inputs / "fixture" / name).open("x") as stream:
+                    stream.write("fresh")
+            return {"status": "pass"}
+
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(root), "CM_TEST_BUILD_DIR": str(output),
+                "CM_ACCEPTANCE_BUILD_CACHE_DIR": str(cache)}), \
+                patch.object(runtime_sdk, "native_probe", side_effect=lambda *args: proof("m02")), \
+                patch.object(turn_budget, "native_probe", side_effect=lambda *args: proof("g02a")), \
+                patch.object(acceptance_cache, "run", return_value=binary), patch.object(policy(), "output"):
+            probe_build(root, logs)
+        for group in names.values():
+            for name in group:
+                assert (output / label / "fixture" / name).read_text() == "fresh"
+        assert all((inputs / path).read_bytes() == data for path, data in before.items())
 
 
 def probe_overlay_self_check():
