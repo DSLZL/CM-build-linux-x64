@@ -27,6 +27,7 @@ RUNTIME_FILES = (
     "ci/scripts/review_before_send.py", "fixtures/review-before-send/driver.py",
     "ci/scripts/tool_concurrency.py", "fixtures/tool-concurrency/driver.py", "ci/scripts/runtime_cases.py",
     "ci/scripts/runtime_qualification.py", "fixtures/runtime-qualification/driver.py",
+    "ci/scripts/runtime_hooks.py", "fixtures/runtime-hooks/driver.py",
 )
 PHASES = {
     "consumer-matrix": (("fixtures/runtime-consumer/driver.py", "matrix"),),
@@ -129,7 +130,7 @@ def test_inputs(root, revision):
     result = {}
     for label, entries in PHASES.items():
         selected = runtime_cases.labels().get(label)
-        dispatch = {runtime_cases.DRIVERS[selected[0]]: runtime_cases.function(selected[1])} if selected else {}
+        dispatch = {runtime_cases.DRIVERS[selected[0]]: runtime_cases.function(selected[1], selected[0])} if selected else {}
         if selected:
             wrapper = {"m02": ("ci/scripts/runtime_sdk.py", "matrix"),
                 "m03": ("ci/scripts/managed_package.py", "driver"), "m04": ("ci/scripts/runtime_state.py", "driver"),
@@ -164,6 +165,7 @@ def product_inputs(root, revision):
     runtime_modules["ci/scripts/review_before_send.py"] = {"driver", "self_check"}
     runtime_modules["ci/scripts/tool_concurrency.py"] = {"driver", "self_check"}
     runtime_modules["ci/scripts/runtime_qualification.py"] = {"reports", "self_check"}
+    runtime_modules["ci/scripts/runtime_hooks.py"] = {"reports", "self_check"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
@@ -742,6 +744,7 @@ def native_key(closure, label):
         "m02": ("inputs/mods/m02/",),
         "m03": ("inputs/mods/",), "m04": ("inputs/mods/m04/", "inputs/mods/m02/"),
         "g04": ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/"),
+        "g01": ("inputs/mods/g01/a/normal/",),
         "m05": ("inputs/mods/m05/", "inputs/mods/m02/"),
         "g02a": ("inputs/mods/g02a/", "inputs/mods/m02/"),
         "review": ("inputs/mods/g02b/", "inputs/mods/m02/"),
@@ -751,6 +754,24 @@ def native_key(closure, label):
     if label == "g04-abi":
         mods += ("inputs/mods/constructor-sentinel/",)
     probes = []
+    if phase == "g01":
+        case = label.removeprefix("g01-")
+        if case in ("qualification-matrix", "core-baseline", "ordinary-reentry"):
+            mods = ()
+        elif case in ("conflict-advanced", "conflict-mixed"):
+            mods = ("inputs/mods/g01/a/replacement/", "inputs/mods/g01/b/replacement/")
+        elif case == "core-short":
+            mods = ("inputs/mods/g01/a/short/", "inputs/mods/g01/b/normal/")
+        elif case in ("binding-drift", "binding-aslr", "core-around", "core-error", "next-repeat",
+                      "next-stale-owner", "next-thread", "cancel-before", "cancel-during",
+                      "cancel-callback", "restart-disabled"):
+            mods += ("inputs/mods/g01/b/normal/",)
+        if case in ("binding-drift", "next-repeat", "next-stale-owner", "next-thread", "cancel-before", "cancel-callback"):
+            probes.append("inputs/probes/cm-hook-policy")
+        if case == "ordinary-reentry":
+            probes.extend(("fixture/m02-native-probe.json", "fixture/m02-native-trace.jsonl"))
+        if case == "qualification-matrix":
+            probes.append("fixture/g01-producer.json")
     if phase == "review":
         probes.append("inputs/probes/cm-review-tui")
     if phase == "concurrency" and label not in ("concurrency-value-flow", "concurrency-leaf-bound", "concurrency-plug-and-play"):
@@ -826,7 +847,7 @@ class Checkpoints:
             prefix = label.split("-")[0]
             return name.startswith(prefix + "/") or name.startswith(prefix + "-") or name in self.reports[label]
         reserved = {p for key, paths in self.reports.items() if key != label for p in paths}
-        return (not name.startswith(("m01", "m02", "m03", "m04", "m05", "g02a", "g04", "review", "concurrency", "probe", "syscalls.",
+        return (not name.startswith(("m01", "m02", "m03", "m04", "m05", "g02a", "g04", "g01", "review", "concurrency", "probe", "syscalls.",
                                      "failures/missing-library/", "recoveries/actual-missing-library/"))
                 and name not in reserved | {"outer-runtime-audit.json", "missing-library.json",
                     "actual-missing-library-recovery.json", "recovery-environment.json", "step-results.json", "isolation-probes.json"})

@@ -42,14 +42,21 @@ GROUPS = {
     "m04": ("query", "restart", "rollback", "interruption", "stdio", "terminal", "ownership"),
     "m05": ("update", "failures", "metadata", "commands"),
     "g04": ("missing-bwrap", "missing-rg", "missing-code-mode", "missing-inventory", "damaged-package", "abi", "loader-environment", "missing-library"),
+    "g01": ("qualification-matrix", "binding-build-id", "binding-executable", "binding-map",
+        "binding-map-ordinary", "binding-map-missing", "binding-other-host", "binding-abi", "binding-target",
+        "binding-slot", "binding-missing-target", "binding-drift", "binding-aslr", "core-baseline",
+        "core-around", "core-short", "core-error", "next-repeat", "next-stale-owner", "next-thread",
+        "ordinary-reentry", "conflict-advanced", "conflict-mixed", "cancel-before", "cancel-during",
+        "cancel-callback", "restart-disabled", "unsupported-detour", "unsupported-layout",
+        "unsupported-inline", "unsupported-async", "unsupported-signature"),
 }
 DRIVERS = {"p04": "fixtures/runtime-consumer/driver.py", "m01": "ci/scripts/mod_manifest.py",
            "m02": "fixtures/runtime-sdk/driver.py", "m03": "fixtures/managed-package/driver.py",
            "m04": "fixtures/state/driver.py", "m05": "fixtures/mod-author/driver.py",
-           "g04": "fixtures/runtime-qualification/driver.py"}
+           "g04": "fixtures/runtime-qualification/driver.py", "g01": "fixtures/runtime-hooks/driver.py"}
 MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
     ("mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
-     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_cases")},
+     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_cases")},
     "core": "fixtures/native-loader/core_acceptance.py", "core_acceptance": "fixtures/native-loader/core_acceptance.py",
     "tool_barrier": "fixtures/native-loader/tool_barrier.py"}
 DYNAMIC = {"sdk": DRIVERS["m02"], "m": DRIVERS["m03"], "packages": "ci/scripts/mod_manifest.py",
@@ -66,7 +73,9 @@ def labels():
     return {phase + "-" + case: (phase, case) for phase, cases in GROUPS.items() for case in cases}
 
 
-def function(case):
+def function(case, phase=None):
+    if phase == "g01":
+        return "case_" + case.replace("-", "_")
     prefix = case.split("-", 1)[0]
     return "case_" + (prefix if prefix in {"startup", "packages", "callbacks", "rejections", "zip", "config",
         "cancel", "error"} else case.replace("-", "_"))
