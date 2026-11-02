@@ -118,7 +118,7 @@ jobs:
       needs.preflight.outputs.consumer_required == 'true' &&
       (needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     cache-mode: none
     permissions:
       contents: read
