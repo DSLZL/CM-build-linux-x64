@@ -28,7 +28,9 @@ RUNTIME_FILES = (
     "ci/scripts/tool_concurrency.py", "fixtures/tool-concurrency/driver.py", "ci/scripts/runtime_cases.py",
     "ci/scripts/runtime_qualification.py", "fixtures/runtime-qualification/driver.py",
     "ci/scripts/runtime_hooks.py", "fixtures/runtime-hooks/driver.py",
+    "ci/scripts/runtime_upgrade.py", "fixtures/compatibility/driver.py",
 )
+RUNTIME_DATA = ("ci/g05-baseline.json",)
 PHASES = {
     "consumer-matrix": (("fixtures/runtime-consumer/driver.py", "matrix"),),
     "consumer-missing-library": (("fixtures/runtime-consumer/driver.py", "missing_library"),),
@@ -146,6 +148,8 @@ def test_inputs(root, revision):
             for node in module.body if isinstance(node, ast.If) and any(
                 isinstance(item, ast.Name) and item.id == "__name__" for item in ast.walk(node.test))])
         value.update(protocol=runtime_cases.PROTOCOL, audit=digest({"outer": audit, "observer": observer}))
+        if selected and selected[0] == "g05":
+            value["qualification_data"] = {path: digest(source(root, revision, path)) for path in RUNTIME_DATA}
         result[label] = value
     return result
 
@@ -166,6 +170,7 @@ def product_inputs(root, revision):
     runtime_modules["ci/scripts/tool_concurrency.py"] = {"driver", "self_check"}
     runtime_modules["ci/scripts/runtime_qualification.py"] = {"reports", "self_check"}
     runtime_modules["ci/scripts/runtime_hooks.py"] = {"reports", "self_check"}
+    runtime_modules["ci/scripts/runtime_upgrade.py"] = {"reports", "self_check", "driver", "restore_reference", "baseline_file", "mount_reference"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
@@ -173,7 +178,7 @@ def product_inputs(root, revision):
     for row in filter(None, tree):
         metadata, name = row.split(b"\t", 1)
         path = name.decode()
-        if (path in administrative or path in PRIVATE_PROBES or path.endswith(".md") or path.startswith(("docs/", ".github/workflows/", "ci/worker/"))
+        if (path in administrative or path in PRIVATE_PROBES or path in RUNTIME_DATA or path.endswith(".md") or path.startswith(("docs/", ".github/workflows/", "ci/worker/"))
                 or path.startswith("fixtures/") and path.endswith(".py")
                 or "/.vscode/" in path or "/.github/" in path):
             continue
@@ -671,7 +676,7 @@ def overlay(root, logs):
             origin[key] = artifact_ref(checked_artifact(p.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/artifacts/" + os.environ[variable]), origin["run_id"]))
     destination = Path(os.environ["CM_VALIDATION_INPUT_DIR"])
     destination.mkdir()
-    for path in RUNTIME_FILES:
+    for path in (*RUNTIME_FILES, *RUNTIME_DATA):
         target = destination / "fixture" / path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(root / path, target)
@@ -717,7 +722,7 @@ def refresh():
     old = original["files"]
     for entry in validation["files"]:
         assert "link" not in entry and entry["path"] in {
-            "runtime_consumer.py", "ci_progress.py", "retry.py", "runtime_cases.py", "observer.py", *("fixture/" + path for path in RUNTIME_FILES)}
+            "runtime_consumer.py", "ci_progress.py", "retry.py", "runtime_cases.py", "observer.py", *("fixture/" + path for path in (*RUNTIME_FILES, *RUNTIME_DATA))}
         target = inputs / entry["path"]
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(overlay_dir / entry["path"], target)
@@ -745,6 +750,7 @@ def native_key(closure, label):
         "m03": ("inputs/mods/",), "m04": ("inputs/mods/m04/", "inputs/mods/m02/"),
         "g04": ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/"),
         "g01": ("inputs/mods/g01/a/normal/",),
+        "g05": (),
         "m05": ("inputs/mods/m05/", "inputs/mods/m02/"),
         "g02a": ("inputs/mods/g02a/", "inputs/mods/m02/"),
         "review": ("inputs/mods/g02b/", "inputs/mods/m02/"),
@@ -754,6 +760,28 @@ def native_key(closure, label):
     if label == "g04-abi":
         mods += ("inputs/mods/constructor-sentinel/",)
     probes = []
+    if phase == "g05":
+        case = label.removeprefix("g05-")
+        baseline = "inputs/upgrade-baseline/"
+        mods = (baseline + "host/",)
+        normal = tuple("inputs/mods/m02/" + owner + "/normal/" for owner in ("lifecycle-audit", "example-tool"))
+        if case.startswith("candidate-fault-"):
+            mods = ()
+        elif case.startswith("exact-"):
+            mods += (baseline + "mods/g01/a/normal/",)
+            if case == "exact-variant" or case.startswith("exact-wrong-"):
+                mods += ("inputs/mods/g01/a/normal/",)
+        elif case.startswith("state-") or case == "source-busy":
+            mods += ("inputs/mods/m04/",)
+        else:
+            mods += normal
+            roles = (("a", "b") if case in ("check-only", "candidate-success", "labels-tamper")
+                or case.startswith("reuse-ab-") else ("a",) if case.startswith("reuse-a-")
+                or case == "variant-identity" else ("b",) if case.startswith("reuse-b-") else ())
+            mods += tuple(baseline + "mods/" + relative for role, relative in
+                (("a", "g02a/turn-budget/"), ("b", "g02b/review-before-send/")) if role in roles)
+        if case.startswith(("candidate-fault-", "source-drift-")) or case in ("state-copy", "source-busy"):
+            probes.append("fixture/g05-transaction-checks.json")
     if phase == "g01":
         case = label.removeprefix("g01-")
         if case in ("qualification-matrix", "core-baseline", "ordinary-reentry"):
@@ -790,6 +818,8 @@ def native_key(closure, label):
         or not entry["path"].startswith(("inputs/", "fixture/"))],
         "required_paths": probes, "mod_prefixes": mods,
         "static_fixture_data": [entry for entry in closure["files"] if entry["path"].startswith("fixture/")
+            and entry["path"] != "fixture/g05-transaction-checks.json"
+            and (phase == "g05" or entry["path"] not in {"fixture/" + path for path in RUNTIME_DATA})
             and not entry["path"].endswith((".py", ".rs", ".patch"))
             and not re.search(r"(?:producer|native-probe|native-scopes|native-events|native-trace|context)\.(?:json|jsonl)$",
                              entry["path"])]})

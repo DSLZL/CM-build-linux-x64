@@ -178,6 +178,14 @@ jobs:
           /usr/bin/python3 -B .github/scripts/worker_policy.py extract-consumer
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_VALIDATION_ARTIFACT_NAME" --dir "$CM_VALIDATION_INPUT_DIR"
           /usr/bin/python3 -B "$CM_VALIDATION_INPUT_DIR/retry.py" refresh
+      - name: Restore the exact G05 baseline separately from H1 inputs
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: |
+          export PYTHONPATH="$CM_WORKER_POLICY_DIR:$CM_CONSUMER_INPUT_DIR:$CM_CONSUMER_INPUT_DIR/fixture/ci/scripts"
+          if [[ -f "$CM_CONSUMER_INPUT_DIR/fixture/ci/scripts/runtime_upgrade.py" ]]; then
+            /usr/bin/python3 -B "$CM_CONSUMER_INPUT_DIR/fixture/ci/scripts/runtime_upgrade.py" restore-reference
+          fi
       - name: Prepare observation tools and user namespaces before consumption
         run: |
           sudo apt-get update

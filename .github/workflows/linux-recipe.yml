@@ -156,12 +156,28 @@ jobs:
         if: inputs.consumer_required && inputs.build_kind == 'qualification'
         run: |
           python3 -B ci/scripts/retry.py self-check
+          python3 -B ci/scripts/acceptance_cache.py self-check
           python3 -B ci/scripts/mod_author.py self-check
+          python3 -B ci/scripts/managed_package.py self-check
           python3 -B ci/scripts/turn_budget.py self-check
           python3 -B ci/scripts/review_before_send.py self-check
           python3 -B ci/scripts/tool_concurrency.py self-check
           python3 -B ci/scripts/runtime_qualification.py self-check
           python3 -B ci/scripts/runtime_hooks.py self-check
+          python3 -B ci/scripts/runtime_upgrade.py self-check
+          python3 -B - <<'PY'
+          import os
+          from pathlib import Path
+          import py_compile
+          import tempfile
+          import sys
+          sys.path.insert(0, "ci/scripts")
+          from mod_author import source_review
+          source_review(Path.cwd())
+          with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+              for index, script in enumerate([*Path("ci/scripts").glob("*.py"), *Path("fixtures").rglob("*.py")]):
+                  py_compile.compile(str(script), cfile=str(Path(directory) / (str(index) + ".pyc")), doraise=True)
+          PY
       - name: Restore the qualified legacy Host reference for metadata rejection
         if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         env:
@@ -169,6 +185,7 @@ jobs:
         run: |
           python3 -B ci/scripts/turn_budget.py restore-legacy
           python3 -B ci/scripts/review_before_send.py restore-reference
+          python3 -B ci/scripts/runtime_upgrade.py restore-reference --producer
       - name: Install exact reviewed Rust toolchain on the worker
         if: (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
