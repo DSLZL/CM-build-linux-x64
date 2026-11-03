@@ -246,14 +246,6 @@ jobs:
       - name: Generate current protocol and config schema assets before sealing Host sources
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/host.py schemas
-      - name: Restore the qualified legacy Host reference for metadata rejection
-        if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
-        env:
-          CM_POLICY_TOKEN: ${{ github.token }}
-        run: |
-          python3 -B ci/scripts/turn_budget.py restore-legacy
-          python3 -B ci/scripts/review_before_send.py restore-reference
-          python3 -B ci/scripts/runtime_upgrade.py restore-reference --producer
       - name: Seal complete Host inputs and the compiled helper digest
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         id: host-identity
@@ -415,6 +407,14 @@ jobs:
         run: |
           python3 -B ci/scripts/linux_ci.py build-test
           sccache --show-stats --stats-format json > "$CM_CI_LOG_DIR/sccache-after-host.json"
+      - name: Restore the qualified legacy Host reference for metadata rejection
+        if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B ci/scripts/turn_budget.py restore-legacy
+          python3 -B ci/scripts/review_before_send.py restore-reference
+          python3 -B ci/scripts/runtime_upgrade.py restore-reference --producer
       - name: Run actual acceptance for the current mapped task
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: python3 -B ci/scripts/linux_ci.py acceptance
