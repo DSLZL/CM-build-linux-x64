@@ -29,6 +29,7 @@ RUNTIME_FILES = (
     "ci/scripts/runtime_qualification.py", "fixtures/runtime-qualification/driver.py",
     "ci/scripts/runtime_hooks.py", "fixtures/runtime-hooks/driver.py",
     "ci/scripts/runtime_upgrade.py", "fixtures/compatibility/driver.py",
+    "ci/scripts/sdk_seams.py", "fixtures/sdk-seams/driver.py",
 )
 RUNTIME_DATA = ("ci/g05-baseline.json",)
 PHASES = {
@@ -74,6 +75,9 @@ PRIVATE_PROBES = {
     "fixtures/review-before-send/dispatch_probe.rs": "review-tui-probe-build",
     "fixtures/review-before-send/app_probe.rs": "review-tui-probe-build",
     "fixtures/tool-concurrency/backend_probe.rs": "review-tui-probe-build",
+    "fixtures/sdk-seams/runtime_probe.rs": "m02-native-probe-build",
+    "fixtures/sdk-seams/core_probe.rs": "m02-native-probe-build",
+    "fixtures/sdk-seams/stream_probe.rs": "m02-native-probe-build",
 }
 
 
@@ -171,6 +175,7 @@ def product_inputs(root, revision):
     runtime_modules["ci/scripts/runtime_qualification.py"] = {"reports", "self_check"}
     runtime_modules["ci/scripts/runtime_hooks.py"] = {"reports", "self_check"}
     runtime_modules["ci/scripts/runtime_upgrade.py"] = {"reports", "self_check", "driver", "restore_reference", "baseline_file", "mount_reference"}
+    runtime_modules["ci/scripts/sdk_seams.py"] = {"reports", "self_check"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
@@ -751,6 +756,7 @@ def native_key(closure, label):
         "g04": ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/"),
         "g01": ("inputs/mods/g01/a/normal/",),
         "g05": (),
+        "g06": (),
         "m05": ("inputs/mods/m05/", "inputs/mods/m02/"),
         "g02a": ("inputs/mods/g02a/", "inputs/mods/m02/"),
         "review": ("inputs/mods/g02b/", "inputs/mods/m02/"),
@@ -760,6 +766,8 @@ def native_key(closure, label):
     if label == "g04-abi":
         mods += ("inputs/mods/constructor-sentinel/",)
     probes = []
+    if phase == "g06":
+        mods, probes = runtime_cases.g06_native_dependencies(label.removeprefix("g06-"))
     if phase == "g05":
         case = label.removeprefix("g05-")
         baseline = "inputs/upgrade-baseline/"
@@ -818,7 +826,7 @@ def native_key(closure, label):
         or not entry["path"].startswith(("inputs/", "fixture/"))],
         "required_paths": probes, "mod_prefixes": mods,
         "static_fixture_data": [entry for entry in closure["files"] if entry["path"].startswith("fixture/")
-            and entry["path"] != "fixture/g05-transaction-checks.json"
+            and entry["path"] not in ("fixture/g05-transaction-checks.json", "fixture/g06-shutdown-regression.json")
             and (phase == "g05" or entry["path"] not in {"fixture/" + path for path in RUNTIME_DATA})
             and not entry["path"].endswith((".py", ".rs", ".patch"))
             and not re.search(r"(?:producer|native-probe|native-scopes|native-events|native-trace|context)\.(?:json|jsonl)$",
@@ -1051,6 +1059,15 @@ def self_check():
     affected = {label for label in current if current[label] != changed[label]}
     expected = {"m04-query", *("m01-zip-" + name for name in runtime_cases.ZIP_INVALID)}
     assert affected == expected, ("Private matrix case dependency leak", sorted(affected))
+    seams_path = "fixtures/sdk-seams/driver.py"
+    seams_text = source(root, "HEAD", seams_path)
+    entry = "def case_cli_help():\n"
+    assert seams_text.count(entry) == 1
+    changed_seams = seams_text.replace(entry, entry + '    assert False, "single G06 assertion only"\n')
+    with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, path:
+            changed_seams if path == seams_path else original_source(directory, revision, path)):
+        changed = test_inputs(root, "HEAD")
+    assert {label for label in current if current[label] != changed[label]} == {"g06-cli-help"}
     assert product_inputs(root, "HEAD")["files"]
     base = {"packages": {"libc6": "1"}, "files": [{"path": "usr/bin/python3", "sha256": "a"}, {"path": "fixture/test.py", "sha256": "a"}]}
     changed = json.loads(json.dumps(base))
@@ -1102,6 +1119,19 @@ def native_self_check():
     assert runtime_cases.ENTRY_INVALID == runtime_consumer.ENTRY_INVALID
     assert runtime_cases.CALL_INVALID == runtime_consumer.CALL_INVALID
     assert runtime_cases.SDK_INVALID == runtime_sdk.NEGATIVE
+    labels = ("g06-tool-base", "g06-cli-help", "g06-tool-foreign-owner", "g06-replacement-conflict")
+    paths = ("inputs/host/bin/codex", "inputs/mods/g06/a/v1/payload.so", "inputs/mods/g06/b/v1/payload.so",
+             "inputs/mods/g06/a/replacement/payload.so", "inputs/mods/g06/b/replacement/payload.so",
+             "inputs/probes/cm-concurrency-core")
+    closure = {"packages": {"libc6": "1"}, "files": [{"path": path, "sha256": "before"} for path in paths]}
+    before = {label: native_key(closure, label) for label in labels}
+    for path, expected in ((paths[1], {"g06-cli-help", "g06-tool-foreign-owner"}),
+                           (paths[2], {"g06-tool-foreign-owner"}),
+                           (paths[3], {"g06-replacement-conflict"}),
+                           (paths[-1], {"g06-tool-foreign-owner"})):
+        changed = deepcopy(closure)
+        next(row for row in changed["files"] if row["path"] == path)["sha256"] = "after"
+        assert {label for label in labels if before[label] != native_key(changed, label)} == expected, path
 
 
 def history_self_check():

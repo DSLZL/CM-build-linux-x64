@@ -60,21 +60,77 @@ GROUPS = {
         *("state-reject-" + name for name in ("owner", "schema", "version", "unsafe-entry", "overflow", "pending-cleanup")),
         "state-return", *("state-checkpoint-" + name for name in ("home", "host", "generation", "config", "owners")),
         "labels-tamper"),
+    "g06": ("abi-contract", "abi-manifest", "abi-buffers",
+        "tool-base", "tool-next-once", "tool-next-twice", "tool-zero-short", "tool-replacement",
+        "tool-duplicate-actual-name", "tool-reserved-name", "tool-missing-target", "tool-stale-token", "tool-foreign-owner",
+        "cancel-before", "cancel-queued", "cancel-running", "cancel-after-complete", "late-complete",
+        "duplicate-complete", "drop-parent", "release-pending", "noncooperative", "exit-race",
+        "order-ab", "order-discovery-reversed", "order-error", "order-deadline", "order-short", "order-reentry",
+        "order-cycle", "replacement-conflict", "replacement-mixed-conflict",
+        "stream-order", "stream-tool-call", "stream-slow-mod", "stream-slow-consumer", "stream-bound",
+        "stream-mod-error", "stream-drop", "stream-turn-cancel", "stream-late-ack", "stream-retry-scope",
+        "cli-help", "cli-completion", "cli-parse-dispatch", "cli-unknown-args", "cli-profile",
+        "command-name-conflict", "command-actual-drift", "tui-slash", "tui-ui-owner", "tui-wrong-thread",
+        "tui-stale-owner", "tui-cancel", "independent-versions", "independent-disable-delete", "legacy-abc",
+        "old-host-reject", "capability-boundary"),
 }
 DRIVERS = {"p04": "fixtures/runtime-consumer/driver.py", "m01": "ci/scripts/mod_manifest.py",
            "m02": "fixtures/runtime-sdk/driver.py", "m03": "fixtures/managed-package/driver.py",
            "m04": "fixtures/state/driver.py", "m05": "fixtures/mod-author/driver.py",
            "g04": "fixtures/runtime-qualification/driver.py", "g01": "fixtures/runtime-hooks/driver.py",
-           "g05": "fixtures/compatibility/driver.py"}
+           "g05": "fixtures/compatibility/driver.py", "g06": "fixtures/sdk-seams/driver.py"}
 MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
     ("mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
-     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases")},
+     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases", "sdk_seams")},
     "core": "fixtures/native-loader/core_acceptance.py", "core_acceptance": "fixtures/native-loader/core_acceptance.py",
     "tool_barrier": "fixtures/native-loader/tool_barrier.py"}
 DYNAMIC = {"sdk": DRIVERS["m02"], "m": DRIVERS["m03"], "packages": "ci/scripts/mod_manifest.py",
            "budget": "fixtures/turn-budget/driver.py", "review": "fixtures/review-before-send/driver.py"}
 PROTOCOL = 2
 EXECUTED_RESOURCES = {"tool_barrier.py": MODULES["tool_barrier"]}
+
+
+def g06_native_dependencies(case):
+    """Exact frozen payloads used by each atomic G06 transaction."""
+    assert case in GROUPS["g06"], "Undeclared G06 native dependency: " + case
+    base = "inputs/mods/g06/"
+    mods = (base + "a/v1/",)
+    probes = []
+    private = {"abi-buffers", "tool-stale-token", "tool-foreign-owner", "cancel-before", "cancel-queued",
+        "cancel-running", "cancel-after-complete", "late-complete", "duplicate-complete", "drop-parent",
+        "release-pending", "exit-race", "order-reentry", "stream-slow-mod", "stream-slow-consumer",
+        "stream-drop", "stream-turn-cancel", "stream-late-ack", "tui-ui-owner", "tui-wrong-thread",
+        "tui-stale-owner", "tui-cancel"}
+    if case in private:
+        mods += (base + "b/v1/",)
+        probes.append("inputs/probes/cm-concurrency-core")
+    if case in {"order-ab", "order-discovery-reversed", "order-error", "order-deadline", "order-short",
+                "order-cycle", "command-name-conflict", "independent-disable-delete"}:
+        mods += (base + "b/v1/",)
+    if case == "tool-base":
+        mods = ()
+    elif case == "tool-replacement":
+        mods = (base + "a/replacement/",)
+    elif case == "replacement-conflict":
+        mods = (base + "a/replacement/", base + "b/replacement/")
+    elif case == "replacement-mixed-conflict":
+        mods = (base + "a/replacement/", base + "b/v1/")
+    elif case == "independent-versions":
+        mods = tuple(base + owner + "/" + variant + "/" for owner in ("a", "b") for variant in ("v1", "v2", "replacement"))
+        probes.append("fixture/g06-producer.json")
+    elif case == "old-host-reject":
+        mods += ("inputs/upgrade-baseline/host/",)
+    if case == "independent-disable-delete":
+        mods += (base + "a/v2/",)
+    if case == "abi-contract":
+        probes.append("inputs/probes/cm-sdk-c-abi")
+    if case == "exit-race":
+        probes.append("fixture/g06-shutdown-regression.json")
+    if case in ("legacy-abc", "tui-ui-owner"):
+        mods += ("inputs/mods/g02b/review-before-send/",)
+    if case == "legacy-abc":
+        mods += ("inputs/mods/g02a/turn-budget/", "inputs/mods/g03/tool-concurrency/")
+    return tuple(sorted(set(mods))), probes
 
 
 def digest(value):
@@ -86,7 +142,7 @@ def labels():
 
 
 def function(case, phase=None):
-    if phase in ("g01", "g05"):
+    if phase in ("g01", "g05", "g06"):
         return "case_" + case.replace("-", "_")
     prefix = case.split("-", 1)[0]
     return "case_" + (prefix if prefix in {"startup", "packages", "callbacks", "rejections", "zip", "config",

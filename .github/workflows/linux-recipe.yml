@@ -165,6 +165,7 @@ jobs:
           python3 -B ci/scripts/runtime_qualification.py self-check
           python3 -B ci/scripts/runtime_hooks.py self-check
           python3 -B ci/scripts/runtime_upgrade.py self-check
+          python3 -B ci/scripts/sdk_seams.py self-check
           python3 -B - <<'PY'
           import os
           from pathlib import Path
@@ -329,6 +330,62 @@ jobs:
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g03-local-backend-contract
           key: ${{ steps.acceptance-identity.outputs.g03_local_backend_contract }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-a-v1
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_a_v1 != ''
+        id: acceptance-g06-sdk-a-v1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v1 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-a-v2
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_a_v2 != ''
+        id: acceptance-g06-sdk-a-v2
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v2 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-a-replacement
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_a_replacement != ''
+        id: acceptance-g06-sdk-a-replacement
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_replacement }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-b-v1
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_b_v1 != ''
+        id: acceptance-g06-sdk-b-v1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v1 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-b-v2
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_b_v2 != ''
+        id: acceptance-g06-sdk-b-v2
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v2 }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-sdk-b-replacement
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_sdk_b_replacement != ''
+        id: acceptance-g06-sdk-b-replacement
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_replacement }}
+          enableCrossOsArchive: false
+      - name: Restore compiled target g06-c-abi
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && steps.acceptance-identity.outputs.g06_c_abi != ''
+        id: acceptance-g06-c-abi
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-c-abi
+          key: ${{ steps.acceptance-identity.outputs.g06_c_abi }}
           enableCrossOsArchive: false
       - name: Restore verified legacy snapshot for one-time target migration
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true' && (steps.acceptance-host-core-baseline-build.outputs.cache-hit != 'true' || steps.acceptance-mod-adapter-clippy.outputs.cache-hit != 'true' || steps.acceptance-mod-host-abi-probe-build.outputs.cache-hit != 'true' || steps.acceptance-mod-pinned-snapshot-build.outputs.cache-hit != 'true' || steps.acceptance-m02-native-probe-build.outputs.cache-hit != 'true' || steps.acceptance-review-tui-probe-build.outputs.cache-hit != 'true' || steps.acceptance-g03-local-backend-contract.outputs.cache-hit != 'true')
@@ -543,6 +600,55 @@ jobs:
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g03-local-backend-contract
           key: ${{ steps.acceptance-identity.outputs.g03_local_backend_contract }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g06-sdk-a-v1
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_v1 == 'true' && steps.acceptance-g06-sdk-a-v1.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v1 }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g06-sdk-a-v2
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_v2 == 'true' && steps.acceptance-g06-sdk-a-v2.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v2 }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g06-sdk-a-replacement
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_replacement == 'true' && steps.acceptance-g06-sdk-a-replacement.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_replacement }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g06-sdk-b-v1
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_v1 == 'true' && steps.acceptance-g06-sdk-b-v1.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v1
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v1 }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g06-sdk-b-v2
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_v2 == 'true' && steps.acceptance-g06-sdk-b-v2.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v2
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v2 }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g06-sdk-b-replacement
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_replacement == 'true' && steps.acceptance-g06-sdk-b-replacement.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-replacement
+          key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_replacement }}
+          enableCrossOsArchive: false
+      - name: Save successful compiled target g06-c-abi
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_c_abi == 'true' && steps.acceptance-g06-c-abi.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-c-abi
+          key: ${{ steps.acceptance-identity.outputs.g06_c_abi }}
           enableCrossOsArchive: false
       - name: Upload logs compiler statistics and source/worker identities
         if: ${{ always() && steps.policy.outcome == 'success' }}
