@@ -179,6 +179,14 @@ jobs:
               for index, script in enumerate([*Path("ci/scripts").glob("*.py"), *Path("fixtures").rglob("*.py")]):
                   py_compile.compile(str(script), cfile=str(Path(directory) / (str(index) + ".pyc")), doraise=True)
           PY
+      - name: Free space for restored Rust caches and build outputs
+        if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
+        run: |
+          df -h "$RUNNER_TEMP" | tee "$CM_CI_LOG_DIR/disk-before-cache.log"
+          # These preinstalled SDKs are unused by the reviewed Rust/Python recipe.
+          sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h "$RUNNER_TEMP" | tee -a "$CM_CI_LOG_DIR/disk-before-cache.log"
       - name: Install exact reviewed Rust toolchain on the worker
         if: (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: rustup toolchain install "$CM_RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$CM_TARGET" 2>&1 | tee "$CM_CI_LOG_DIR/toolchain.log"
