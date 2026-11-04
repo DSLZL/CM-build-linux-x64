@@ -631,10 +631,15 @@ def sbom(directory, name, components, files, origin):
             license = next(item for item in row["licenses"] if "LicenseRef-" + item["sha256"] == row["declared_license"])
             path = directory / ("licenses/components" if name == "cm-host" else "") / license["path"]
             extracted[row["declared_license"]] = {"licenseId": row["declared_license"], "extractedText": path.read_text(encoding="utf-8")}
-    file_rows = [{"fileName": "./" + row["path"], "SPDXID": "SPDXRef-File-" + str(index),
-        "checksums": [{"algorithm": "SHA256", "checksumValue": row["sha256"]}],
-        "licenseConcluded": "NOASSERTION", "copyrightText": "NOASSERTION",
-        "comment": json.dumps({"source": row["source"], "components": row["components"]}, sort_keys=True)} for index, row in enumerate(files)]
+    file_rows = []
+    for index, row in enumerate(files):
+        with (directory / row["path"]).open("rb") as stream:
+            sha1 = hashlib.file_digest(stream, "sha1").hexdigest()
+        file_rows.append({"fileName": "./" + row["path"], "SPDXID": "SPDXRef-File-" + str(index),
+            "checksums": [{"algorithm": "SHA1", "checksumValue": sha1},
+                {"algorithm": "SHA256", "checksumValue": row["sha256"]}],
+            "licenseConcluded": "NOASSERTION", "copyrightText": "NOASSERTION",
+            "comment": json.dumps({"source": row["source"], "components": row["components"]}, sort_keys=True)})
     packages.insert(0, {"SPDXID": "SPDXRef-Distribution", "name": name, "downloadLocation": "NOASSERTION",
         "filesAnalyzed": False, "licenseConcluded": "NOASSERTION", "licenseDeclared": "NOASSERTION",
         "copyrightText": "NOASSERTION"})
@@ -1082,6 +1087,15 @@ def self_check():
     with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
         root = Path(temporary) / "checkout"
         root.mkdir()
+        (root / "sbom-file.txt").write_bytes(b"abc")
+        checksum = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        document = sbom(root, "self-check", [], [{"path": "sbom-file.txt", "size": 3,
+            "sha256": checksum, "source": "self-check", "components": ["self-check"]}],
+            {"created_at": "2026-11-04T00:00:00Z"})
+        assert document["files"][0]["fileName"] == "./sbom-file.txt"
+        assert document["files"][0]["checksums"] == [
+            {"algorithm": "SHA1", "checksumValue": "a9993e364706816aba3e25717850c26c9cd0d89d"},
+            {"algorithm": "SHA256", "checksumValue": checksum}]
         (root / ".git").mkdir()
         (root / "LICENSE").write_text("shared pinned checkout license\n")
         (root / "Cargo.lock").write_text("version = 4\n")
