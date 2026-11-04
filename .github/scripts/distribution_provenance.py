@@ -661,6 +661,7 @@ def prepare(root, inputs, frozen, logs, authors):
     import datetime
     import host
     import mod_manifest
+    import runtime_qualification
     output = Path(os.environ["CM_CI_ARTIFACT_DIR"]) / "distribution"
     output.mkdir()
     policy = read(root / POLICY_PATH)
@@ -670,8 +671,7 @@ def prepare(root, inputs, frozen, logs, authors):
         "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "job": os.environ["GITHUB_JOB"],
         "host_identity": frozen["host_identity"]["host_build_id"]}
     components = read(inputs / "host/distribution-components.json")
-    host_rows = read(inputs / "host/cm-runtime-files.json")["files"]
-    host_paths = {row["path"] for row in host_rows} | {"cm-runtime-files.json"}
+    _, host_files = runtime_qualification.host_manifest(inputs / "host", frozen)
     artifacts = {}
     for role in ("host", "a", "b"):
         name = "cm-host" if role == "host" else "sdk-" + role
@@ -693,8 +693,7 @@ def prepare(root, inputs, frozen, logs, authors):
                 "licenses": row["licenses"], "source_checksum": row["checksum"]} for row in go["modules"]]
             rows = [{**row, "size": len(os.readlink(directory / row["path"]).encode())
                      if (directory / row["path"]).is_symlink() else (directory / row["path"]).stat().st_size}
-                    for row in host.manifest(directory) if row["path"] in host_paths]
-            assert {row["path"] for row in host.manifest(directory)} == host_paths, "Unregistered packaged asset"
+                    for row in host_files]
             payload = "bin/codex"
             manifest_hash = sha(directory / "cm-runtime-files.json")
             contracts = {key: frozen["host_identity"][key] for key in
