@@ -63,6 +63,11 @@ def licenses(directory, destination, source):
     return result
 
 
+def go_proxy_source(module, version):
+    path = re.sub(r"[A-Z]", lambda match: "!" + match[0].lower(), module + "/@v/" + version)
+    return "https://proxy.golang.org/" + path + ".zip"
+
+
 def verifier(root, logs):
     """Download before the Host seal; the compiled pin covers the extracted executable."""
     policy = read(root / POLICY_PATH)
@@ -96,7 +101,7 @@ def verifier(root, logs):
             cwd=directory, text=True, timeout=180))
         assert downloaded.get("Sum") == checksum and not downloaded.get("Error"), module
         modules.append({"name": module, "version": version, "checksum": checksum,
-            "source": "https://proxy.golang.org/" + module + "/@v/" + version + ".zip",
+            "source": go_proxy_source(module, version),
             "source_archive_sha256": sha(Path(downloaded["Zip"])),
             "licenses": licenses(Path(downloaded["Dir"]), material, module + "@" + version)})
     assert modules and len(modules) <= 512
@@ -447,6 +452,7 @@ def prepare(root, inputs, frozen, logs, authors):
             shutil.copyfile(inputs / "host/licenses/codex-LICENSE", directory / "LICENSE")
             (directory / "NOTICE").write_text("CM independent SDK fixture; Apache-2.0. No installer hooks are run.\n")
             (directory / "build.rs").write_text('fn main() { panic!("installer must not build"); }\n')
+            (directory / "proc-macro.rs").write_text('extern crate proc_macro;\n#[proc_macro]\npub fn install(input: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    std::fs::write("/work/proc-macro-executed", b"executed").unwrap();\n    input\n}\n')
             (directory / "post-install.sh").write_text('#!/bin/sh\nprintf executed > /work/install-script-executed\n')
             import tomllib
             fields = tomllib.loads((directory / "mod.toml").read_text())
@@ -460,7 +466,7 @@ def prepare(root, inputs, frozen, logs, authors):
             closure = {"author": author, "independent_host": frozen["host_identity"],
                 "delta_source": {"repository": "DSLZL/CM", "sha": os.environ["CM_SOURCE_SHA"]},
                 "license_text": {"path": "LICENSE", "sha256": sha(directory / "LICENSE")},
-                "source_attachments_are_data": ["build.rs", "post-install.sh"]}
+                "source_attachments_are_data": ["build.rs", "proc-macro.rs", "post-install.sh"]}
             record = {"source": "https://github.com/DSLZL/CM@" + os.environ["CM_SOURCE_SHA"],
                 "roles": ["independent-mod-static-component"], "declared_license": "Apache-2.0",
                 "licenses": [{"path": "LICENSE", "sha256": sha(directory / "LICENSE")}]}
@@ -772,6 +778,8 @@ def self_check():
     require_hosted_linux()
     assert canonical({"b": 1, "a": "中"}) == '{"a":"中","b":1}'.encode()
     assert len(REPORTS) == len(set(REPORTS)) == 5
+    assert go_proxy_source("golang.org/x/sys", "v0.1.0") == "https://proxy.golang.org/golang.org/x/sys/@v/v0.1.0.zip"
+    assert go_proxy_source("example.com/Azure/SDK", "v1.0.0-RC1") == "https://proxy.golang.org/example.com/!azure/!s!d!k/@v/v1.0.0-!r!c1.zip"
     import runtime_consumer
     runtime_consumer.check_distribution_verifier_binding()
     import retry
