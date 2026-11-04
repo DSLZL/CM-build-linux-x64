@@ -852,7 +852,8 @@ def validate_materials(directory, policy):
                 location = ("https://crates.io/crates/" + expected["name"] + "/" + expected["version"]
                     if expected["source"].startswith("registry+") else expected["source"].removeprefix("git+"))
                 assert (row["name"], row["versionInfo"], row["downloadLocation"], row["licenseDeclared"]) == (
-                    expected["name"], expected["version"], location, expected["declared_license"])
+                    expected["name"], expected["version"], location, re.sub(r"\s*/\s*", " OR ", expected["declared_license"]))
+                assert json.loads(row["comment"])["original_license_declaration"] == expected["declared_license"]
         extracted = {row["licenseId"]: row["extractedText"] for row in bom["hasExtractedLicensingInfos"]}
         assert all(extracted[row["declared_license"]] == texts[row["declared_license"].removeprefix("LicenseRef-")]
             for row in notice["components"] if row["declared_license"].startswith("LicenseRef-"))
@@ -867,8 +868,14 @@ def validate_materials(directory, policy):
             assert row["components"] and set(row["components"]) <= component_ids, "Asset has unknown component origin"
             assert type(row["size"]) is int and row["size"] >= 0 and re.fullmatch(r"[0-9a-f]{64}", row["sha256"])
         assert notice["assets"] == assets
-        assert {row["fileName"][2:]: row["checksums"][0]["checksumValue"] for row in bom["files"]} == {
-            row["path"]: row["sha256"] for row in assets}
+        file_checksums = {}
+        for row in bom["files"]:
+            checksums = {item["algorithm"]: item["checksumValue"] for item in row["checksums"]}
+            assert len(checksums) == len(row["checksums"]) == 2 and set(checksums) == {"SHA1", "SHA256"}
+            assert re.fullmatch(r"[0-9a-f]{40}", checksums["SHA1"])
+            file_checksums[row["fileName"][2:]] = checksums["SHA256"]
+        assert len(file_checksums) == len(bom["files"])
+        assert file_checksums == {row["path"]: row["sha256"] for row in assets}
         assert hashlib.sha256(canonical({row["path"]: [row["size"], row["sha256"]] for row in assets})).hexdigest() == draft["artifact"]["object_sha256"]
     return value
 
@@ -1096,6 +1103,50 @@ def self_check():
         assert document["files"][0]["checksums"] == [
             {"algorithm": "SHA1", "checksumValue": "a9993e364706816aba3e25717850c26c9cd0d89d"},
             {"algorithm": "SHA256", "checksumValue": checksum}]
+        materials = Path(temporary) / "materials"
+        origin = {"created_at": "2026-11-04T00:00:00Z"}
+        asset = {"path": "sbom-file.txt", "size": 3, "sha256": checksum,
+            "source": {"repository": "DSLZL/CM", "sha": "a" * 40}, "components": ["SPDXRef-Package-0"]}
+        producer = {"artifacts": {}, "production_origin": origin, "policy_sha256": checksum}
+        for name, declaration in zip(("cm-host", "sdk-a", "sdk-b"),
+                ("Apache-2.0/MIT", "MIT OR Apache-2.0", "Apache-2.0 WITH LLVM-exception")):
+            material = materials / name
+            component = {"name": "fixture", "version": "1.0.0", "source": "https://example.invalid/fixed",
+                "roles": ["self-check"], "declared_license": declaration,
+                "licenses": [{"path": "sbom-file.txt", "sha256": checksum}]}
+            document = sbom(root, name, [component], [asset], origin)
+            if name == "sdk-b":
+                document["files"][0]["checksums"].reverse()
+            write(material / "sbom.spdx.json", document)
+            write(material / "NOTICE.json", {"components": [component], "assets": [asset],
+                "license_texts": {checksum: "abc"}, "native_licenses": []})
+            write(material / "source.json", {"source": asset["source"]})
+            write(material / "assets.json", [asset])
+            draft = {"schema_version": 1, "domain": "cm.release-receipt.v1",
+                "role": "host" if name == "cm-host" else "mod", "name": name, "version": "1.0.0",
+                "target": "x86_64-unknown-linux-gnu", "source": {**asset["source"], "repository_id": 1430833890},
+                "production_origin": origin, "contracts": {"self_check": True}, "policy_sha256": checksum,
+                "artifact": {**{key: checksum for key in ("archive_sha256", "manifest_sha256", "payload_sha256")},
+                    "archive_size": 3, "object_sha256": hashlib.sha256(canonical({"sbom-file.txt": [3, checksum]})).hexdigest()},
+                "materials": {key: sha(material / path) for key, path in
+                    (("sbom", "sbom.spdx.json"), ("notice", "NOTICE.json"), ("source", "source.json"))}}
+            write(material / "draft.json", draft)
+            producer["artifacts"][name] = {"draft_sha256": sha(material / "draft.json")}
+        write(materials / "producer.json", producer)
+        assert validate_materials(materials, policy) == producer
+        material = materials / "sdk-b"
+        document["files"][0]["checksums"] = [item for item in document["files"][0]["checksums"] if item["algorithm"] != "SHA1"]
+        write(material / "sbom.spdx.json", document)
+        draft["materials"]["sbom"] = sha(material / "sbom.spdx.json")
+        write(material / "draft.json", draft)
+        producer["artifacts"]["sdk-b"]["draft_sha256"] = sha(material / "draft.json")
+        write(materials / "producer.json", producer)
+        try:
+            validate_materials(materials, policy)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("Rehashed SPDX material without mandatory SHA1 accepted")
         (root / ".git").mkdir()
         (root / "LICENSE").write_text("shared pinned checkout license\n")
         (root / "Cargo.lock").write_text("version = 4\n")
