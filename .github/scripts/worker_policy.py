@@ -136,7 +136,7 @@ def verify_origin(origin, source, worker, workflow_sha):
     return {"run": run, "jobs": jobs, "artifacts": artifacts}
 
 
-def download_origin_archive(worker, record, destination):
+def download_origin_archive(worker, record, destination, *, maximum=4 * 1024 ** 3):
     class Redirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, message, headers, url):
             if not url.startswith("https://"):
@@ -152,7 +152,7 @@ def download_origin_archive(worker, record, destination):
     with urllib.request.build_opener(Redirect()).open(request, timeout=60) as response, destination.open("xb") as stream:
         while chunk := response.read(1024 * 1024):
             size += len(chunk)
-            if size > 4 * 1024 ** 3:
+            if size > maximum:
                 raise RuntimeError("Oversized qualification artifact")
             digest.update(chunk)
             stream.write(chunk)
@@ -160,7 +160,7 @@ def download_origin_archive(worker, record, destination):
                 print(json.dumps({"stage": "restore-qualified-origin", "status": "running",
                     "bytes": size, "elapsed_seconds": round(time.monotonic() - started, 3)}), flush=True)
                 heartbeat = time.monotonic()
-    if "sha256:" + digest.hexdigest() != record["digest"]:
+    if size != record["size_in_bytes"] or "sha256:" + digest.hexdigest() != record["digest"]:
         raise RuntimeError("Downloaded qualification artifact digest differs from GitHub metadata")
     return zipfile.ZipFile(destination)
 
@@ -305,7 +305,7 @@ def preflight():
     mode = "write" if sha == source_head else "read"
     config_record = api("repos/" + source + "/contents/.github/cm-ci.json?ref=" + sha)
     config = json.loads(base64.b64decode(config_record["content"]))
-    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02", "CM-M03", "CM-M04", "CM-M05", "CM-G02A", "CM-G02B", "CM-G03", "CM-G04", "CM-G01", "CM-G05", "CM-G06") else "false"
+    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02", "CM-M03", "CM-M04", "CM-M05", "CM-G02A", "CM-G02B", "CM-G03", "CM-G04", "CM-G01", "CM-G05", "CM-G06", "CM-S01") else "false"
     if kind == "mod-only":
         if config.get("task_id") != "CM-M05":
             raise RuntimeError("Mod-only requires the reviewed M05 mapping")
@@ -314,7 +314,7 @@ def preflight():
               "observed_source_default_sha": source_head, "builder_repository": worker,
               "workflow_sha": workflow_sha, "worker_default_branch": worker_branch,
               "request_id": request, "target": TARGET, "cache_mode": mode, "consumer_required": consumer_required,
-              "build_kind": kind}
+              "build_kind": kind, "distribution_required": "true" if config.get("task_id") == "CM-S01" else "false"}
     Path(os.environ["RUNNER_TEMP"], "cm-worker-preflight.json").write_text(json.dumps(record, indent=2) + "\n")
     output({**record, "source_default_sha_verified": "true" if mode == "write" else "false"})
     print(json.dumps(record, indent=2))
@@ -665,6 +665,8 @@ def receipt():
     names = [os.environ["CM_BUILD_JOB"]]
     if os.environ.get("CM_CONSUMER_REQUIRED") == "true":
         names.append("runtime-consumer")
+    if os.environ.get("CM_DISTRIBUTION_REQUIRED") == "true":
+        names.append("attest-distribution")
     jobs = receipt_jobs("repos/" + worker + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100", names)
     producer_job = successful_job(jobs, os.environ["CM_BUILD_JOB"])
     ci = {"provider": "github_actions", "repository": worker, "source_repository": source,
@@ -713,9 +715,20 @@ def receipt():
             assert label == test_build["target"]
             verify_test_build(test_build)
         consumer["test_builds"] = validation["test_builds"]
+    distribution = None
+    if os.environ.get("CM_DISTRIBUTION_REQUIRED") == "true":
+        proof_id = int(os.environ["CM_DISTRIBUTION_ARTIFACT_ID"])
+        proof_digest = checked(os.environ["CM_DISTRIBUTION_ARTIFACT_DIGEST"].removeprefix("sha256:"),
+            r"[0-9a-f]{64}", "distribution artifact digest")
+        proof_name = "cm-linux-x64-distribution-proofs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        record = api("repos/" + worker + "/actions/artifacts/" + str(proof_id))
+        proof_ref = artifact_binding(record, proof_id, proof_name, proof_digest, int(os.environ["GITHUB_RUN_ID"]))
+        distribution = {"job": "attest-distribution", **successful_job(jobs, "attest-distribution"),
+            "artifact": proof_ref, "production_origin": origin, "consumer_job_id": consumer["job_id"]}
     out = Path(os.environ["RUNNER_TEMP"], "cm-worker-receipt")
     out.mkdir(exist_ok=True)
     (out / "worker-receipt.json").write_text(json.dumps({"schema_version": 1, "ci": ci, "consumer": consumer,
+        "distribution": distribution,
         "note": "Artifact identity verified; final workflow conclusion must be fetched after this run completes."}, indent=2) + "\n")
 
 

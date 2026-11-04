@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "domain": "cm.distribution-policy.v1",
+  "source_repository": "DSLZL/CM",
+  "source_repository_id": 1430833890,
+  "builder_repository": "DSLZL/CM-build-linux-x64",
+  "builder_repository_id": 1430833977,
+  "workflow": ".github/workflows/build.yml",
+  "ref": "refs/heads/main",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "predicate_type": "https://slsa.dev/provenance/v1",
+  "verifier": {
+    "version": "2.103.3",
+    "source_commit": "63837fb778d6a39f02be0ce76ff89f2bc8d74bdc",
+    "asset_id": 679195621,
+    "archive": "gh_2.103.3_linux_amd64.tar.gz",
+    "archive_sha256": "4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d",
+    "url": "https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_linux_amd64.tar.gz",
+    "license": "MIT"
+  }
+}

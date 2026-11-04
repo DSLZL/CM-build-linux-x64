@@ -27,6 +27,10 @@ on:
       consumer_required:
         required: true
         type: boolean
+      distribution_required:
+        required: false
+        type: boolean
+        default: false
       build_kind:
         required: true
         type: string
@@ -166,6 +170,9 @@ jobs:
           python3 -B ci/scripts/runtime_hooks.py self-check
           python3 -B ci/scripts/runtime_upgrade.py self-check
           python3 -B ci/scripts/sdk_seams.py self-check
+          if [[ '${{ inputs.distribution_required }}' == 'true' ]]; then
+            python3 -B ci/scripts/distribution_provenance.py self-check
+          fi
           python3 -B - <<'PY'
           import os
           from pathlib import Path
@@ -487,6 +494,14 @@ jobs:
         with:
           name: cm-linux-x64-task-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload only original distribution materials
+        if: ${{ success() && inputs.distribution_required && steps.reuse.outputs.reused != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-distribution-materials-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_ARTIFACT_DIR }}/distribution
           if-no-files-found: error
           retention-days: 14
       - name: Upload exact frozen runtime inputs for the separate consumer

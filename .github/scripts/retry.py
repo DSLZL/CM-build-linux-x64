@@ -30,8 +30,10 @@ RUNTIME_FILES = (
     "ci/scripts/runtime_hooks.py", "fixtures/runtime-hooks/driver.py",
     "ci/scripts/runtime_upgrade.py", "fixtures/compatibility/driver.py",
     "ci/scripts/sdk_seams.py", "fixtures/sdk-seams/driver.py",
+    "ci/scripts/distribution_provenance.py", "fixtures/distribution-provenance/driver.py",
 )
-RUNTIME_DATA = ("ci/g05-baseline.json",)
+RUNTIME_DATA = ("ci/g05-baseline.json", "crates/cm/src/distribution-policy.json",
+    "crates/cm/src/distribution-root.jsonl", "docs/distribution.md", "schemas/release-receipt.schema.json")
 PHASES = {
     "consumer-matrix": (("fixtures/runtime-consumer/driver.py", "matrix"),),
     "consumer-missing-library": (("fixtures/runtime-consumer/driver.py", "missing_library"),),
@@ -157,8 +159,13 @@ def test_inputs(root, revision):
             for node in module.body if isinstance(node, ast.If) and any(
                 isinstance(item, ast.Name) and item.id == "__name__" for item in ast.walk(node.test))])
         value.update(protocol=runtime_cases.PROTOCOL, audit=digest({"outer": audit, "observer": observer}))
-        if selected and selected[0] == "g05":
-            value["qualification_data"] = {path: digest(source(root, revision, path)) for path in RUNTIME_DATA}
+        if selected and selected[0] in ("g05", "s01"):
+            paths = RUNTIME_DATA[:1] if selected[0] == "g05" else RUNTIME_DATA[1:3]
+            if label == "s01-offline":
+                paths += ("docs/distribution.md",)
+            if label == "s01-identity":
+                paths += ("schemas/release-receipt.schema.json",)
+            value["qualification_data"] = {path: digest(source(root, revision, path)) for path in paths}
         result[label] = value
     return result
 
@@ -181,6 +188,8 @@ def product_inputs(root, revision):
     runtime_modules["ci/scripts/runtime_hooks.py"] = {"reports", "self_check"}
     runtime_modules["ci/scripts/runtime_upgrade.py"] = {"reports", "self_check", "driver", "restore_reference", "baseline_file", "mount_reference"}
     runtime_modules["ci/scripts/sdk_seams.py"] = {"reports", "self_check"}
+    runtime_modules["ci/scripts/distribution_provenance.py"] = {
+        "reports", "self_check", "attest_prepare", "consume_proofs", "source_check", "artifact_download", "extract_materials"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
@@ -188,7 +197,9 @@ def product_inputs(root, revision):
     for row in filter(None, tree):
         metadata, name = row.split(b"\t", 1)
         path = name.decode()
-        if (path in administrative or path in PRIVATE_PROBES or path in RUNTIME_DATA or path.endswith(".md") or path.startswith(("docs/", ".github/workflows/", "ci/worker/"))
+        if (path in administrative or path in PRIVATE_PROBES
+                or path in RUNTIME_DATA and not path.startswith("crates/cm/src/distribution-")
+                or path.endswith(".md") or path.startswith(("docs/", ".github/workflows/", "ci/worker/"))
                 or path.startswith("fixtures/") and path.endswith(".py")
                 or "/.vscode/" in path or "/.github/" in path):
             continue
@@ -810,7 +821,7 @@ def native_key(closure, label):
         "g04": ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/"),
         "g01": ("inputs/mods/g01/a/normal/",),
         "g05": (),
-        "g06": (),
+        "g06": (), "s01": ("inputs/mods/s01/", "inputs/distribution/"),
         "m05": ("inputs/mods/m05/", "inputs/mods/m02/"),
         "g02a": ("inputs/mods/g02a/", "inputs/mods/m02/"),
         "review": ("inputs/mods/g02b/", "inputs/mods/m02/"),
@@ -832,6 +843,10 @@ def native_key(closure, label):
             "legacy": legacy,
             "writers": (*normal, *manifest, *sentinel),
         }[label.removeprefix("m03-")]
+    if phase == "s01":
+        probes.extend(("fixture/s01-producer.json", "fixture/s01-bootstrap/identity.json"))
+        probes.extend(entry["path"] for entry in closure["files"]
+            if entry["path"].startswith("fixture/s01-proofs/") and entry["path"] != "fixture/s01-proofs/authority.json")
     if phase == "g06":
         mods, probes = runtime_cases.g06_native_dependencies(label.removeprefix("g06-"))
     if phase == "g05":
@@ -892,8 +907,10 @@ def native_key(closure, label):
         or not entry["path"].startswith(("inputs/", "fixture/"))],
         "required_paths": probes, "mod_prefixes": mods,
         "static_fixture_data": [entry for entry in closure["files"] if entry["path"].startswith("fixture/")
+            and not entry["path"].startswith(("fixture/s01-proofs/", "fixture/s01-bootstrap/"))
             and entry["path"] not in ("fixture/g05-transaction-checks.json", "fixture/g06-shutdown-regression.json")
-            and (phase == "g05" or entry["path"] not in {"fixture/" + path for path in RUNTIME_DATA})
+            and (entry["path"] not in {"fixture/" + path for path in RUNTIME_DATA}
+                or phase == "g05" and entry["path"] == "fixture/ci/g05-baseline.json")
             and not entry["path"].endswith((".py", ".rs", ".patch"))
             and not re.search(r"(?:producer|native-probe|native-scopes|native-events|native-trace|context)\.(?:json|jsonl)$",
                              entry["path"])]})

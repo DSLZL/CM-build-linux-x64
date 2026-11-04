@@ -74,14 +74,17 @@ GROUPS = {
         "tui-stale-owner", "tui-cancel", "independent-versions", "independent-disable-delete", "legacy-abc",
         "old-host-reject", "capability-boundary"),
 }
+GROUPS["s01"] = ("identity", "independent", "inventory", "materials", "source", "install-boundary",
+    "proof", "stale", "digests", "compatibility", "no-op", "transaction", "legacy", "bootstrap", "offline", "failure-boundary")
 DRIVERS = {"p04": "fixtures/runtime-consumer/driver.py", "m01": "ci/scripts/mod_manifest.py",
            "m02": "fixtures/runtime-sdk/driver.py", "m03": "fixtures/managed-package/driver.py",
            "m04": "fixtures/state/driver.py", "m05": "fixtures/mod-author/driver.py",
            "g04": "fixtures/runtime-qualification/driver.py", "g01": "fixtures/runtime-hooks/driver.py",
-           "g05": "fixtures/compatibility/driver.py", "g06": "fixtures/sdk-seams/driver.py"}
+           "g05": "fixtures/compatibility/driver.py", "g06": "fixtures/sdk-seams/driver.py",
+           "s01": "fixtures/distribution-provenance/driver.py"}
 MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
     ("mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
-     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases", "sdk_seams")},
+     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases", "sdk_seams", "distribution_provenance")},
     "core": "fixtures/native-loader/core_acceptance.py", "core_acceptance": "fixtures/native-loader/core_acceptance.py",
     "tool_barrier": "fixtures/native-loader/tool_barrier.py"}
 DYNAMIC = {"sdk": DRIVERS["m02"], "m": DRIVERS["m03"], "packages": "ci/scripts/mod_manifest.py",
@@ -142,7 +145,7 @@ def labels():
 
 
 def function(case, phase=None):
-    if phase in ("g01", "g05", "g06"):
+    if phase in ("g01", "g05", "g06", "s01"):
         return "case_" + case.replace("-", "_")
     prefix = case.split("-", 1)[0]
     return "case_" + (prefix if prefix in {"startup", "packages", "callbacks", "rejections", "zip", "config",
