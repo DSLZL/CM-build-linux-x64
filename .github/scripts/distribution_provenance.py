@@ -630,7 +630,7 @@ def sbom(directory, name, components, files, origin):
         if row["declared_license"].startswith("LicenseRef-"):
             license = next(item for item in row["licenses"] if "LicenseRef-" + item["sha256"] == row["declared_license"])
             path = directory / ("licenses/components" if name == "cm-host" else "") / license["path"]
-            extracted[row["declared_license"]] = {"licenseId": row["declared_license"], "extractedText": path.read_text(encoding="utf-8")}
+            extracted[row["declared_license"]] = {"licenseId": row["declared_license"], "extractedText": license_text(path, directory).decode("utf-8")}
     file_rows = []
     for index, row in enumerate(files):
         with (directory / row["path"]).open("rb") as stream:
@@ -773,7 +773,7 @@ def prepare(root, inputs, frozen, logs, authors):
         for record in [item for component in cargo for item in component["licenses"]] + notice["native_licenses"]:
             path = directory / ("licenses/components" if role == "host" else "") / record["path"]
             assert path.is_file() and not path.is_symlink() and sha(path) == record["sha256"], "Missing actual license text"
-            text = path.read_text(encoding="utf-8")
+            text = license_text(path, directory).decode("utf-8")
             assert text.strip() and len(text.encode()) <= 2 * 1024 * 1024
             texts[record["sha256"]] = text
         notice["license_texts"] = texts
@@ -836,7 +836,9 @@ def validate_materials(directory, policy):
         notice = read(material / "NOTICE.json")
         assert notice["components"] and notice["assets"]
         texts = notice["license_texts"]
-        assert texts and all(text.strip() and hashlib.sha256(text.encode()).hexdigest() == key for key, text in texts.items())
+        assert texts, "Missing actual license texts"
+        for key, text in texts.items():
+            assert text.strip() and hashlib.sha256(text.encode()).hexdigest() == key, "License text differs: " + name + "/" + key
         for row in notice["components"]:
             assert row["licenses"] and row["source"] and row["declared_license"] not in (None, "", "UNKNOWN", "NOASSERTION")
             assert all(item["sha256"] in texts for item in row["licenses"]), "Component lacks actual license text"
@@ -1107,18 +1109,25 @@ def self_check():
         asset = {"path": "sbom-file.txt", "size": 3, "sha256": checksum,
             "source": {"repository": "DSLZL/CM", "sha": "a" * 40}, "components": ["SPDXRef-Package-0"]}
         producer = {"artifacts": {}, "production_origin": origin, "policy_sha256": checksum}
+        license_data = "Fixture license\r\nUTF-8: 中\r\n".encode("utf-8")
         for name, declaration in zip(("cm-host", "sdk-a", "sdk-b"),
                 ("Apache-2.0/MIT", "MIT OR Apache-2.0", "Apache-2.0 WITH LLVM-exception")):
             material = materials / name
+            package_root = Path(temporary) / "license-source" / name
+            license_directory = package_root / ("licenses/components" if name == "cm-host" else "")
+            license_record = text_material(license_directory, "fixture-LICENSE", "https://example.invalid/fixed", license_data)
+            (package_root / "sbom-file.txt").write_bytes(b"abc")
             component = {"name": "fixture", "version": "1.0.0", "source": "https://example.invalid/fixed",
-                "roles": ["self-check"], "declared_license": declaration,
-                "licenses": [{"path": "sbom-file.txt", "sha256": checksum}]}
-            document = sbom(root, name, [component], [asset], origin)
+                "roles": ["self-check"], "declared_license": declaration, "licenses": [license_record]}
+            reference = {**component, "name": "license-ref-fixture", "declared_license": "LicenseRef-" + license_record["sha256"]}
+            document = sbom(package_root, name, [component, reference], [asset], origin)
+            assert document["hasExtractedLicensingInfos"][0]["extractedText"].encode("utf-8") == license_data
             if name == "sdk-b":
                 document["files"][0]["checksums"].reverse()
             write(material / "sbom.spdx.json", document)
-            write(material / "NOTICE.json", {"components": [component], "assets": [asset],
-                "license_texts": {checksum: "abc"}, "native_licenses": []})
+            write(material / "NOTICE.json", {"components": [component, reference], "assets": [asset],
+                "license_texts": {license_record["sha256"]: license_text(license_directory / license_record["path"], package_root).decode("utf-8")},
+                "native_licenses": []})
             write(material / "source.json", {"source": asset["source"]})
             write(material / "assets.json", [asset])
             draft = {"schema_version": 1, "domain": "cm.release-receipt.v1",
