@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -124,6 +125,41 @@ def verifier(root, logs):
     return value
 
 
+def registry_licenses(package, directory, destination):
+    # Some published crates omit license files; their checksum-covered VCS pin still identifies the real texts.
+    repository = re.fullmatch(r"https://github\.com/([A-Za-z0-9_-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?",
+        package.get("repository") or "")
+    assert package["source"] and package["source"].startswith("registry+") and repository, "Missing pinned Cargo license source: " + package["id"]
+    checksums = read(directory / ".cargo-checksum.json")
+    vcs_path = directory / ".cargo_vcs_info.json"
+    assert re.fullmatch(r"[0-9a-f]{64}", checksums.get("package") or "")
+    assert checksums["files"].get(vcs_path.name) == sha(vcs_path), "Cargo VCS pin checksum mismatch"
+    vcs = read(vcs_path)
+    revision = vcs["git"]["sha1"]
+    assert re.fullmatch(r"[0-9a-f]{40}", revision) and not vcs["git"].get("dirty"), "Unpinned Cargo license source"
+    subpath = vcs.get("path_in_vcs", "")
+    assert not subpath or (not Path(subpath).is_absolute() and Path(subpath).as_posix() == subpath
+        and ".." not in Path(subpath).parts), "Unsafe Cargo VCS path"
+    parents = {"", *(parent.as_posix() for parent in (Path(subpath), *Path(subpath).parents))}
+    tree = json.loads(fetch("https://api.github.com/repos/" + repository[1] + "/git/trees/" + revision + "?recursive=1"))
+    assert not tree.get("truncated") and len(tree["tree"]) <= 100000, "Incomplete pinned Cargo source tree"
+    candidates = [row for row in tree["tree"] if row["type"] == "blob" and row["mode"] in ("100644", "100755")
+        and Path(row["path"]).parent.as_posix() in parents
+        and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", Path(row["path"]).name)]
+    assert 0 < len(candidates) <= 128 and any(re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])",
+        Path(row["path"]).name) for row in candidates), "No actual license in pinned Cargo source: " + package["id"]
+    records = []
+    for row in sorted(candidates, key=lambda item: item["path"]):
+        path = row["path"]
+        assert not Path(path).is_absolute() and ".." not in Path(path).parts
+        url = "https://raw.githubusercontent.com/" + repository[1] + "/" + revision + "/" + urllib.parse.quote(path)
+        data = fetch(url, 2 * 1024 * 1024)
+        blob = b"blob " + str(len(data)).encode() + b"\0" + data
+        assert hashlib.sha1(blob).hexdigest() == row["sha"], "Pinned Cargo license blob mismatch"
+        records.append(text_material(destination, path, url, data))
+    return records
+
+
 def cargo_components(metadata, roots, destination, revision):
     packages = {row["id"]: row for row in metadata["packages"]}
     nodes = {row["id"]: row for row in metadata["resolve"]["nodes"]}
@@ -159,14 +195,18 @@ def cargo_components(metadata, roots, destination, revision):
             source_root = next((parent for parent in (directory, *directory.parents)
                 if (parent / ".git").exists()), directory)
         license_directory = directory
+        records = None
         if not license_file:
             while not any(path.is_file() and re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])", path.name)
                           for path in license_directory.iterdir()):
-                assert license_directory != source_root, "Missing Cargo license text: " + key
+                if license_directory == source_root:
+                    records = registry_licenses(package, directory, destination)
+                    break
                 license_directory = license_directory.parent
         license_path = directory / license_file if license_file else None
-        records = licenses(license_directory, destination, source + "#" + key, source_root) if not license_path else [
-            text_material(destination, license_path.name, source + "#" + key, license_text(license_path, source_root))]
+        if records is None:
+            records = licenses(license_directory, destination, source + "#" + key, source_root) if not license_path else [
+                text_material(destination, license_path.name, source + "#" + key, license_text(license_path, source_root))]
         notice = [path for path in directory.rglob("*") if path.is_file()
             and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", path.name)]
         assert len(notice) <= 2048
@@ -869,6 +909,57 @@ def self_check():
         linked_license.unlink()
         inherited = {row["name"]: row for row in cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")}
         assert inherited["shared"]["licenses"][0]["sha256"] == sha(root / "LICENSE")
+        from unittest.mock import patch
+        package = next(row for row in metadata["packages"] if row["name"] == "shared")
+        package.update(source="registry+https://github.com/rust-lang/crates.io-index", repository="https://github.com/example/pinned.git")
+        directory = root / "shared"
+        vcs_path = directory / ".cargo_vcs_info.json"
+        vcs = {"git": {"sha1": "a" * 40}, "path_in_vcs": "crate"}
+        write(vcs_path, vcs)
+        checksums = {"package": "b" * 64, "files": {vcs_path.name: sha(vcs_path)}}
+        write(directory / ".cargo-checksum.json", checksums)
+        data = b"actual pinned license text\n"
+        blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        tree = {"truncated": False, "tree": [
+            {"path": "LICENSE.md", "type": "blob", "mode": "100644", "sha": blob},
+            {"path": "unrelated/LICENSE", "type": "blob", "mode": "100644", "sha": blob}]}
+        tree_url = "https://api.github.com/repos/example/pinned/git/trees/" + "a" * 40 + "?recursive=1"
+        license_url = "https://raw.githubusercontent.com/example/pinned/" + "a" * 40 + "/LICENSE.md"
+        def pinned_fetch(url, maximum=LIMIT):
+            assert url in (tree_url, license_url), "License source used an unpinned or unrelated path"
+            return canonical(tree) if url == tree_url else data
+        with patch(__name__ + ".fetch", side_effect=pinned_fetch):
+            inherited = {row["name"]: row for row in cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")}
+            assert inherited["shared"]["source_checksum"] == "b" * 64
+            assert [row["source"] for row in inherited["shared"]["licenses"]] == [license_url]
+            assert inherited["shared"]["licenses"][0]["sha256"] == hashlib.sha256(data).hexdigest()
+            for invalid in ({"git": {"sha1": "main"}}, {"git": {"sha1": "a" * 40, "dirty": True}},
+                            {"git": {"sha1": "a" * 40}, "path_in_vcs": "../escape"}):
+                write(vcs_path, invalid)
+                write(directory / ".cargo-checksum.json", {**checksums, "files": {vcs_path.name: sha(vcs_path)}})
+                try:
+                    registry_licenses(package, directory, root / "rejected")
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError("Unpinned Cargo license source accepted")
+            write(vcs_path, vcs)
+            write(directory / ".cargo-checksum.json", checksums)
+            for invalid_tree in ({**tree, "truncated": True}, {**tree, "tree": [{**tree["tree"][0], "sha": "0" * 40}]}):
+                with patch(__name__ + ".fetch", side_effect=lambda url, maximum=LIMIT: canonical(invalid_tree) if url == tree_url else data):
+                    try:
+                        registry_licenses(package, directory, root / "rejected")
+                    except AssertionError:
+                        pass
+                    else:
+                        raise AssertionError("Incomplete or mismatched pinned license accepted")
+            vcs_path.write_text("{}")
+            try:
+                registry_licenses(package, directory, root / "rejected")
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("Modified Cargo VCS pin accepted")
         metadata["packages"][0]["license"] = None
         try:
             cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")
