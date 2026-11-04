@@ -68,6 +68,7 @@ SPDX_MIT_PIN = (
     "https://raw.githubusercontent.com/spdx/license-list-data/31846481de7ea17d92f2f46fad76abe58b2e9bb0/text/MIT.txt",
     "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5")
 RIPGREP_SOURCE_COMMIT = "e89fff89ac9af12e8d4ce9d5fd07beb408ca730f"
+COMMON_LICENSE_PATH = r"/usr/share/common-licenses/[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*"
 
 
 def canonical(value):
@@ -531,7 +532,7 @@ def system_components(package, destination):
                 copyright = Path("/usr/share/doc") / owner.split(":")[0] / "copyright"
                 text = text_material(destination, owner + "/copyright", "Ubuntu package " + owner + "@" + version, copyright.read_bytes())
                 records = [text]
-                for common in re.findall(r"/usr/share/common-licenses/[A-Za-z0-9_.+-]+", copyright.read_text()):
+                for common in re.findall(COMMON_LICENSE_PATH, copyright.read_text()):
                     records.append(text_material(destination, common, common, Path(common).read_bytes()))
                 source_package = qualification.command("dpkg-query", "-W", "-f=${source:Package}=${source:Version}", owner)
                 result.append({"name": owner, "version": version,
@@ -1024,6 +1025,10 @@ def reports(evidence, steps, audit):
 def self_check():
     from record_run import require_hosted_linux
     require_hosted_linux()
+    assert re.findall(COMMON_LICENSE_PATH, "See /usr/share/common-licenses/GPL. Also /usr/share/common-licenses/LGPL-2.1. "
+        "(/usr/share/common-licenses/GPL-3), /usr/share/common-licenses/Apache-2.0; /usr/share/common-licenses/Unknown-1.0.") == [
+        "/usr/share/common-licenses/GPL", "/usr/share/common-licenses/LGPL-2.1", "/usr/share/common-licenses/GPL-3",
+        "/usr/share/common-licenses/Apache-2.0", "/usr/share/common-licenses/Unknown-1.0"]
     assert canonical({"b": 1, "a": "中"}) == '{"a":"中","b":1}'.encode()
     assert len(REPORTS) == len(set(REPORTS)) == 5
     assert go_proxy_source("golang.org/x/sys", "v0.1.0") == "https://proxy.golang.org/golang.org/x/sys/@v/v0.1.0.zip"
