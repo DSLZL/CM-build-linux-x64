@@ -18,6 +18,11 @@ REPORTS = ("binary-provenance.json", "distribution-sbom-license.json",
 POLICY_PATH = "crates/cm/src/distribution-policy.json"
 ROOT_PATH = "crates/cm/src/distribution-root.jsonl"
 LIMIT = 32 * 1024 * 1024
+CARGO_LICENSE_PINS = {
+    ("facebookexperimental/allocative", name, "0.3.6"):
+        ("fc41670cf9cfebd86ba597925081577897112c51", name)
+    for name in ("allocative", "allocative_derive")
+}
 
 
 def canonical(value):
@@ -133,23 +138,55 @@ def registry_licenses(package, directory, destination, checksum):
     assert package["source"] and package["source"].startswith("registry+") and repository, "Missing pinned Cargo license source: " + package["id"]
     vcs_path = directory / ".cargo_vcs_info.json"
     assert re.fullmatch(r"[0-9a-f]{64}", checksum or ""), "Missing locked Cargo checksum"
-    vcs = read(vcs_path)
-    revision = vcs["git"]["sha1"]
-    assert re.fullmatch(r"[0-9a-f]{40}", revision) and not vcs["git"].get("dirty"), "Unpinned Cargo license source"
-    subpath = vcs.get("path_in_vcs", "")
+    vcs = read(vcs_path) if vcs_path.is_file() else None
+    if vcs is not None:
+        revision, subpath = vcs["git"]["sha1"], vcs.get("path_in_vcs", "")
+        assert not vcs["git"].get("dirty"), "Dirty Cargo license source"
+    else:
+        pin = CARGO_LICENSE_PINS.get((repository[1].lower(), package["name"], package["version"]))
+        assert pin, "Missing reviewed Cargo license source: " + package["id"]
+        revision, subpath = pin
+    assert re.fullmatch(r"[0-9a-f]{40}", revision), "Unpinned Cargo license source"
     assert not subpath or (not Path(subpath).is_absolute() and Path(subpath).as_posix() == subpath
         and ".." not in Path(subpath).parts), "Unsafe Cargo VCS path"
     crate_name = package["name"] + "-" + package["version"]
     crate = fetch("https://static.crates.io/crates/" + urllib.parse.quote(package["name"], safe="") + "/"
         + urllib.parse.quote(crate_name, safe="") + ".crate")
     assert hashlib.sha256(crate).hexdigest() == checksum, "Locked Cargo archive checksum mismatch"
+    source_files = {}
     with tarfile.open(fileobj=io.BytesIO(crate), mode="r:gz") as archive:
-        member = archive.getmember(crate_name + "/.cargo_vcs_info.json")
-        assert member.isfile() and 0 < member.size <= 65536
-        assert json.loads(archive.extractfile(member).read()) == vcs, "Cargo VCS pin differs from locked archive"
+        if vcs is not None:
+            member = archive.getmember(crate_name + "/.cargo_vcs_info.json")
+            assert member.isfile() and 0 < member.size <= 65536
+            assert json.loads(archive.extractfile(member).read()) == vcs, "Cargo VCS pin differs from locked archive"
+        else:
+            assert crate_name + "/.cargo_vcs_info.json" not in archive.getnames(), "Published Cargo VCS pin was removed"
+            members = archive.getmembers()
+            assert len(members) <= 4096
+            total = 0
+            for member in members:
+                if member.isdir():
+                    continue
+                relative = member.name.removeprefix(crate_name + "/")
+                assert member.isfile() and relative != member.name and not Path(relative).is_absolute() and ".." not in Path(relative).parts
+                assert 0 <= member.size <= 2 * 1024 * 1024
+                total += member.size
+                assert total <= LIMIT
+                if relative in ("Cargo.toml", "Cargo.lock"):
+                    continue  # Cargo generates these; the original manifest and every shipped source file must match.
+                if relative == "Cargo.toml.orig":
+                    relative = "Cargo.toml"
+                path = (Path(subpath) / relative).as_posix()
+                assert path not in source_files, "Duplicate Cargo source file"
+                data = archive.extractfile(member).read()
+                source_files[path] = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+            assert (Path(subpath) / "Cargo.toml").as_posix() in source_files and any(path.endswith(".rs") for path in source_files)
     parents = {"", *(parent.as_posix() for parent in (Path(subpath), *Path(subpath).parents))}
     tree = json.loads(fetch("https://api.github.com/repos/" + repository[1] + "/git/trees/" + revision + "?recursive=1"))
     assert not tree.get("truncated") and len(tree["tree"]) <= 100000, "Incomplete pinned Cargo source tree"
+    tree_files = {row["path"]: row["sha"] for row in tree["tree"] if row["type"] == "blob" and row["mode"] in ("100644", "100755")}
+    for path, blob in source_files.items():
+        assert tree_files.get(path) == blob, "Published Cargo source differs from reviewed pin: " + path
     candidates = [row for row in tree["tree"] if row["type"] == "blob" and row["mode"] in ("100644", "100755")
         and Path(row["path"]).parent.as_posix() in parents
         and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", Path(row["path"]).name)]
@@ -191,44 +228,52 @@ def cargo_components(metadata, roots, destination, revision):
                 proc_macro = any("proc-macro" in item["kind"] for item in target["targets"])
                 next_role = "build-tool" if role == "build-tool" or kind["kind"] == "build" or proc_macro else role
                 pending.append((edge["pkg"], next_role, consumer))
-    result = []
+    result, failures = [], []
     for key, roles_used in sorted(roles.items()):
         package = packages[key]
-        source = package["source"] or revision
-        checksum = checksums.get((package["name"], package["version"], package["source"]))
-        if package["source"] and package["source"].startswith("registry+"):
-            assert re.fullmatch(r"[0-9a-f]{64}", checksum or ""), "Missing locked Cargo checksum: " + key
-        directory = Path(package["manifest_path"]).parent
-        declared = package.get("license")
-        license_file = package.get("license_file")
-        assert declared or license_file, "Unknown Cargo license: " + key
-        source_root = directory
-        if not package["source"] or package["source"].startswith("git+"):
-            source_root = next((parent for parent in (directory, *directory.parents)
-                if (parent / ".git").exists()), directory)
-        license_directory = directory
-        records = None
-        if not license_file:
-            while not any(path.is_file() and re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])", path.name)
-                          for path in license_directory.iterdir()):
-                if license_directory == source_root:
-                    records = registry_licenses(package, directory, destination, checksum)
-                    break
-                license_directory = license_directory.parent
-        license_path = directory / license_file if license_file else None
-        if records is None:
-            records = licenses(license_directory, destination, source + "#" + key, source_root) if not license_path else [
-                text_material(destination, license_path.name, source + "#" + key, license_text(license_path, source_root))]
-        notice = [path for path in directory.rglob("*") if path.is_file()
-            and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", path.name)]
-        assert len(notice) <= 2048
-        records += [text_material(destination, path.relative_to(directory).as_posix(), source + "#" + key, license_text(path, source_root))
-                    for path in notice if path.parent != directory]
-        result.append({"name": package["name"], "version": package["version"], "id": key, "source": source,
-            "declared_license": declared or "LicenseRef-" + records[0]["sha256"], "roles": sorted(roles_used),
-            "production_roots": sorted(consumers[key]),
-            "source_checksum": checksum,
-            "licenses": records, "manifest_sha256": sha(Path(package["manifest_path"]))})
+        try:
+            source = package["source"] or revision
+            checksum = checksums.get((package["name"], package["version"], package["source"]))
+            if package["source"] and package["source"].startswith("registry+"):
+                assert re.fullmatch(r"[0-9a-f]{64}", checksum or ""), "Missing locked Cargo checksum: " + key
+            directory = Path(package["manifest_path"]).parent
+            declared = package.get("license")
+            license_file = package.get("license_file")
+            assert declared or license_file, "Unknown Cargo license: " + key
+            source_root = directory
+            if not package["source"] or package["source"].startswith("git+"):
+                source_root = next((parent for parent in (directory, *directory.parents)
+                    if (parent / ".git").exists()), directory)
+            license_directory = directory
+            records = None
+            if not license_file:
+                while not any(path.is_file() and re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])", path.name)
+                              for path in license_directory.iterdir()):
+                    if license_directory == source_root:
+                        records = registry_licenses(package, directory, destination, checksum)
+                        break
+                    license_directory = license_directory.parent
+            license_path = directory / license_file if license_file else None
+            if records is None:
+                records = licenses(license_directory, destination, source + "#" + key, source_root) if not license_path else [
+                    text_material(destination, license_path.name, source + "#" + key, license_text(license_path, source_root))]
+            notice = [path for path in directory.rglob("*") if path.is_file()
+                and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", path.name)]
+            assert len(notice) <= 2048
+            records += [text_material(destination, path.relative_to(directory).as_posix(), source + "#" + key, license_text(path, source_root))
+                        for path in notice if path.parent != directory]
+            result.append({"name": package["name"], "version": package["version"], "id": key, "source": source,
+                "declared_license": declared or "LicenseRef-" + records[0]["sha256"], "roles": sorted(roles_used),
+                "production_roots": sorted(consumers[key]),
+                "source_checksum": checksum,
+                "licenses": records, "manifest_sha256": sha(Path(package["manifest_path"]))})
+        except (AssertionError, OSError, ValueError, KeyError, tarfile.TarError) as error:
+            failures.append({"id": key, "name": package["name"], "version": package["version"],
+                "source": package["source"], "checksum": checksums.get((package["name"], package["version"], package["source"])),
+                "repository": package.get("repository"), "license": package.get("license"),
+                "vcs_present": (Path(package["manifest_path"]).parent / ".cargo_vcs_info.json").is_file(),
+                "error": type(error).__name__ + ": " + str(error)})
+    assert not failures, "Cargo license collection blocked: " + canonical(failures).decode()
     return result
 
 
@@ -374,6 +419,23 @@ def system_components(package, destination):
                     "roles": ["system-runtime-dependency-not-shipped"], "source_package": source_package,
                     "runtime_file": {"path": str(path), "sha256": sha(path)}})
     return result
+
+
+def cargo_audit():
+    import host
+    root = Path(os.environ["CM_SOURCE_DIR"])
+    if host.load_config(root)["task_id"] != "CM-S01":
+        return
+    assert os.environ["GITHUB_REPOSITORY"] == "DSLZL/CM-build-linux-x64"
+    metadata = json.loads(subprocess.check_output(
+        ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", host.TARGET],
+        cwd=root / host.HOST / "codex-rs", text=True))
+    logs = Path(os.environ["CM_CI_LOG_DIR"])
+    components = cargo_components(metadata, {"codex-cli", "codex-code-mode-host", "codex-bwrap"},
+        logs / "cargo-license-texts", "https://github.com/" + os.environ["CM_SOURCE_REPOSITORY"] + "/tree/" + os.environ["CM_SOURCE_SHA"])
+    write(logs / "cargo-license-audit.json", {"status": "pass", "component_count": len(components),
+        "source_sha": os.environ["CM_SOURCE_SHA"], "lock_sha256": sha(Path(metadata["workspace_root"]) / "Cargo.lock"),
+        "note": "Early license check; packaging still collects and verifies its current materials"})
 
 
 def host_materials(root, package, metadata, logs, identity):
@@ -984,11 +1046,49 @@ def self_check():
                 pass
             else:
                 raise AssertionError("Mismatched locked Cargo archive accepted")
+            source_data = {"Cargo.toml.orig": b"[package]\n", "src/lib.rs": b"pub fn pinned() {}\n"}
+            crate_data = io.BytesIO()
+            with tarfile.open(fileobj=crate_data, mode="w:gz") as archive:
+                for name, contents in source_data.items():
+                    member = tarfile.TarInfo("shared-1.0.0/" + name)
+                    member.size = len(contents)
+                    archive.addfile(member, io.BytesIO(contents))
+                    path = "crate/" + ("Cargo.toml" if name == "Cargo.toml.orig" else name)
+                    tree["tree"].append({"path": path, "type": "blob", "mode": "100644",
+                        "sha": hashlib.sha1(b"blob " + str(len(contents)).encode() + b"\0" + contents).hexdigest()})
+            unpinned_crate = crate_data.getvalue()
+            vcs_path.unlink()
+            with patch.dict(CARGO_LICENSE_PINS, {("example/pinned", "shared", "1.0.0"): ("a" * 40, "crate")}):
+                try:
+                    registry_licenses(package, directory, root / "rejected", checksum)
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError("Removed published Cargo VCS pin accepted")
+                def reviewed_fetch(url, maximum=LIMIT):
+                    return unpinned_crate if url.endswith(".crate") else pinned_fetch(url, maximum)
+                with patch(__name__ + ".fetch", side_effect=reviewed_fetch):
+                    actual_checksum = hashlib.sha256(unpinned_crate).hexdigest()
+                    texts = registry_licenses(package, directory, root / "texts", actual_checksum)
+                    assert [row["source"] for row in texts] == [license_url]
+                    tree["tree"][-1]["sha"] = "0" * 40
+                    try:
+                        registry_licenses(package, directory, root / "rejected", actual_checksum)
+                    except AssertionError:
+                        pass
+                    else:
+                        raise AssertionError("Published source mismatch accepted for reviewed Cargo pin")
+            write(vcs_path, vcs)
+        linked_license.write_text("self-check license text\n")
         metadata["packages"][0]["license"] = None
+        metadata["packages"][1]["license"] = None
         try:
             cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")
-        except AssertionError:
-            pass
+        except AssertionError as error:
+            prefix = "Cargo license collection blocked: "
+            assert str(error).startswith(prefix)
+            failures = json.loads(str(error).removeprefix(prefix))
+            assert {row["id"] for row in failures} == {"a", "b"}, "License audit stopped at its first missing component"
         else:
             raise AssertionError("Unknown Cargo license accepted")
         for name in ("../escape.json", "/absolute.json", "linked.json"):
@@ -1011,4 +1111,5 @@ if __name__ == "__main__":
     import sys
     from record_run import require_hosted_linux
     require_hosted_linux()
-    {"attest-prepare": attest_prepare, "consume-proofs": consume_proofs, "self-check": self_check}[sys.argv[1]]()
+    {"attest-prepare": attest_prepare, "consume-proofs": consume_proofs, "cargo-audit": cargo_audit,
+        "self-check": self_check}[sys.argv[1]]()

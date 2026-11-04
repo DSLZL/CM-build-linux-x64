@@ -253,6 +253,9 @@ jobs:
       - name: Fetch locked dependencies
         if: inputs.build_kind == 'qualification' && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true')
         run: python3 -B ci/scripts/linux_ci.py fetch
+      - name: Audit all production Cargo licenses before native build work
+        if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        run: python3 -B ci/scripts/distribution_provenance.py cargo-audit 2>&1 | tee "$CM_CI_LOG_DIR/cargo-license-audit.log"
       - name: Build and bind the bundled sandbox helper before Host compilation
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         run: |
