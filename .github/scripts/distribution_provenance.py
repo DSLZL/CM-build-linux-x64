@@ -55,10 +55,18 @@ def text_material(directory, key, source, data):
     return {"name": key, "source": source, "path": name, "sha256": sha(destination), "size": len(data)}
 
 
-def licenses(directory, destination, source):
-    candidates = [path for path in directory.iterdir() if path.is_file() and not path.is_symlink()
+def license_text(path, source_root):
+    resolved = path.resolve(strict=True)
+    assert resolved.is_file() and resolved.is_relative_to(source_root.resolve()), "License escapes its pinned source: " + str(path)
+    with resolved.open("rb") as stream:
+        return stream.read(2 * 1024 * 1024 + 1)
+
+
+def licenses(directory, destination, source, source_root=None):
+    candidates = [path for path in directory.iterdir() if path.is_file()
         and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", path.name)]
-    result = [text_material(destination, path.name, source, path.read_bytes()) for path in sorted(candidates)]
+    result = [text_material(destination, path.name, source, license_text(path, source_root or directory))
+        for path in sorted(candidates)]
     assert result, "No actual license text for " + source
     return result
 
@@ -146,19 +154,23 @@ def cargo_components(metadata, roots, destination, revision):
         declared = package.get("license")
         license_file = package.get("license_file")
         assert declared or license_file, "Unknown Cargo license: " + key
+        source_root = directory
+        if not package["source"] or package["source"].startswith("git+"):
+            source_root = next((parent for parent in (directory, *directory.parents)
+                if (parent / ".git").exists()), directory)
         license_directory = directory
         if not license_file:
             while not any(path.is_file() and re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])", path.name)
                           for path in license_directory.iterdir()):
-                assert not package["source"] and license_directory.parent != license_directory, "Missing Cargo license text: " + key
+                assert license_directory != source_root, "Missing Cargo license text: " + key
                 license_directory = license_directory.parent
         license_path = directory / license_file if license_file else None
-        records = licenses(license_directory, destination, source + "#" + key) if not license_path else [
-            text_material(destination, license_path.name, source + "#" + key, license_path.read_bytes())]
-        notice = [path for path in directory.rglob("*") if path.is_file() and not path.is_symlink()
+        records = licenses(license_directory, destination, source + "#" + key, source_root) if not license_path else [
+            text_material(destination, license_path.name, source + "#" + key, license_text(license_path, source_root))]
+        notice = [path for path in directory.rglob("*") if path.is_file()
             and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", path.name)]
         assert len(notice) <= 2048
-        records += [text_material(destination, path.relative_to(directory).as_posix(), source + "#" + key, path.read_bytes())
+        records += [text_material(destination, path.relative_to(directory).as_posix(), source + "#" + key, license_text(path, source_root))
                     for path in notice if path.parent != directory]
         checksum_file = directory / ".cargo-checksum.json"
         result.append({"name": package["name"], "version": package["version"], "id": key, "source": source,
@@ -819,7 +831,10 @@ def self_check():
         else:
             raise AssertionError("Unqualified source CI authorized signing")
     with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as temporary:
-        root = Path(temporary)
+        root = Path(temporary) / "checkout"
+        root.mkdir()
+        (root / ".git").mkdir()
+        (root / "LICENSE").write_text("shared pinned checkout license\n")
         metadata = {"packages": [], "resolve": {"nodes": []}}
         edges = {"a": [("shared", None), ("builder", "build"), ("dev", "dev")],
             "b": [("shared", None)], "shared": [], "builder": [], "dev": []}
@@ -832,10 +847,28 @@ def self_check():
                 "license": "MIT", "manifest_path": str(directory / "Cargo.toml"), "targets": [{"kind": ["lib"]}]})
             metadata["resolve"]["nodes"].append({"id": name, "deps": [
                 {"pkg": dependency, "dep_kinds": [{"kind": kind}]} for dependency, kind in dependencies]})
+        linked_license = root / "shared/LICENSE"
+        linked_license.unlink()
+        linked_license.symlink_to("../LICENSE")
+        next(row for row in metadata["packages"] if row["name"] == "shared")["source"] = "git+https://example.invalid/pinned#" + "a" * 40
         components = {row["name"]: row for row in cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")}
         assert set(components) == {"a", "b", "shared", "builder"}
         assert components["shared"]["production_roots"] == ["a", "b"]
+        assert components["shared"]["licenses"][0]["sha256"] == sha(root / "LICENSE")
         assert components["builder"]["roles"] == ["build-tool"] and components["builder"]["production_roots"] == ["a"]
+        outside = Path(temporary) / "outside.txt"
+        outside.write_text("not part of the pinned checkout\n")
+        linked_license.unlink()
+        linked_license.symlink_to("../../outside.txt")
+        try:
+            cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("License symlink escaped its pinned checkout")
+        linked_license.unlink()
+        inherited = {row["name"]: row for row in cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")}
+        assert inherited["shared"]["licenses"][0]["sha256"] == sha(root / "LICENSE")
         metadata["packages"][0]["license"] = None
         try:
             cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")
