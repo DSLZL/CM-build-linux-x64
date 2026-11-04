@@ -909,9 +909,9 @@ def extract_materials(archive, destination):
 
 def source_check(worker, policy, revision):
     path = "repos/" + policy["source_repository"]
-    runs = worker.api(path + "/actions/workflows/cm-source-check.yml/runs?head_sha=" + revision + "&status=completed&per_page=100")["workflow_runs"]
+    runs = worker.api(path + "/actions/runs?head_sha=" + revision + "&per_page=100")["workflow_runs"]
     for run in runs:
-        if (run["head_sha"] != revision or run["head_branch"] != "main" or run["conclusion"] != "success"
+        if (run["status"] != "completed" or run["head_sha"] != revision or run["head_branch"] != "main" or run["conclusion"] != "success"
             or run["event"] not in ("push", "workflow_dispatch") or run["path"] != ".github/workflows/cm-source-check.yml"
             or run["repository"]["id"] != policy["source_repository_id"]
             or run["head_repository"]["id"] != policy["source_repository_id"]):
@@ -919,7 +919,7 @@ def source_check(worker, policy, revision):
         jobs = worker.receipt_jobs(path + "/actions/runs/" + str(run["id"]) + "/attempts/" +
             str(run["run_attempt"]) + "/jobs?per_page=100", ["CI infrastructure / Linux x64 / GitHub hosted"])
         return {"run_id": run["id"], "run_attempt": run["run_attempt"], "source_sha": revision, "jobs": jobs}
-    raise RuntimeError("No exact successful first-party source CI for the signing inputs")
+    raise RuntimeError("No exact successful first-party source CI for the signing inputs: " + revision)
 
 
 def attest_prepare():
@@ -1039,6 +1039,28 @@ def self_check():
     require_hosted_linux()
     import runtime_consumer
     runtime_consumer.check_distribution_verifier_binding()
+    from types import SimpleNamespace
+    ci_policy = {"source_repository": "DSLZL/CM", "source_repository_id": 1430833890}
+    ci_revision = "a" * 40
+    ci_run = {"id": 1, "run_attempt": 1, "head_sha": ci_revision, "head_branch": "main",
+        "status": "completed", "conclusion": "success", "event": "push",
+        "path": ".github/workflows/cm-source-check.yml",
+        "repository": {"id": 1430833890}, "head_repository": {"id": 1430833890}}
+    ci_candidate = ci_run
+    def ci_api(path):
+        assert path == "repos/DSLZL/CM/actions/runs?head_sha=" + ci_revision + "&per_page=100"
+        return {"workflow_runs": [ci_candidate]}
+    ci_worker = SimpleNamespace(api=ci_api, receipt_jobs=lambda *args: [{"id": 2}])
+    assert source_check(ci_worker, ci_policy, ci_revision)["run_id"] == 1
+    for changed in ({"status": "in_progress"}, {"conclusion": "failure"},
+        {"path": ".github/workflows/other.yml"}, {"head_sha": "b" * 40}):
+        ci_candidate = ci_run | changed
+        try:
+            source_check(ci_worker, ci_policy, ci_revision)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Nonmatching source CI accepted")
     assert re.findall(COMMON_LICENSE_PATH, "See /usr/share/common-licenses/GPL. Also /usr/share/common-licenses/LGPL-2.1. "
         "(/usr/share/common-licenses/GPL-3), /usr/share/common-licenses/Apache-2.0; /usr/share/common-licenses/Unknown-1.0.") == [
         "/usr/share/common-licenses/GPL", "/usr/share/common-licenses/LGPL-2.1", "/usr/share/common-licenses/GPL-3",
