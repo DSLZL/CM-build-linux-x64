@@ -79,6 +79,11 @@ PRIVATE_PROBES = {
     "fixtures/sdk-seams/core_probe.rs": "m02-native-probe-build",
     "fixtures/sdk-seams/stream_probe.rs": "m02-native-probe-build",
 }
+PRIVATE_PROBES = {path: (label,) for path, label in PRIVATE_PROBES.items()} | {
+    "fixtures/mods/sdk-seams-" + owner + "/" + path:
+        tuple("g06-sdk-" + owner + "-" + variant for variant in ("v1", "v2", "replacement"))
+    for owner in ("a", "b") for path in ("Cargo.toml", "Cargo.lock", "src/lib.rs")}
+PROBE_TARGETS = {label for labels in PRIVATE_PROBES.values() for label in labels}
 
 
 
@@ -307,12 +312,13 @@ def select(root, logs):
     plan["probe_inputs"] = probe_inputs(root, "HEAD")
     if plan["status"] == "hit":
         old_probes = probe_inputs(root, plan["production_origin"]["source_sha"])
-        changed = {PRIVATE_PROBES[path] for path, value in plan["probe_inputs"].items()
-                   if plan["build_request"]["kind"] == "qualification" and old_probes[path] != value}
+        changed = {label for path, value in plan["probe_inputs"].items()
+                   if plan["build_request"]["kind"] == "qualification" and old_probes[path] != value
+                   for label in PRIVATE_PROBES[path]}
         test_builds = {}
         for label, item in plan.get("test_builds", {}).items():
             if label not in changed or item["inputs"] != {
-                    path: value for path, value in plan["probe_inputs"].items() if PRIVATE_PROBES[path] == label}:
+                    path: value for path, value in plan["probe_inputs"].items() if label in PRIVATE_PROBES[path]}:
                 continue
             try:
                 verify_test_build(item)
@@ -524,19 +530,32 @@ def probe_build(root, logs):
         binary = acceptance_cache.run(root, logs, label)
         shutil.copy2(binary, target / "binary")
         receipt = read(Path(os.environ["CM_ACCEPTANCE_BUILD_CACHE_DIR"]) / label / "build.json")
-        metadata["source_sha256"] = receipt["inputs"]["instrumented_source_sha256"]
+        if label.startswith("g06-sdk-"):
+            import mod_manifest
+            import sdk_seams
+            _, _, owner, variant = label.split("-")
+            mod_manifest.manifest(target, sdk_seams.manifest(owner, variant, binary))
+            exports = subprocess.check_output(["nm", "-D", "--defined-only", str(binary)], text=True)
+            assert " cm_mod_entry_v2" in exports
+            metadata["author"] = {"inputs": receipt["inputs"], "origin": receipt["origin"],
+                "payload_sha256": runtime_consumer.sha(binary), "mod_build_id": "sha256:" + digest(receipt["inputs"]),
+                "exports": exports, "host_frozen_before_author_build": producer["host"]["executable_sha256"], "host_linked": False}
+        else:
+            metadata["source_sha256"] = receipt["inputs"]["instrumented_source_sha256"]
         shutil.copyfile(Path(os.environ["CM_ACCEPTANCE_BUILD_CACHE_DIR"]) / label / "build.json", target / "build.json")
         write(target / "test-build.json", {"schema_version": 1, "target": label,
             "provenance": runtime_consumer.provenance(),
-            "inputs": {path: value for path, value in plan["probe_inputs"].items() if PRIVATE_PROBES[path] == label},
+            "inputs": {path: value for path, value in plan["probe_inputs"].items() if label in PRIVATE_PROBES[path]},
             "metadata": metadata, "files": runtime_consumer.inventory(target)})
-        policy().output({("core_probe" if label == "m02-native-probe-build" else "tui_probe"): "true"})
+        output = label.replace("-", "_") if label.startswith("g06-sdk-") else (
+            "core_probe" if label == "m02-native-probe-build" else "tui_probe")
+        policy().output({output: "true"})
 
 
 def verify_test_build(item, *, worker=None, fetch=None):
     worker = worker or os.environ["GITHUB_REPOSITORY"]
     fetch = fetch or policy().api
-    assert item["target"] in set(PRIVATE_PROBES.values())
+    assert item["target"] in PROBE_TARGETS
     assert item["job"] in ("build-read / linux-x64", "build-write / linux-x64")
     assert all(re.fullmatch(r"[0-9a-f]{40}", item[key]) for key in ("source_sha", "workflow_sha"))
     assert all(type(item[key]) is int and item[key] > 0 for key in ("run_id", "run_attempt", "job_id"))
@@ -557,8 +576,9 @@ def refresh_probes(inputs, validation):
     import runtime_consumer as runtime
     metadata = {}
     for label, item in validation.get("test_builds", {}).items():
-        assert label in set(PRIVATE_PROBES.values()) and item["target"] == label
-        expected = {path: value for path, value in validation["probe_inputs"].items() if PRIVATE_PROBES[path] == label}
+        assert label in PROBE_TARGETS and item["target"] == label
+        sdk_author = label.startswith("g06-sdk-")
+        expected = {path: value for path, value in validation["probe_inputs"].items() if label in PRIVATE_PROBES[path]}
         assert item["inputs"] == expected
         record = verify_test_build(item)
         with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
@@ -573,13 +593,15 @@ def refresh_probes(inputs, validation):
                     "GITHUB_REPOSITORY": os.environ["GITHUB_REPOSITORY"],
                     "CM_SOURCE_REPOSITORY": os.environ["CM_SOURCE_REPOSITORY"],
                     "CM_REQUEST_ID": item["request_id"]}.items())
-                required_metadata = {"source_sha256"}
+                required_metadata = {"author"} if sdk_author else {"source_sha256"}
                 if label == "m02-native-probe-build":
                     required_metadata.add("native_scope_probe")
                     if read(inputs / "producer.json").get("g02a"):
                         required_metadata.add("budget_scope_probe")
                 assert set(proof["metadata"]) == required_metadata
                 allowed = {"binary", "build.json"}
+                if sdk_author:
+                    allowed.add("mod.toml")
                 if label == "m02-native-probe-build":
                     allowed.update("fixture/" + name for name in ("m02-native-probe.json", "m02-native-scopes.json",
                         "m02-native-events.jsonl", "m02-native-trace.jsonl"))
@@ -602,13 +624,37 @@ def refresh_probes(inputs, validation):
                     target.chmod(0o755 if name == "binary" else 0o644)
                 assert runtime.inventory(extracted) == proof["files"], "Test-build bytes differ"
                 build = read(extracted / "build.json")
-                assert build["inputs"]["instrumented_source_sha256"] == proof["metadata"]["source_sha256"]
+                if not sdk_author:
+                    assert build["inputs"]["instrumented_source_sha256"] == proof["metadata"]["source_sha256"]
                 assert set(build["checks"]) == {label} and build["checks"][label]["return_code"] == 0
                 compiled = next(row for row in build["files"] if row["path"] == label + ".bin")
                 assert compiled["sha256"] == runtime.sha(extracted / "binary")
                 assert build["checks"][label]["recipe"] == build["inputs"]["recipes"][label]
                 assert build["origin"]["CM_SOURCE_REPOSITORY"] == os.environ["CM_SOURCE_REPOSITORY"]
                 assert build["origin"]["GITHUB_REPOSITORY"] == os.environ["GITHUB_REPOSITORY"]
+                if sdk_author:
+                    import tomllib
+                    _, _, owner, variant = label.split("-")
+                    author = proof["metadata"]["author"]
+                    assert author["inputs"] == build["inputs"] and author["origin"] == build["origin"]
+                    assert author["payload_sha256"] == compiled["sha256"]
+                    assert author["mod_build_id"] == "sha256:" + digest(build["inputs"])
+                    assert author["host_linked"] is False and " cm_mod_entry_v2" in author["exports"]
+                    assert author["host_frozen_before_author_build"] == read(inputs / "producer.json")["host"]["executable_sha256"]
+                    sources = {entry["path"]: entry["sha256"] for entry in build["inputs"]["author"]["sources"]}
+                    assert all(sources[path] == value for path, value in expected.items())
+                    manifest = tomllib.loads((extracted / "mod.toml").read_text())
+                    assert manifest["id"] == "sdk-" + owner and manifest["binary"]["path"] == "payload.so"
+                    assert manifest["binary"]["sha256"] == compiled["sha256"]
+                    assert manifest["binary"]["size"] == (extracted / "binary").stat().st_size
+                    assert manifest["provenance"]["revision"] == item["source_sha"]
+                    package = inputs / "mods/g06" / owner / variant
+                    assert package.is_dir() and not package.is_symlink()
+                    for name, destination in (("binary", "payload.so"), ("mod.toml", "mod.toml")):
+                        assert not (package / destination).is_symlink()
+                        shutil.copy2(extracted / name, package / destination)
+                    metadata[label] = proof["metadata"]
+                    continue
                 for field, name in (("native_scope_probe", "m02-native-probe.json"),
                                     ("budget_scope_probe", "g02a-native-probe.json")):
                     if field in proof["metadata"]:
@@ -626,6 +672,8 @@ def refresh_probes(inputs, validation):
                         shutil.copyfile(extracted / name, inputs / name)
                 metadata[label] = {"binary_sha256": runtime.sha(extracted / "binary"), **proof["metadata"]}
     write(inputs / "test-build-overlays.json", metadata)
+    if any(label.startswith("g06-sdk-") for label in metadata):
+        write(inputs / "fixture/g06-producer.json", effective_producer(inputs)["sdk_seams"])
 
 
 def effective_producer(inputs):
@@ -647,6 +695,10 @@ def effective_producer(inputs):
                 value["review"]["probe"].update(sha256=metadata["binary_sha256"], source_sha256=metadata["source_sha256"])
             if value.get("concurrency"):
                 value["concurrency"]["backend_probe"].update(sha256=metadata["binary_sha256"], source_sha256=metadata["source_sha256"])
+        elif label.startswith("g06-sdk-"):
+            _, _, owner, variant = label.split("-")
+            value["authors"]["g06/" + owner + "/" + variant] = metadata["author"]
+            value["sdk_seams"]["authors"][owner + "/" + variant] = metadata["author"]
         else:
             raise AssertionError("Unknown test-build overlay")
     return value
@@ -691,7 +743,9 @@ def overlay(root, logs):
     test_builds = dict(plan.get("test_builds", {}))
     probe_producer = current_producer_job() if plan["changed_probes"] else None
     for label, variable in (("m02-native-probe-build", "CM_CORE_PROBE_ARTIFACT_ID"),
-                            ("review-tui-probe-build", "CM_TUI_PROBE_ARTIFACT_ID")):
+                            ("review-tui-probe-build", "CM_TUI_PROBE_ARTIFACT_ID"),
+                            *((label, "CM_" + label.replace("-", "_").upper() + "_ARTIFACT_ID")
+                              for label in sorted(PROBE_TARGETS) if label.startswith("g06-sdk-"))):
         if os.environ.get(variable):
             record = checked_artifact(p.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/artifacts/" + os.environ[variable]),
                                       int(os.environ["GITHUB_RUN_ID"]))
@@ -701,7 +755,7 @@ def overlay(root, logs):
                 "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "request_id": os.environ["CM_REQUEST_ID"],
                 "job": probe_producer["name"], "job_id": probe_producer["id"],
                 "target": label, "artifact": artifact_ref(record),
-                "inputs": {path: value for path, value in plan["probe_inputs"].items() if PRIVATE_PROBES[path] == label}}
+                "inputs": {path: value for path, value in plan["probe_inputs"].items() if label in PRIVATE_PROBES[path]}}
     baseline = plan.get("checkpoint_origin")
     write(destination / "validation.json", {"schema_version": 2, "provenance": runtime_consumer.provenance(),
         "environment": environment(), "production_inputs_sha256": plan["production_inputs_sha256"],
@@ -1255,15 +1309,15 @@ def probe_build_self_check():
         assert all((inputs / path).read_bytes() == data for path, data in before.items())
 
 
-def probe_overlay_self_check():
+def probe_overlay_self_check(label="review-tui-probe-build"):
     from contextlib import nullcontext
     from copy import deepcopy
     from io import BytesIO
     from unittest.mock import patch
     import runtime_consumer as runtime
     import zipfile
-    label = "review-tui-probe-build"
-    expected = {path: "a" * 64 for path, target in PRIVATE_PROBES.items() if target == label}
+    sdk_author = label.startswith("g06-sdk-")
+    expected = {path: "a" * 64 for path, targets in PRIVATE_PROBES.items() if label in targets}
     origin = runtime.provenance()
     item = {"target": label, "inputs": expected, "run_id": int(origin["GITHUB_RUN_ID"]),
         "run_attempt": int(origin["GITHUB_RUN_ATTEMPT"]), "workflow_sha": origin["GITHUB_WORKFLOW_SHA"],
@@ -1282,28 +1336,53 @@ def probe_overlay_self_check():
         artifact.mkdir()
         (inputs / "host/bin").mkdir(parents=True)
         (inputs / "host/bin/codex").write_bytes(b"frozen-host")
-        write(inputs / "producer.json", {"host": {"unchanged": True}})
+        write(inputs / "producer.json", {"host": {"executable_sha256": "frozen-host"},
+            "authors": {}, "sdk_seams": {"authors": {}}})
+        (inputs / "mods/g06/a/v1").mkdir(parents=True)
+        (inputs / "mods/g06/b/v1").mkdir(parents=True)
+        (inputs / "mods/g06/b/v1/payload.so").write_bytes(b"unchanged-author-b")
+        (inputs / "official").mkdir()
+        (inputs / "official/frozen").write_bytes(b"unchanged-official")
         (artifact / "binary").write_bytes(b"private-tui-probe")
         (artifact / "binary").chmod(0o755)
         recipe = {"binary": "codex_tui"}
-        write(artifact / "build.json", {"origin": origin, "inputs": {
-            "instrumented_source_sha256": "f" * 64, "recipes": {label: recipe}},
+        build_inputs = {"recipes": {label: recipe}, **({"author": {"sources": [
+            {"path": path, "sha256": value} for path, value in expected.items()]}} if sdk_author else {
+                "instrumented_source_sha256": "f" * 64})}
+        write(artifact / "build.json", {"origin": origin, "inputs": build_inputs,
             "checks": {label: {"return_code": 0, "recipe": recipe}},
             "files": [{"path": label + ".bin", "sha256": runtime.sha(artifact / "binary")}]})
+        metadata = {"source_sha256": "f" * 64}
+        if sdk_author:
+            import mod_manifest
+            mod_manifest.manifest(artifact, {"id": "sdk-a", "binary": {"path": "payload.so",
+                "sha256": runtime.sha(artifact / "binary"), "size": (artifact / "binary").stat().st_size},
+                "provenance": {"revision": origin["CM_SOURCE_SHA"]}})
+            metadata = {"author": {"inputs": build_inputs, "origin": origin,
+                "payload_sha256": runtime.sha(artifact / "binary"), "mod_build_id": "sha256:" + digest(build_inputs),
+                "exports": " cm_mod_entry_v2", "host_linked": False, "host_frozen_before_author_build": "frozen-host"}}
         proof = {"schema_version": 1, "target": label, "inputs": expected, "provenance": origin,
-            "metadata": {"source_sha256": "f" * 64}, "files": runtime.inventory(artifact)}
+            "metadata": metadata, "files": runtime.inventory(artifact)}
         write(artifact / "test-build.json", proof)
         validation = {"probe_inputs": expected, "test_builds": {label: item}}
-        before = runtime.inventory(inputs / "host")
+        before = {name: runtime.inventory(inputs / name) for name in ("host", "official", "mods/g06/b")}
+        original_build = read(artifact / "build.json")
         p = policy()
         with patch(__name__ + ".verify_test_build", return_value={}), \
                 patch.object(p, "download_origin_archive", side_effect=lambda worker, record, path: archive(artifact)):
             refresh_probes(inputs, validation)
-            assert runtime.inventory(inputs / "host") == before
-            assert (inputs / "probes/cm-review-tui").read_bytes() == b"private-tui-probe"
-            assert (inputs / "probes/cm-concurrency-backend").read_bytes() == b"private-tui-probe"
+            assert all(runtime.inventory(inputs / name) == files for name, files in before.items())
+            if sdk_author:
+                assert (inputs / "mods/g06/a/v1/payload.so").read_bytes() == b"private-tui-probe"
+                assert effective_producer(inputs)["authors"]["g06/a/v1"] == metadata["author"]
+                assert read(inputs / "fixture/g06-producer.json")["authors"]["a/v1"] == metadata["author"]
+            else:
+                assert (inputs / "probes/cm-review-tui").read_bytes() == b"private-tui-probe"
+                assert (inputs / "probes/cm-concurrency-backend").read_bytes() == b"private-tui-probe"
             original = deepcopy(proof)
-            for mutation in ("unknown-target", "host-overwrite", "wrong-origin", "wrong-bytes", "wrong-recipe"):
+            for mutation in ("unknown-target", "host-overwrite", "wrong-origin", "wrong-bytes", "wrong-recipe",
+                             *(("wrong-manifest", "wrong-author-source") if sdk_author else ())):
+                write(artifact / "build.json", original_build)
                 candidate = deepcopy(original)
                 if mutation == "unknown-target":
                     candidate["target"] = "host"
@@ -1313,6 +1392,19 @@ def probe_overlay_self_check():
                     candidate["provenance"]["GITHUB_RUN_ID"] = "other-run"
                 elif mutation == "wrong-bytes":
                     candidate["files"][0]["sha256"] = "wrong"
+                elif mutation == "wrong-manifest":
+                    import tomllib
+                    fields = tomllib.loads((artifact / "mod.toml").read_text())
+                    fields["binary"]["sha256"] = "other-payload"
+                    mod_manifest.manifest(artifact, fields)
+                    candidate["files"] = [row for row in runtime.inventory(artifact) if row["path"] != "test-build.json"]
+                elif mutation == "wrong-author-source":
+                    mod_manifest.manifest(artifact, {"id": "sdk-a", "binary": {"path": "payload.so",
+                        "sha256": runtime.sha(artifact / "binary"), "size": (artifact / "binary").stat().st_size},
+                        "provenance": {"revision": origin["CM_SOURCE_SHA"]}})
+                    candidate["inputs"][next(iter(expected))] = "different-source"
+                    validation["probe_inputs"] = candidate["inputs"]
+                    item["inputs"] = candidate["inputs"]
                 else:
                     receipt = read(artifact / "build.json")
                     receipt["checks"][label]["return_code"] = 1
@@ -1325,7 +1417,9 @@ def probe_overlay_self_check():
                     pass
                 else:
                     raise AssertionError("Invalid test-build overlay accepted: " + mutation)
-                assert runtime.inventory(inputs / "host") == before
+                assert all(runtime.inventory(inputs / name) == files for name, files in before.items())
+    if not sdk_author:
+        probe_overlay_self_check("g06-sdk-a-v1")
 
 
 def g02a_checkpoint_self_check():
