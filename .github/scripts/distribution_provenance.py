@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import tomllib
 import urllib.parse
 import urllib.request
 import zipfile
@@ -125,21 +126,27 @@ def verifier(root, logs):
     return value
 
 
-def registry_licenses(package, directory, destination):
-    # Some published crates omit license files; their checksum-covered VCS pin still identifies the real texts.
+def registry_licenses(package, directory, destination, checksum):
+    # Some published crates omit license files; the locked crate archive pins their VCS metadata.
     repository = re.fullmatch(r"https://github\.com/([A-Za-z0-9_-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?",
         package.get("repository") or "")
     assert package["source"] and package["source"].startswith("registry+") and repository, "Missing pinned Cargo license source: " + package["id"]
-    checksums = read(directory / ".cargo-checksum.json")
     vcs_path = directory / ".cargo_vcs_info.json"
-    assert re.fullmatch(r"[0-9a-f]{64}", checksums.get("package") or "")
-    assert checksums["files"].get(vcs_path.name) == sha(vcs_path), "Cargo VCS pin checksum mismatch"
+    assert re.fullmatch(r"[0-9a-f]{64}", checksum or ""), "Missing locked Cargo checksum"
     vcs = read(vcs_path)
     revision = vcs["git"]["sha1"]
     assert re.fullmatch(r"[0-9a-f]{40}", revision) and not vcs["git"].get("dirty"), "Unpinned Cargo license source"
     subpath = vcs.get("path_in_vcs", "")
     assert not subpath or (not Path(subpath).is_absolute() and Path(subpath).as_posix() == subpath
         and ".." not in Path(subpath).parts), "Unsafe Cargo VCS path"
+    crate_name = package["name"] + "-" + package["version"]
+    crate = fetch("https://static.crates.io/crates/" + urllib.parse.quote(package["name"], safe="") + "/"
+        + urllib.parse.quote(crate_name, safe="") + ".crate")
+    assert hashlib.sha256(crate).hexdigest() == checksum, "Locked Cargo archive checksum mismatch"
+    with tarfile.open(fileobj=io.BytesIO(crate), mode="r:gz") as archive:
+        member = archive.getmember(crate_name + "/.cargo_vcs_info.json")
+        assert member.isfile() and 0 < member.size <= 65536
+        assert json.loads(archive.extractfile(member).read()) == vcs, "Cargo VCS pin differs from locked archive"
     parents = {"", *(parent.as_posix() for parent in (Path(subpath), *Path(subpath).parents))}
     tree = json.loads(fetch("https://api.github.com/repos/" + repository[1] + "/git/trees/" + revision + "?recursive=1"))
     assert not tree.get("truncated") and len(tree["tree"]) <= 100000, "Incomplete pinned Cargo source tree"
@@ -163,6 +170,8 @@ def registry_licenses(package, directory, destination):
 def cargo_components(metadata, roots, destination, revision):
     packages = {row["id"]: row for row in metadata["packages"]}
     nodes = {row["id"]: row for row in metadata["resolve"]["nodes"]}
+    lock = tomllib.loads((Path(metadata["workspace_root"]) / "Cargo.lock").read_text())
+    checksums = {(row["name"], row["version"], row.get("source")): row.get("checksum") for row in lock.get("package", [])}
     pending = [(key, "static-or-runtime", value["name"]) for key, value in packages.items() if value["name"] in roots]
     assert len(pending) == len(roots), "Ambiguous/missing production Cargo roots"
     roles, consumers, visited = {}, {}, set()
@@ -186,6 +195,9 @@ def cargo_components(metadata, roots, destination, revision):
     for key, roles_used in sorted(roles.items()):
         package = packages[key]
         source = package["source"] or revision
+        checksum = checksums.get((package["name"], package["version"], package["source"]))
+        if package["source"] and package["source"].startswith("registry+"):
+            assert re.fullmatch(r"[0-9a-f]{64}", checksum or ""), "Missing locked Cargo checksum: " + key
         directory = Path(package["manifest_path"]).parent
         declared = package.get("license")
         license_file = package.get("license_file")
@@ -200,7 +212,7 @@ def cargo_components(metadata, roots, destination, revision):
             while not any(path.is_file() and re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])", path.name)
                           for path in license_directory.iterdir()):
                 if license_directory == source_root:
-                    records = registry_licenses(package, directory, destination)
+                    records = registry_licenses(package, directory, destination, checksum)
                     break
                 license_directory = license_directory.parent
         license_path = directory / license_file if license_file else None
@@ -212,11 +224,10 @@ def cargo_components(metadata, roots, destination, revision):
         assert len(notice) <= 2048
         records += [text_material(destination, path.relative_to(directory).as_posix(), source + "#" + key, license_text(path, source_root))
                     for path in notice if path.parent != directory]
-        checksum_file = directory / ".cargo-checksum.json"
         result.append({"name": package["name"], "version": package["version"], "id": key, "source": source,
             "declared_license": declared or "LicenseRef-" + records[0]["sha256"], "roles": sorted(roles_used),
             "production_roots": sorted(consumers[key]),
-            "source_checksum": read(checksum_file).get("package") if checksum_file.is_file() else None,
+            "source_checksum": checksum,
             "licenses": records, "manifest_sha256": sha(Path(package["manifest_path"]))})
     return result
 
@@ -875,7 +886,8 @@ def self_check():
         root.mkdir()
         (root / ".git").mkdir()
         (root / "LICENSE").write_text("shared pinned checkout license\n")
-        metadata = {"packages": [], "resolve": {"nodes": []}}
+        (root / "Cargo.lock").write_text("version = 4\n")
+        metadata = {"workspace_root": str(root), "packages": [], "resolve": {"nodes": []}}
         edges = {"a": [("shared", None), ("builder", "build"), ("dev", "dev")],
             "b": [("shared", None)], "shared": [], "builder": [], "dev": []}
         for name, dependencies in edges.items():
@@ -916,8 +928,15 @@ def self_check():
         vcs_path = directory / ".cargo_vcs_info.json"
         vcs = {"git": {"sha1": "a" * 40}, "path_in_vcs": "crate"}
         write(vcs_path, vcs)
-        checksums = {"package": "b" * 64, "files": {vcs_path.name: sha(vcs_path)}}
-        write(directory / ".cargo-checksum.json", checksums)
+        crate_data = io.BytesIO()
+        with tarfile.open(fileobj=crate_data, mode="w:gz") as archive:
+            member = tarfile.TarInfo("shared-1.0.0/.cargo_vcs_info.json")
+            member.size = len(canonical(vcs))
+            archive.addfile(member, io.BytesIO(canonical(vcs)))
+        crate = crate_data.getvalue()
+        checksum = hashlib.sha256(crate).hexdigest()
+        (root / "Cargo.lock").write_text('version = 4\n[[package]]\nname = "shared"\nversion = "1.0.0"\nsource = '
+            + json.dumps(package["source"]) + '\nchecksum = "' + checksum + '"\n')
         data = b"actual pinned license text\n"
         blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
         tree = {"truncated": False, "tree": [
@@ -926,40 +945,45 @@ def self_check():
         tree_url = "https://api.github.com/repos/example/pinned/git/trees/" + "a" * 40 + "?recursive=1"
         license_url = "https://raw.githubusercontent.com/example/pinned/" + "a" * 40 + "/LICENSE.md"
         def pinned_fetch(url, maximum=LIMIT):
-            assert url in (tree_url, license_url), "License source used an unpinned or unrelated path"
-            return canonical(tree) if url == tree_url else data
+            assert url in ("https://static.crates.io/crates/shared/shared-1.0.0.crate", tree_url, license_url), "License source used an unpinned or unrelated path"
+            return canonical(tree) if url == tree_url else data if url == license_url else crate
         with patch(__name__ + ".fetch", side_effect=pinned_fetch):
             inherited = {row["name"]: row for row in cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")}
-            assert inherited["shared"]["source_checksum"] == "b" * 64
+            assert inherited["shared"]["source_checksum"] == checksum
             assert [row["source"] for row in inherited["shared"]["licenses"]] == [license_url]
             assert inherited["shared"]["licenses"][0]["sha256"] == hashlib.sha256(data).hexdigest()
             for invalid in ({"git": {"sha1": "main"}}, {"git": {"sha1": "a" * 40, "dirty": True}},
                             {"git": {"sha1": "a" * 40}, "path_in_vcs": "../escape"}):
                 write(vcs_path, invalid)
-                write(directory / ".cargo-checksum.json", {**checksums, "files": {vcs_path.name: sha(vcs_path)}})
                 try:
-                    registry_licenses(package, directory, root / "rejected")
+                    registry_licenses(package, directory, root / "rejected", checksum)
                 except AssertionError:
                     pass
                 else:
                     raise AssertionError("Unpinned Cargo license source accepted")
             write(vcs_path, vcs)
-            write(directory / ".cargo-checksum.json", checksums)
             for invalid_tree in ({**tree, "truncated": True}, {**tree, "tree": [{**tree["tree"][0], "sha": "0" * 40}]}):
-                with patch(__name__ + ".fetch", side_effect=lambda url, maximum=LIMIT: canonical(invalid_tree) if url == tree_url else data):
+                with patch(__name__ + ".fetch", side_effect=lambda url, maximum=LIMIT: canonical(invalid_tree) if url == tree_url else pinned_fetch(url, maximum)):
                     try:
-                        registry_licenses(package, directory, root / "rejected")
+                        registry_licenses(package, directory, root / "rejected", checksum)
                     except AssertionError:
                         pass
                     else:
                         raise AssertionError("Incomplete or mismatched pinned license accepted")
-            vcs_path.write_text("{}")
+            write(vcs_path, {"git": {"sha1": "c" * 40}})
             try:
-                registry_licenses(package, directory, root / "rejected")
+                registry_licenses(package, directory, root / "rejected", checksum)
             except AssertionError:
                 pass
             else:
                 raise AssertionError("Modified Cargo VCS pin accepted")
+            write(vcs_path, vcs)
+            try:
+                registry_licenses(package, directory, root / "rejected", "0" * 64)
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("Mismatched locked Cargo archive accepted")
         metadata["packages"][0]["license"] = None
         try:
             cargo_components(metadata, {"a", "b"}, root / "texts", "unit-fixture")
