@@ -255,6 +255,8 @@ jobs:
         run: python3 -B ci/scripts/linux_ci.py fetch
       - name: Audit all production Cargo licenses before native build work
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
         run: python3 -B ci/scripts/distribution_provenance.py cargo-audit 2>&1 | tee "$CM_CI_LOG_DIR/cargo-license-audit.log"
       - name: Build and bind the bundled sandbox helper before Host compilation
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
@@ -439,6 +441,8 @@ jobs:
           python3 -B ci/scripts/runtime_upgrade.py restore-reference --producer
       - name: Run actual acceptance for the current mapped task
         if: inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
         run: python3 -B ci/scripts/linux_ci.py acceptance
       - name: Build only changed private probes against the frozen product
         id: probe-build
