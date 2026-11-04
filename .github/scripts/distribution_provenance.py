@@ -1037,6 +1037,8 @@ def reports(evidence, steps, audit):
 def self_check():
     from record_run import require_hosted_linux
     require_hosted_linux()
+    import runtime_consumer
+    runtime_consumer.check_distribution_verifier_binding()
     assert re.findall(COMMON_LICENSE_PATH, "See /usr/share/common-licenses/GPL. Also /usr/share/common-licenses/LGPL-2.1. "
         "(/usr/share/common-licenses/GPL-3), /usr/share/common-licenses/Apache-2.0; /usr/share/common-licenses/Unknown-1.0.") == [
         "/usr/share/common-licenses/GPL", "/usr/share/common-licenses/LGPL-2.1", "/usr/share/common-licenses/GPL-3",
