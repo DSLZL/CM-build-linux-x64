@@ -227,6 +227,11 @@ def environment():
     return result
 
 
+def same_runtime_platform(record, current):
+    return (set(record) == set(current) and all(isinstance(value, str) and value for value in record.values())
+            and all(record[key] == current[key] for key in ("RUNNER_OS", "RUNNER_ARCH", "ImageOS")))
+
+
 def artifact_ref(record):
     return {key: record[key] for key in ("id", "name", "digest", "size_in_bytes")}
 
@@ -373,7 +378,7 @@ def checkpoint_history(root, runs, worker, workflow_sha):
             with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
                 with small_archive(worker, record, Path(directory) / "index.zip") as archive:
                     index = policy().archive_json(archive, "index.json")
-            if index.get("schema_version") != 2 or index["environment"] != environment():
+            if index.get("schema_version") != 2 or not same_runtime_platform(index["environment"], environment()):
                 continue
             provenance = index["provenance"]
             expected_provenance = {"GITHUB_REPOSITORY": worker, "GITHUB_RUN_ID": str(run["id"]),
@@ -785,7 +790,9 @@ def refresh():
     inputs = Path(os.environ["CM_CONSUMER_INPUT_DIR"])
     overlay_dir = Path(os.environ["CM_VALIDATION_INPUT_DIR"])
     validation = read(overlay_dir / "validation.json")
-    assert validation["provenance"] == runtime.provenance() and validation["environment"] == environment()
+    assert validation["provenance"] == runtime.provenance(), "Current validation provenance differs"
+    current_environment = environment()
+    assert same_runtime_platform(validation["environment"], current_environment), "Overlay runtime platform differs"
     assert validation["production_origin"] == json.loads(os.environ["CM_PRODUCTION_ORIGIN"])
     assert validation["files"] == [e for e in runtime.inventory(overlay_dir) if e["path"] != "validation.json"]
     original = runtime.validate_inputs(inputs)
@@ -800,6 +807,7 @@ def refresh():
     assert [e for e in old if e["path"] not in allowed] == [e for e in runtime.inventory(inputs) if e["path"] not in allowed | {"input-manifest.json"}]
     refresh_probes(inputs, validation)
     validation["original_input_manifest_sha256"] = original["sha256"]
+    validation["consumer_environment"] = current_environment
     write(inputs / "validation.json", validation)
     entries = [e for e in runtime.inventory(inputs) if e["path"] != "input-manifest.json"]
     write(inputs / "input-manifest.json", {"files": entries, "sha256": runtime.digest(entries)})
@@ -930,14 +938,15 @@ class Checkpoints:
         self.commands = {}
         self.constraints = {}
         self.index = {"schema_version": 2, "provenance": runtime.provenance(),
-            "environment": validation["environment"], "rootfs_key": rootfs_key(closure),
+            "environment": environment(), "rootfs_key": rootfs_key(closure),
             "test_inputs": validation["test_inputs"], "steps": {}}
         self.previous = []
         self.download_lock = threading.Lock()
         for candidate in validation.get("checkpoint_origins", ()):
             old = candidate["index"]
-            assert old["schema_version"] == 2 and old["environment"] == validation["environment"]
-            self.previous.append((None, old, candidate))
+            assert old["schema_version"] == 2
+            if old["environment"] == self.index["environment"]:
+                self.previous.append((None, old, candidate))
         previous = os.environ.get("CM_RUNTIME_RESUME_DIR")
         if previous and (Path(previous) / "index.json").is_file():
             old = read(Path(previous) / "index.json")
@@ -1161,6 +1170,7 @@ def self_check():
     with patch.dict(os.environ, {"CM_SOURCE_REPOSITORY": os.environ.get("CM_SOURCE_REPOSITORY", os.environ["GITHUB_REPOSITORY"]),
             "CM_SOURCE_SHA": git(root, "rev-parse", "HEAD").decode().strip(), "CM_REQUEST_ID": "retry-self-check"}):
         checkpoint_self_check()
+        refresh_self_check()
         history_self_check()
         native_self_check()
         probe_build_self_check()
@@ -1490,6 +1500,47 @@ def request_self_check():
             raise AssertionError("Missing or failed legacy producer kind accepted")
 
 
+def refresh_self_check():
+    from unittest.mock import patch
+    import runtime_consumer as runtime
+    current = environment()
+    builder = {**current, "ImageVersion": "different-builder-image"}
+    assert same_runtime_platform(builder, current)
+    for key in ("RUNNER_OS", "RUNNER_ARCH", "ImageOS"):
+        assert not same_runtime_platform({**builder, key: "different-platform"}, current)
+    assert not same_runtime_platform({**builder, "ImageVersion": ""}, current)
+    with tempfile.TemporaryDirectory() as directory:
+        inputs, overlay = Path(directory) / "inputs", Path(directory) / "overlay"
+        inputs.mkdir()
+        overlay.mkdir()
+        (inputs / "frozen-host").write_bytes(b"unchanged native input")
+        original = runtime.inventory(inputs)
+        write(inputs / "input-manifest.json", {"files": original, "sha256": runtime.digest(original)})
+        (overlay / "runtime_consumer.py").write_bytes(b"inert test overlay")
+        validation = {"provenance": runtime.provenance(), "environment": builder,
+            "production_origin": {"frozen": "producer"}, "files": runtime.inventory(overlay)}
+        write(overlay / "validation.json", validation)
+        with patch.dict(os.environ, {"CM_CONSUMER_INPUT_DIR": str(inputs), "CM_VALIDATION_INPUT_DIR": str(overlay),
+                "CM_PRODUCTION_ORIGIN": json.dumps(validation["production_origin"])}), \
+                patch(__name__ + ".refresh_probes"):
+            refresh()
+            recorded = read(inputs / "validation.json")
+            assert recorded["environment"] == builder and recorded["consumer_environment"] == current
+            assert (inputs / "frozen-host").read_bytes() == b"unchanged native input"
+            assert (inputs / "runtime_consumer.py").read_bytes() == b"inert test overlay"
+            before = runtime.inventory(inputs)
+            for field, value in (("environment", {**builder, "RUNNER_ARCH": "other-architecture"}),
+                    ("provenance", {**runtime.provenance(), "GITHUB_RUN_ID": "other-run"})):
+                write(overlay / "validation.json", {**validation, field: value})
+                try:
+                    refresh()
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError("Unbound overlay environment or provenance accepted")
+                assert runtime.inventory(inputs) == before
+
+
 def checkpoint_self_check():
     from unittest.mock import patch
     import runtime_consumer as runtime
@@ -1501,7 +1552,7 @@ def checkpoint_self_check():
     origin = {"run_id": int(provenance["GITHUB_RUN_ID"]), "run_attempt": int(provenance["GITHUB_RUN_ATTEMPT"]),
               "source_sha": provenance["CM_SOURCE_SHA"], "workflow_sha": provenance["GITHUB_WORKFLOW_SHA"],
               "artifact": {"id": 1, "digest": "sha256:" + "a" * 64}}
-    validation = {"environment": environment(), "test_inputs": {label: "a" for label in labels},
+    validation = {"environment": {**environment(), "ImageVersion": "builder-image"}, "test_inputs": {label: "a" for label in labels},
                   "baseline_test_inputs": {label: "a" for label in labels}, "checkpoint_origin": origin}
     with tempfile.TemporaryDirectory() as directory:
         directory = Path(directory)
@@ -1523,6 +1574,7 @@ def checkpoint_self_check():
             write(evidence / "isolation-probes.json", {"current_probe": 1})
             (evidence / "A.entered").touch()
             first = Checkpoints(runtime, validation, closure, temp, evidence, logs, reports, [])
+            assert first.index["environment"] == environment() != validation["environment"]
             assert first.run(logs, labels[0], [], 1).returncode == 0
             assert first.run(logs, labels[1], [], 1).returncode != 0
             assert set(read(directory / "first/index.json")["steps"]) == {labels[0]}
@@ -1552,8 +1604,11 @@ def checkpoint_self_check():
                 sources[number] = snapshot
                 previous.append({**origin, "run_id": number, "artifact": {"id": number}, "index": index})
             os.environ.update(CM_RUNTIME_CHECKPOINT_DIR=str(directory / "multi"), CM_RUNTIME_RESUME_DIR="")
-            multi = Checkpoints(runtime, {**validation, "checkpoint_origins": previous},
+            other_image = {**previous[0], "index": {**previous[0]["index"],
+                "environment": {**environment(), "ImageVersion": "other-consumer-image"}}}
+            multi = Checkpoints(runtime, {**validation, "checkpoint_origins": [other_image, *previous]},
                 closure, temp, evidence, logs, reports, [])
+            assert len(multi.previous) == len(previous), "A different consumer image became a checkpoint candidate"
             def extract(worker, candidate, destination):
                 shutil.copytree(sources[candidate["artifact"]["id"]], destination)
             with patch(__name__ + ".extract_checkpoint", side_effect=extract) as download:
