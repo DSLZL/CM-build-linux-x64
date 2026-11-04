@@ -33,6 +33,8 @@ CARGO_LICENSE_PINS = {
         ("bb9114292d98db0a2919d37d673bb27f930e6aa1", "gazebo/" + name)
         for name in ("strong_hash", "strong_hash_derive")},
     ("denoland/rusty_v8", "v8", "152.2.0"): ("2768994f664e8a6e3aba27503606c58339136e2a", ""),
+    ("pdf-rs/fax", "fax", "0.2.6"): ("5d70a161e33b62305f8bce7af3f7fbd011cfaf5d", ""),
+    ("pdf-rs/fax", "fax_derive", "0.2.0"): ("5d70a161e33b62305f8bce7af3f7fbd011cfaf5d", "derive"),
 }
 CARGO_LICENSE_REPOSITORIES = {
     ("pagable_derive", "0.4.1", "838d17166587914f4e99353766c29160462b681511f08679545a0d07a0dc9415"):
@@ -172,6 +174,9 @@ def registry_licenses(package, directory, destination, checksum):
     if vcs is not None:
         revision, subpath = vcs["git"]["sha1"], vcs.get("path_in_vcs", "")
         assert not vcs["git"].get("dirty") or pin == (revision, subpath), "Unreviewed dirty Cargo license source"
+        if pin and pin != (revision, subpath):
+            revision, subpath = pin
+            verify_source = True  # A later license-only commit must still match every shipped source file.
     else:
         assert pin, "Missing reviewed Cargo license source: " + package["id"]
         revision, subpath = pin
@@ -461,8 +466,6 @@ def cargo_audit():
     if host.load_config(root)["task_id"] != "CM-S01":
         return
     assert os.environ["GITHUB_REPOSITORY"] == "DSLZL/CM-build-linux-x64"
-    self_check()
-    print("CM distribution material self-checks passed", flush=True)
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", host.TARGET],
         cwd=root / host.HOST / "codex-rs", text=True))
@@ -1128,7 +1131,9 @@ def self_check():
                     actual_checksum = hashlib.sha256(unpinned_crate).hexdigest()
                     texts = registry_licenses(package, directory, root / "texts", actual_checksum)
                     assert [row["source"] for row in texts] == [license_url]
-                    for dirty, repository in ((False, None), (True, "https://github.com/example/pinned")):
+                    for dirty, repository, revision in ((False, None, "a" * 40),
+                            (True, "https://github.com/example/pinned", "a" * 40),
+                            (False, "https://github.com/example/pinned", "b" * 40)):
                         reviewed_vcs = {**vcs, "git": {"sha1": "a" * 40, "dirty": dirty}}
                         write(vcs_path, reviewed_vcs)
                         archive_data = io.BytesIO()
@@ -1139,8 +1144,11 @@ def self_check():
                                 archive.addfile(member, io.BytesIO(contents))
                         reviewed_crate = archive_data.getvalue()
                         reviewed_checksum = hashlib.sha256(reviewed_crate).hexdigest()
+                        tree_url = tree_url.replace("a" * 40, revision)
+                        license_url = license_url.replace("a" * 40, revision)
                         with patch.dict(package, repository=repository), patch.dict(CARGO_LICENSE_REPOSITORIES,
                                 {("shared", "1.0.0", reviewed_checksum): "https://github.com/example/pinned"}), \
+                                patch.dict(CARGO_LICENSE_PINS, {("example/pinned", "shared", "1.0.0"): (revision, "crate")}), \
                                 patch(__name__ + ".fetch", side_effect=lambda url, maximum=LIMIT:
                                     reviewed_crate if url.endswith(".crate") else pinned_fetch(url, maximum)):
                             assert registry_licenses(package, directory, root / "texts", reviewed_checksum)
@@ -1153,6 +1161,8 @@ def self_check():
                             else:
                                 raise AssertionError("Published source mismatch accepted for exceptional Cargo metadata")
                             tree["tree"][-1]["sha"] = original_blob
+                        tree_url = tree_url.replace(revision, "a" * 40)
+                        license_url = license_url.replace(revision, "a" * 40)
                     vcs_path.unlink()
                     tree["tree"][-1]["sha"] = "0" * 40
                     try:
@@ -1194,5 +1204,10 @@ if __name__ == "__main__":
     import sys
     from record_run import require_hosted_linux
     require_hosted_linux()
+    if sys.argv[1] == "cargo-audit":
+        import host
+        if host.load_config(Path(os.environ["CM_SOURCE_DIR"]))["task_id"] == "CM-S01":
+            self_check()
+            print("CM distribution material self-checks passed", flush=True)
     {"attest-prepare": attest_prepare, "consume-proofs": consume_proofs, "cargo-audit": cargo_audit,
         "self-check": self_check}[sys.argv[1]]()
