@@ -752,7 +752,7 @@ def native_key(closure, label):
         "consumer": ("inputs/mods/a/", "inputs/mods/b/"),
         "m01": ("inputs/mods/m01-", "inputs/mods/a/", "inputs/mods/b/"),
         "m02": ("inputs/mods/m02/",),
-        "m03": ("inputs/mods/",), "m04": ("inputs/mods/m04/", "inputs/mods/m02/"),
+        "m03": (), "m04": ("inputs/mods/m04/", "inputs/mods/m02/"),
         "g04": ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/"),
         "g01": ("inputs/mods/g01/a/normal/",),
         "g05": (),
@@ -766,6 +766,18 @@ def native_key(closure, label):
     if label == "g04-abi":
         mods += ("inputs/mods/constructor-sentinel/",)
     probes = []
+    if phase == "m03":
+        normal = ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/")
+        legacy = ("inputs/mods/a/", "inputs/mods/b/normal/")
+        manifest = ("inputs/mods/m01-a/", "inputs/mods/m01-b/")
+        sentinel = ("inputs/mods/constructor-sentinel/",)
+        mods = {
+            "install": (*normal, "inputs/mods/example-tool.cmod"),
+            "process": normal, "terminal": normal, "live": normal, "backends": normal,
+            "rejections": (normal[0], *manifest, *legacy, *sentinel),
+            "legacy": legacy,
+            "writers": (*normal, *manifest, *sentinel),
+        }[label.removeprefix("m03-")]
     if phase == "g06":
         mods, probes = runtime_cases.g06_native_dependencies(label.removeprefix("g06-"))
     if phase == "g05":
@@ -1132,6 +1144,30 @@ def native_self_check():
         changed = deepcopy(closure)
         next(row for row in changed["files"] if row["path"] == path)["sha256"] = "after"
         assert {label for label in labels if before[label] != native_key(changed, label)} == expected, path
+    labels = (*(f"m03-{case}" for case in runtime_cases.GROUPS["m03"]), "g06-cli-help")
+    paths = {
+        "inputs/mods/g06/a/v1/payload.so": {"g06-cli-help"},
+        "inputs/mods/g06/a/v1/mod.toml": {"g06-cli-help"},
+        "inputs/mods/g06/b/v1/payload.so": set(),
+        "inputs/mods/a/payload.so": {"m03-legacy", "m03-rejections"},
+        "inputs/mods/b/normal/payload.so": {"m03-legacy", "m03-rejections"},
+        "inputs/mods/m01-a/payload.so": {"m03-rejections", "m03-writers"},
+        "inputs/mods/m01-b/payload.so": {"m03-rejections", "m03-writers"},
+        "inputs/mods/m02/lifecycle-audit/normal/payload.so": set(labels) - {"m03-legacy", "g06-cli-help"},
+        "inputs/mods/m02/example-tool/normal/payload.so": set(labels) - {"m03-legacy", "m03-rejections", "g06-cli-help"},
+        "inputs/mods/example-tool.cmod": {"m03-install"},
+        "inputs/mods/constructor-sentinel/payload.so": {"m03-rejections", "m03-writers"},
+        "inputs/host/bin/codex": set(labels),
+    }
+    closure = {"packages": {"libc6": "1"}, "files": [{"path": path, "sha256": "before"} for path in paths]}
+    before = {label: native_key(closure, label) for label in labels}
+    for path, expected in paths.items():
+        changed = deepcopy(closure)
+        next(row for row in changed["files"] if row["path"] == path)["sha256"] = "after"
+        assert {label for label in labels if before[label] != native_key(changed, label)} == expected, path
+    changed = deepcopy(closure)
+    changed["packages"]["libc6"] = "2"
+    assert all(before[label] != native_key(changed, label) for label in labels)
 
 
 def history_self_check():
