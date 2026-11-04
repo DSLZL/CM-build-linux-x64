@@ -18,6 +18,8 @@ REPORTS = ("binary-provenance.json", "distribution-sbom-license.json",
 POLICY_PATH = "crates/cm/src/distribution-policy.json"
 ROOT_PATH = "crates/cm/src/distribution-root.jsonl"
 LIMIT = 32 * 1024 * 1024
+CARGO_BINDING_SOURCE_PIN = ("denoland/rusty_v8", "v8", "152.2.0",
+    "a10fe1a92da5c32c7c7f838ce36c0ccfcfd5edf0865b58bdde820aa64cea9888", "2768994f664e8a6e3aba27503606c58339136e2a")
 CARGO_LICENSE_PINS = {
     **{("facebookexperimental/allocative", name, "0.3.6"):
         ("fc41670cf9cfebd86ba597925081577897112c51", name)
@@ -71,7 +73,7 @@ def fetch(url, maximum=LIMIT):
     else:
         with urllib.request.urlopen(url, timeout=90) as response:
             value = response.read(maximum + 1)
-    assert 0 < len(value) <= maximum, "Material exceeds bound"
+    assert 0 < len(value) <= maximum, "Material exceeds bound: " + url
     return value
 
 
@@ -183,9 +185,21 @@ def registry_licenses(package, directory, destination, checksum):
     assert re.fullmatch(r"[0-9a-f]{40}", revision), "Unpinned Cargo license source"
     assert not subpath or (not Path(subpath).is_absolute() and Path(subpath).as_posix() == subpath
         and ".." not in Path(subpath).parts), "Unsafe Cargo VCS path"
+    tree = json.loads(fetch("https://api.github.com/repos/" + repository[1] + "/git/trees/" + revision + "?recursive=1"))
+    assert not tree.get("truncated") and len(tree["tree"]) <= 100000, "Incomplete pinned Cargo source tree"
+    binding_source = (repository[1].lower(), package["name"], package["version"], checksum, revision) == CARGO_BINDING_SOURCE_PIN
+    submodules = [row["path"] for row in tree["tree"] if row["mode"] == "160000"] if binding_source else []
     crate_name = package["name"] + "-" + package["version"]
-    crate = fetch("https://static.crates.io/crates/" + urllib.parse.quote(package["name"], safe="") + "/"
-        + urllib.parse.quote(crate_name, safe="") + ".crate")
+    maximum = 64 * 1024 * 1024 if binding_source else LIMIT
+    cached = (Path(os.environ["CARGO_HOME"]) / "registry/cache" / directory.parent.name / (crate_name + ".crate")) if os.environ.get("CARGO_HOME") else None
+    if cached and cached.is_file():
+        assert not cached.is_symlink() and 0 < cached.stat().st_size <= maximum, "Invalid cached Cargo archive"
+        with cached.open("rb") as stream:
+            crate = stream.read(maximum + 1)
+    else:
+        crate = fetch("https://static.crates.io/crates/" + urllib.parse.quote(package["name"], safe="") + "/"
+            + urllib.parse.quote(crate_name, safe="") + ".crate", maximum)
+    assert 0 < len(crate) <= maximum, "Invalid Cargo archive size"
     assert hashlib.sha256(crate).hexdigest() == checksum, "Locked Cargo archive checksum mismatch"
     source_files = {}
     with tarfile.open(fileobj=io.BytesIO(crate), mode="r:gz") as archive:
@@ -197,31 +211,37 @@ def registry_licenses(package, directory, destination, checksum):
             assert crate_name + "/.cargo_vcs_info.json" not in archive.getnames(), "Published Cargo VCS pin was removed"
         if verify_source:
             members = archive.getmembers()
-            assert len(members) <= 4096
-            total = 0
+            assert len(members) <= (32768 if binding_source else 4096)
+            total, selected = 0, 0
             for member in members:
                 if member.isdir():
                     continue
                 relative = member.name.removeprefix(crate_name + "/")
                 assert member.isfile() and relative != member.name and not Path(relative).is_absolute() and ".." not in Path(relative).parts
-                assert 0 <= member.size <= 2 * 1024 * 1024
+                assert member.size >= 0
                 total += member.size
-                assert total <= LIMIT
+                assert total <= (1024 * 1024 * 1024 if binding_source else LIMIT)
                 if relative in ("Cargo.toml", "Cargo.lock", ".cargo_vcs_info.json"):
                     continue  # Cargo generates these; the original manifest and every shipped source file must match.
                 if relative == "Cargo.toml.orig":
                     relative = "Cargo.toml"
                 path = (Path(subpath) / relative).as_posix()
+                if any(path.startswith(module + "/") for module in submodules):
+                    continue  # The locked archive pins these bytes; native_components covers the separately built native inputs.
+                assert 0 <= member.size <= 2 * 1024 * 1024
+                selected += member.size
+                assert selected <= LIMIT
                 assert path not in source_files, "Duplicate Cargo source file"
                 data = archive.extractfile(member).read()
                 source_files[path] = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
             assert (Path(subpath) / "Cargo.toml").as_posix() in source_files and any(path.endswith(".rs") for path in source_files)
     parents = {"", *(parent.as_posix() for parent in (Path(subpath), *Path(subpath).parents))}
-    tree = json.loads(fetch("https://api.github.com/repos/" + repository[1] + "/git/trees/" + revision + "?recursive=1"))
-    assert not tree.get("truncated") and len(tree["tree"]) <= 100000, "Incomplete pinned Cargo source tree"
     tree_files = {row["path"]: row["sha"] for row in tree["tree"] if row["type"] == "blob" and row["mode"] in ("100644", "100755")}
     for path, blob in source_files.items():
         assert tree_files.get(path) == blob, "Published Cargo source differs from reviewed pin: " + path
+    if binding_source:
+        print("CM Cargo binding source verified: " + crate_name + "; complete locked archive SHA256 " + checksum
+            + "; binding repository files matched " + revision + "; embedded submodule bytes retain archive identity", flush=True)
     candidates = [row for row in tree["tree"] if row["type"] == "blob" and row["mode"] in ("100644", "100755")
         and ((Path(row["path"]).parent.as_posix() in parents
             and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", Path(row["path"]).name))
@@ -1073,6 +1093,22 @@ def self_check():
             assert [row["name"] for row in registry_licenses(package, directory, root / "texts", checksum)] == ["LICENSES/MIT.txt"]
             tree["tree"][0]["path"] = "LICENSE.md"
             license_url = license_url.removesuffix("LICENSES/MIT.txt") + "LICENSE.md"
+            cache_home = root / "cargo-cache-fixture"
+            cached_crate = cache_home / "registry/cache" / directory.parent.name / "shared-1.0.0.crate"
+            cached_crate.parent.mkdir(parents=True)
+            cached_crate.write_bytes(crate)
+            def cached_fetch(url, maximum=LIMIT):
+                assert not url.endswith(".crate"), "Locked Cargo archive was downloaded again"
+                return pinned_fetch(url, maximum)
+            with patch.dict(os.environ, CARGO_HOME=str(cache_home)), patch(__name__ + ".fetch", side_effect=cached_fetch):
+                assert registry_licenses(package, directory, root / "texts", checksum)
+                cached_crate.write_bytes(b"changed cached archive")
+                try:
+                    registry_licenses(package, directory, root / "rejected", checksum)
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError("Changed Cargo download cache accepted")
             for invalid in ({"git": {"sha1": "main"}}, {"git": {"sha1": "a" * 40, "dirty": True}},
                             {"git": {"sha1": "a" * 40}, "path_in_vcs": "../escape"}):
                 write(vcs_path, invalid)
@@ -1137,8 +1173,12 @@ def self_check():
                         reviewed_vcs = {**vcs, "git": {"sha1": "a" * 40, "dirty": dirty}}
                         write(vcs_path, reviewed_vcs)
                         archive_data = io.BytesIO()
+                        archive_sources = {**source_data, ".cargo_vcs_info.json": canonical(reviewed_vcs)}
+                        if dirty:
+                            archive_sources["native/unused.cc"] = b"separately built native source\n"
+                            tree["tree"].append({"path": "crate/native", "type": "commit", "mode": "160000", "sha": "c" * 40})
                         with tarfile.open(fileobj=archive_data, mode="w:gz") as archive:
-                            for name, contents in {**source_data, ".cargo_vcs_info.json": canonical(reviewed_vcs)}.items():
+                            for name, contents in archive_sources.items():
                                 member = tarfile.TarInfo("shared-1.0.0/" + name)
                                 member.size = len(contents)
                                 archive.addfile(member, io.BytesIO(contents))
@@ -1146,21 +1186,35 @@ def self_check():
                         reviewed_checksum = hashlib.sha256(reviewed_crate).hexdigest()
                         tree_url = tree_url.replace("a" * 40, revision)
                         license_url = license_url.replace("a" * 40, revision)
+                        actual_binding_pin = CARGO_BINDING_SOURCE_PIN
                         with patch.dict(package, repository=repository), patch.dict(CARGO_LICENSE_REPOSITORIES,
                                 {("shared", "1.0.0", reviewed_checksum): "https://github.com/example/pinned"}), \
                                 patch.dict(CARGO_LICENSE_PINS, {("example/pinned", "shared", "1.0.0"): (revision, "crate")}), \
+                                patch(__name__ + ".CARGO_BINDING_SOURCE_PIN", ("example/pinned", "shared", "1.0.0", reviewed_checksum, revision)
+                                    if dirty else actual_binding_pin), \
                                 patch(__name__ + ".fetch", side_effect=lambda url, maximum=LIMIT:
                                     reviewed_crate if url.endswith(".crate") else pinned_fetch(url, maximum)):
                             assert registry_licenses(package, directory, root / "texts", reviewed_checksum)
-                            original_blob = tree["tree"][-1]["sha"]
-                            tree["tree"][-1]["sha"] = "0" * 40
+                            if dirty:
+                                with patch(__name__ + ".CARGO_BINDING_SOURCE_PIN", actual_binding_pin):
+                                    try:
+                                        registry_licenses(package, directory, root / "rejected", reviewed_checksum)
+                                    except AssertionError:
+                                        pass
+                                    else:
+                                        raise AssertionError("Unreviewed native source boundary accepted")
+                            source_row = next(row for row in tree["tree"] if row["path"] == "crate/src/lib.rs")
+                            original_blob = source_row["sha"]
+                            source_row["sha"] = "0" * 40
                             try:
                                 registry_licenses(package, directory, root / "rejected", reviewed_checksum)
                             except AssertionError:
                                 pass
                             else:
                                 raise AssertionError("Published source mismatch accepted for exceptional Cargo metadata")
-                            tree["tree"][-1]["sha"] = original_blob
+                            source_row["sha"] = original_blob
+                        if dirty:
+                            tree["tree"].pop()
                         tree_url = tree_url.replace(revision, "a" * 40)
                         license_url = license_url.replace(revision, "a" * 40)
                     vcs_path.unlink()
@@ -1204,10 +1258,5 @@ if __name__ == "__main__":
     import sys
     from record_run import require_hosted_linux
     require_hosted_linux()
-    if sys.argv[1] == "cargo-audit":
-        import host
-        if host.load_config(Path(os.environ["CM_SOURCE_DIR"]))["task_id"] == "CM-S01":
-            self_check()
-            print("CM distribution material self-checks passed", flush=True)
     {"attest-prepare": attest_prepare, "consume-proofs": consume_proofs, "cargo-audit": cargo_audit,
         "self-check": self_check}[sys.argv[1]]()
