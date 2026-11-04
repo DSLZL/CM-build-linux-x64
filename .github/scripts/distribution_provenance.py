@@ -621,8 +621,9 @@ def sbom(directory, name, components, files, origin):
         packages.append({"name": row["name"], "SPDXID": identifier, "versionInfo": row["version"],
             "downloadLocation": ("https://crates.io/crates/" + row["name"] + "/" + row["version"]
                 if row["source"].startswith("registry+") else row["source"].removeprefix("git+")), "filesAnalyzed": False,
-            "licenseConcluded": "NOASSERTION", "licenseDeclared": row["declared_license"],
+            "licenseConcluded": "NOASSERTION", "licenseDeclared": re.sub(r"\s*/\s*", " OR ", row["declared_license"]),
             "copyrightText": "NOASSERTION", "comment": json.dumps({"roles": row["roles"], "source_checksum": row.get("source_checksum"),
+                "original_license_declaration": row["declared_license"],
                 "license_supplements": [item for item in row["licenses"] if item.get("material_kind") == "standard-license-supplement"],
                 "published_crate_source": next((item["published_crate_source"] for item in row["licenses"] if "published_crate_source" in item), None)}, sort_keys=True)})
         relationships.append({"spdxElementId": "SPDXRef-Distribution", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": identifier})
@@ -1031,6 +1032,13 @@ def self_check():
         "/usr/share/common-licenses/Apache-2.0", "/usr/share/common-licenses/Unknown-1.0"]
     assert canonical({"b": 1, "a": "中"}) == '{"a":"中","b":1}'.encode()
     assert len(REPORTS) == len(set(REPORTS)) == 5
+    declarations = ("Apache-2.0/MIT", "MIT OR Apache-2.0", "Apache-2.0 WITH LLVM-exception")
+    packages = [{"name": "license-fixture-" + str(index), "version": "1", "source": "https://example.invalid/pinned",
+        "roles": ["self-check"], "declared_license": declared, "licenses": [{"path": "LICENSE", "sha256": "0" * 64}]}
+        for index, declared in enumerate(declarations)]
+    document = sbom(Path("."), "self-check", packages, [], {"created_at": "2026-11-04T00:00:00Z"})
+    assert [row["licenseDeclared"] for row in document["packages"][1:]] == ["Apache-2.0 OR MIT", *declarations[1:]]
+    assert tuple(json.loads(row["comment"])["original_license_declaration"] for row in document["packages"][1:]) == declarations
     assert go_proxy_source("golang.org/x/sys", "v0.1.0") == "https://proxy.golang.org/golang.org/x/sys/@v/v0.1.0.zip"
     assert go_proxy_source("example.com/Azure/SDK", "v1.0.0-RC1") == "https://proxy.golang.org/example.com/!azure/!s!d!k/@v/v1.0.0-!r!c1.zip"
     import runtime_consumer
