@@ -67,6 +67,7 @@ CARGO_LICENSE_SUPPLEMENTS = {
 SPDX_MIT_PIN = (
     "https://raw.githubusercontent.com/spdx/license-list-data/31846481de7ea17d92f2f46fad76abe58b2e9bb0/text/MIT.txt",
     "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5")
+RIPGREP_SOURCE_COMMIT = "e89fff89ac9af12e8d4ce9d5fd07beb408ca730f"
 
 
 def canonical(value):
@@ -402,6 +403,21 @@ def archive_licenses(data, destination, source):
     return records
 
 
+def ripgrep_source(data, directory, commit):
+    assert commit == RIPGREP_SOURCE_COMMIT, "Unreviewed ripgrep source revision"
+    prefix = "ripgrep-" + commit
+    directory.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        members = archive.getmembers()
+        assert 0 < len(members) <= 16384 and sum(row.size for row in members) <= 128 * 1024 * 1024
+        assert all(Path(row.name).parts and not Path(row.name).is_absolute() and ".." not in Path(row.name).parts and "\\" not in row.name
+            and Path(row.name).parts[0] == prefix for row in members), "Ripgrep source path escapes its pinned root"
+        assert all(row.isfile() or row.isdir() or (row.issym() and row.name == prefix + "/HomebrewFormula"
+            and row.linkname == "pkg/brew") for row in members), "Unexpected ripgrep source link"
+        archive.extractall(directory, filter="data")
+    return directory / prefix
+
+
 def native_components(root, package, destination, native):
     """Pinned upstream recipes identify the separately produced native inputs."""
     import base64
@@ -475,14 +491,7 @@ def native_components(root, package, destination, native):
     commit = json.loads(fetch("https://api.github.com/repos/BurntSushi/ripgrep/commits/15.2.0"))["sha"]
     assert re.fullmatch(r"[0-9a-f]{40}", commit)
     data = fetch("https://codeload.github.com/BurntSushi/ripgrep/tar.gz/" + commit)
-    directory = Path(os.environ["RUNNER_TEMP"]) / "cm-ripgrep-source"
-    directory.mkdir()
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        members = archive.getmembers()
-        assert 0 < len(members) <= 16384 and sum(row.size for row in members) <= 128 * 1024 * 1024
-        assert all(row.isfile() or row.isdir() for row in members), "Unexpected ripgrep source link"
-        archive.extractall(directory, filter="data")
-    source = directory / ("ripgrep-" + commit)
+    source = ripgrep_source(data, Path(os.environ["RUNNER_TEMP"]) / "cm-ripgrep-source", commit)
     command = ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", "x86_64-unknown-linux-musl"]
     if "+pcre2" in version:
         command += ["--features", "pcre2"]
@@ -1344,6 +1353,25 @@ def self_check():
             assert {row["id"] for row in failures} == {"a", "b"}, "License audit stopped at its first missing component"
         else:
             raise AssertionError("Unknown Cargo license accepted")
+        for case in ("safe", "escape", "absolute", "hardlink", "device", "outside", "revision"):
+            data = io.BytesIO()
+            prefix = "ripgrep-" + RIPGREP_SOURCE_COMMIT
+            with tarfile.open(fileobj=data, mode="w:gz") as archive:
+                member = tarfile.TarInfo(prefix + "/pkg/brew")
+                member.type = tarfile.DIRTYPE
+                archive.addfile(member)
+                member = tarfile.TarInfo(("outside" if case == "outside" else prefix) + "/HomebrewFormula")
+                member.type = tarfile.LNKTYPE if case == "hardlink" else tarfile.CHRTYPE if case == "device" else tarfile.SYMTYPE
+                member.linkname = "../../escape" if case == "escape" else "/tmp/escape" if case == "absolute" else "pkg/brew"
+                archive.addfile(member)
+            try:
+                source = ripgrep_source(data.getvalue(), root / ("ripgrep-source-" + case),
+                    "0" * 40 if case == "revision" else RIPGREP_SOURCE_COMMIT)
+            except AssertionError:
+                assert case != "safe", "Reviewed internal ripgrep source link was rejected"
+            else:
+                assert case == "safe", "Unsafe or unreviewed ripgrep source archive accepted"
+                assert (source / "HomebrewFormula").resolve() == source / "pkg/brew"
         for name in ("../escape.json", "/absolute.json", "linked.json"):
             data = io.BytesIO()
             with zipfile.ZipFile(data, "w") as archive:
