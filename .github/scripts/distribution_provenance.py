@@ -1099,7 +1099,7 @@ def self_check():
     import tempfile
     from types import SimpleNamespace
     policy = {"source_repository": "DSLZL/CM", "source_repository_id": 1430833890}
-    valid = {"head_sha": "a" * 40, "head_branch": "main", "conclusion": "success", "event": "push",
+    valid = {"status": "completed", "head_sha": "a" * 40, "head_branch": "main", "conclusion": "success", "event": "push",
         "path": ".github/workflows/cm-source-check.yml", "repository": {"id": 1430833890},
         "head_repository": {"id": 1430833890}, "id": 1, "run_attempt": 1}
     worker = SimpleNamespace(api=lambda _: {"workflow_runs": [valid]}, receipt_jobs=lambda *_: ["successful-source-ci"])
