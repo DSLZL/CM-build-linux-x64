@@ -1017,8 +1017,6 @@ def consume_proofs():
     write(Path(os.environ["CM_CI_LOG_DIR"]) / "distribution-artifact.json", {"artifact": record, "jobs": jobs,
         "signature_gate": "offline consumer must still verify"})
     # Separate from the immutable producer manifest and from native dependency keys.
-    import sys
-    sys.path.append(str(Path(os.environ["CM_SOURCE_DIR"]) / "ci/scripts"))
     import runtime_consumer as runtime
     inputs = Path(os.environ["CM_CONSUMER_INPUT_DIR"])
     entries = [row for row in runtime.inventory(inputs) if row["path"] != "input-manifest.json"]
