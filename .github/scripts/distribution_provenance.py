@@ -44,6 +44,29 @@ CARGO_LICENSE_REPOSITORIES = {
     ("zune-core", "0.4.12", "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"):
         "https://github.com/etemesi254/zune-image",
 }
+CARGO_LICENSE_SUPPLEMENTS = {
+    ("marwes/debugserver-types", "debugserver-types", "0.5.0",
+        "2bf6834a70ed14e8e4e41882df27190bea150f1f6ecf461f1033f8739cd8af4a", "d444f163123af5b4fbce7375d1afead7e9b8a224"):
+        ("MIT", "4411fbf0de2c84a137d47de1c127f418f07ed41a361ae89f4f28bcfdabe304ce"),
+    ("denoland/deno_core_icudata", "deno_core_icudata", "0.78.0",
+        "b963d2d79672b4c379e4511acccd27bb35b4c1b32a93f596d52ff14a064293bc", "9adfc1019ed4fce2e873c8bc7aebec09928010c8"):
+        ("MIT", "151acc78e12d7a849141e0ce714beb64e955cd43f9d9429d17232982de5ea017"),
+    ("jpopesculian/eventsource-stream", "eventsource-stream", "0.2.3",
+        "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab", "3d46f1c758f9ee4681e9da0427556d24c53f9c01"):
+        ("MIT OR Apache-2.0", "725711996fb72721abc35595e0703ca2d1b55cb4d98cc5ade959fc0f8c2e86a4"),
+    ("cbreeden/fxhash", "fxhash", "0.2.1",
+        "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c", "537570af68de22d2f4bbdd5bee5d6e07268e6f42"):
+        ("Apache-2.0/MIT", "42f07fb23f8b37acf45914ccb71df077455a353850e148afeabb5c684f8ebaab"),
+    ("theonlymrcat/io_tee", "io_tee", "0.1.1",
+        "4b3f7cef34251886990511df1c61443aa928499d598a9473929ab5a90a527304", "8a7adecebf3429cbc58a0368751d1851dfaf58ed"):
+        ("MIT OR Apache-2.0", "9556395f55b7c67a6041f84553c7c27b3ab3fe5505769f4f1003a7b0988f2586"),
+    ("landhb/linux-keyutils", "linux-keyutils", "0.2.4",
+        "761e49ec5fd8a5a463f9b84e877c373d888935b71c6be78f3767fe2ae6bed18e", "2e81f726ffd3c0165e11fcdbde279b5d8638f47d"):
+        ("Apache-2.0 OR MIT", "18c658b216c2031f6849f3638cff80f6f42df2280e95ad4d78fbc335d8dc413a"),
+}
+SPDX_MIT_PIN = (
+    "https://raw.githubusercontent.com/spdx/license-list-data/31846481de7ea17d92f2f46fad76abe58b2e9bb0/text/MIT.txt",
+    "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5")
 
 
 def canonical(value):
@@ -201,7 +224,7 @@ def registry_licenses(package, directory, destination, checksum):
             + urllib.parse.quote(crate_name, safe="") + ".crate", maximum)
     assert 0 < len(crate) <= maximum, "Invalid Cargo archive size"
     assert hashlib.sha256(crate).hexdigest() == checksum, "Locked Cargo archive checksum mismatch"
-    source_files = {}
+    source_files, generated_bindings = {}, {}
     with tarfile.open(fileobj=io.BytesIO(crate), mode="r:gz") as archive:
         if vcs is not None:
             member = archive.getmember(crate_name + "/.cargo_vcs_info.json")
@@ -231,25 +254,34 @@ def registry_licenses(package, directory, destination, checksum):
                 assert 0 <= member.size <= 2 * 1024 * 1024
                 selected += member.size
                 assert selected <= LIMIT
-                assert path not in source_files, "Duplicate Cargo source file"
+                assert path not in source_files and path not in generated_bindings, "Duplicate Cargo source file"
                 data = archive.extractfile(member).read()
+                if binding_source and re.fullmatch(r"gen/src_binding_[A-Za-z0-9_-]+\.rs", relative):
+                    assert len(generated_bindings) < 128
+                    generated_bindings[path] = {"path": path, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+                    continue  # The pinned publisher downloads these CI outputs into gen before cargo publish --allow-dirty.
                 source_files[path] = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
             assert (Path(subpath) / "Cargo.toml").as_posix() in source_files and any(path.endswith(".rs") for path in source_files)
     parents = {"", *(parent.as_posix() for parent in (Path(subpath), *Path(subpath).parents))}
     tree_files = {row["path"]: row["sha"] for row in tree["tree"] if row["type"] == "blob" and row["mode"] in ("100644", "100755")}
-    for path, blob in source_files.items():
-        assert tree_files.get(path) == blob, "Published Cargo source differs from reviewed pin: " + path
+    differences = [{"path": path, "published_blob": blob, "repository_blob": tree_files.get(path)}
+        for path, blob in source_files.items() if tree_files.get(path) != blob]
+    assert not differences, "Published Cargo source differs from reviewed pin (" + str(len(differences)) + "): " + canonical(differences[:128]).decode()
     if binding_source:
         print("CM Cargo binding source verified: " + crate_name + "; complete locked archive SHA256 " + checksum
-            + "; binding repository files matched " + revision + "; embedded submodule bytes retain archive identity", flush=True)
+            + "; non-generated binding repository files matched " + revision + "; " + str(len(generated_bindings))
+            + " published generated bindings and embedded submodule bytes retain archive identity", flush=True)
     candidates = [row for row in tree["tree"] if row["type"] == "blob" and row["mode"] in ("100644", "100755")
         and ((Path(row["path"]).parent.as_posix() in parents
             and re.match(r"(?i)^(?:licen[cs]e|copying|copyright|notice)(?:$|[._-])", Path(row["path"]).name))
             or (Path(row["path"]).parent.name.lower() in ("licenses", "licences")
                 and Path(row["path"]).parent.parent.as_posix() in parents))]
-    assert 0 < len(candidates) <= 128 and any(re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])",
+    assert len(candidates) <= 128
+    has_license = any(re.match(r"(?i)^(?:licen[cs]e|copying)(?:$|[._-])",
         Path(row["path"]).name) or Path(row["path"]).parent.name.lower() in ("licenses", "licences")
-        for row in candidates), "No actual license in pinned Cargo source: " + package["id"]
+        for row in candidates)
+    supplement = CARGO_LICENSE_SUPPLEMENTS.get((repository[1].lower(), package["name"], package["version"], checksum, revision))
+    assert has_license or (supplement and package.get("license") == supplement[0]), "No actual license in pinned Cargo source: " + package["id"]
     records = []
     for row in sorted(candidates, key=lambda item: item["path"]):
         path = row["path"]
@@ -259,6 +291,27 @@ def registry_licenses(package, directory, destination, checksum):
         blob = b"blob " + str(len(data)).encode() + b"\0" + data
         assert hashlib.sha1(blob).hexdigest() == row["sha"], "Pinned Cargo license blob mismatch"
         records.append(text_material(destination, path, url, data))
+    if not has_license:
+        declaration_url = "https://raw.githubusercontent.com/" + repository[1] + "/" + revision + "/" + (Path(subpath) / "Cargo.toml").as_posix()
+        declaration = fetch(declaration_url, 2 * 1024 * 1024)
+        assert hashlib.sha256(declaration).hexdigest() == supplement[1], "Reviewed license declaration changed"
+        assert tomllib.loads(declaration.decode())["package"]["license"] == supplement[0], "Upstream license declaration differs"
+        standard = fetch(SPDX_MIT_PIN[0], 2 * 1024 * 1024)
+        assert hashlib.sha256(standard).hexdigest() == SPDX_MIT_PIN[1], "Canonical license text changed"
+        records.append({**text_material(destination, "SPDX/MIT.txt", SPDX_MIT_PIN[0], standard),
+            "material_kind": "standard-license-supplement", "selected_license": "MIT", "declared_license": supplement[0],
+            "upstream_license_file_found": False, "upstream_repository": repository_url, "upstream_revision": revision,
+            "locked_source_checksum": checksum, "declaration_source": declaration_url, "declaration_sha256": supplement[1],
+            "note": "Separately supplied standard terms; no upstream-authored file, copyright holder or year is invented"})
+    if binding_source:
+        publisher = ".github/workflows/ci.yml"
+        assert re.fullmatch(r"[0-9a-f]{40}", tree_files.get(publisher, "")), "Missing pinned binding publisher recipe"
+        records[0]["published_crate_source"] = {"archive_sha256": checksum, "repository_revision": revision,
+            "matched_repository_files": len(source_files), "generated_bindings": list(generated_bindings.values()),
+            "publisher_workflow": "https://github.com/" + repository[1] + "/blob/" + revision + "/" + publisher,
+            "publisher_workflow_blob": tree_files[publisher],
+            "embedded_submodules": [{"path": row["path"], "revision": row["sha"]} for row in tree["tree"] if row["mode"] == "160000"],
+            "note": "Generated bindings and expanded submodules retain the complete locked archive identity; actual native inputs are verified separately"}
     return records
 
 
@@ -559,7 +612,9 @@ def sbom(directory, name, components, files, origin):
             "downloadLocation": ("https://crates.io/crates/" + row["name"] + "/" + row["version"]
                 if row["source"].startswith("registry+") else row["source"].removeprefix("git+")), "filesAnalyzed": False,
             "licenseConcluded": "NOASSERTION", "licenseDeclared": row["declared_license"],
-            "copyrightText": "NOASSERTION", "comment": json.dumps({"roles": row["roles"], "source_checksum": row.get("source_checksum")}, sort_keys=True)})
+            "copyrightText": "NOASSERTION", "comment": json.dumps({"roles": row["roles"], "source_checksum": row.get("source_checksum"),
+                "license_supplements": [item for item in row["licenses"] if item.get("material_kind") == "standard-license-supplement"],
+                "published_crate_source": next((item["published_crate_source"] for item in row["licenses"] if "published_crate_source" in item), None)}, sort_keys=True)})
         relationships.append({"spdxElementId": "SPDXRef-Distribution", "relationshipType": "DEPENDS_ON", "relatedSpdxElement": identifier})
         if row["declared_license"].startswith("LicenseRef-"):
             license = next(item for item in row["licenses"] if "LicenseRef-" + item["sha256"] == row["declared_license"])
@@ -1136,6 +1191,48 @@ def self_check():
             else:
                 raise AssertionError("Modified Cargo VCS pin accepted")
             write(vcs_path, vcs)
+            declaration = b'[package]\nlicense = "MIT"\n'
+            declaration_url = "https://raw.githubusercontent.com/example/pinned/" + "a" * 40 + "/crate/Cargo.toml"
+            standard_url = "https://example.invalid/fixed/MIT.txt"
+            notice_url = license_url.removesuffix("LICENSE.md") + "NOTICE"
+            supplement_tree = {**tree, "tree": [tree["tree"][1], {**tree["tree"][0], "path": "NOTICE"}]}
+            def supplement_fetch(url, maximum=LIMIT):
+                if url == tree_url:
+                    return canonical(supplement_tree)
+                if url == declaration_url:
+                    return declaration
+                return data if url in (standard_url, notice_url) else pinned_fetch(url, maximum)
+            supplement_pin = ("example/pinned", "shared", "1.0.0", checksum, "a" * 40)
+            with patch.dict(CARGO_LICENSE_SUPPLEMENTS, {supplement_pin: ("MIT", hashlib.sha256(declaration).hexdigest())}), \
+                    patch(__name__ + ".SPDX_MIT_PIN", (standard_url, hashlib.sha256(data).hexdigest())), \
+                    patch(__name__ + ".fetch", side_effect=supplement_fetch):
+                texts = registry_licenses(package, directory, root / "texts", checksum)
+                assert [row["name"] for row in texts] == ["NOTICE", "SPDX/MIT.txt"]
+                assert texts[-1]["material_kind"] == "standard-license-supplement" and not texts[-1]["upstream_license_file_found"]
+                assert texts[-1]["declared_license"] == "MIT" and texts[-1]["locked_source_checksum"] == checksum
+                for changed_url in (declaration_url, standard_url, notice_url):
+                    with patch(__name__ + ".fetch", side_effect=lambda url, maximum=LIMIT:
+                            b"changed material" if url == changed_url else supplement_fetch(url, maximum)):
+                        try:
+                            registry_licenses(package, directory, root / "rejected", checksum)
+                        except AssertionError:
+                            pass
+                        else:
+                            raise AssertionError("Changed supplement declaration, standard text or actual NOTICE accepted")
+                with patch.dict(package, license="Apache-2.0"):
+                    try:
+                        registry_licenses(package, directory, root / "rejected", checksum)
+                    except AssertionError:
+                        pass
+                    else:
+                        raise AssertionError("Changed upstream license declaration accepted")
+                with patch.dict(CARGO_LICENSE_SUPPLEMENTS, {}, clear=True):
+                    try:
+                        registry_licenses(package, directory, root / "rejected", checksum)
+                    except AssertionError:
+                        pass
+                    else:
+                        raise AssertionError("Unreviewed license supplement accepted")
             try:
                 registry_licenses(package, directory, root / "rejected", "0" * 64)
             except AssertionError:
@@ -1176,6 +1273,8 @@ def self_check():
                         archive_sources = {**source_data, ".cargo_vcs_info.json": canonical(reviewed_vcs)}
                         if dirty:
                             archive_sources["native/unused.cc"] = b"separately built native source\n"
+                            archive_sources["gen/src_binding_release_x86_64-unknown-linux-gnu.rs"] = b"published generated binding\n"
+                            tree["tree"].append({"path": ".github/workflows/ci.yml", "type": "blob", "mode": "100644", "sha": "d" * 40})
                             tree["tree"].append({"path": "crate/native", "type": "commit", "mode": "160000", "sha": "c" * 40})
                         with tarfile.open(fileobj=archive_data, mode="w:gz") as archive:
                             for name, contents in archive_sources.items():
@@ -1194,8 +1293,14 @@ def self_check():
                                     if dirty else actual_binding_pin), \
                                 patch(__name__ + ".fetch", side_effect=lambda url, maximum=LIMIT:
                                     reviewed_crate if url.endswith(".crate") else pinned_fetch(url, maximum)):
-                            assert registry_licenses(package, directory, root / "texts", reviewed_checksum)
+                            reviewed_texts = registry_licenses(package, directory, root / "texts", reviewed_checksum)
+                            assert reviewed_texts
                             if dirty:
+                                published = reviewed_texts[0]["published_crate_source"]
+                                assert published["archive_sha256"] == reviewed_checksum
+                                assert published["generated_bindings"] == [{"path": "crate/gen/src_binding_release_x86_64-unknown-linux-gnu.rs",
+                                    "sha256": hashlib.sha256(archive_sources["gen/src_binding_release_x86_64-unknown-linux-gnu.rs"]).hexdigest(),
+                                    "size": len(archive_sources["gen/src_binding_release_x86_64-unknown-linux-gnu.rs"])}]
                                 with patch(__name__ + ".CARGO_BINDING_SOURCE_PIN", actual_binding_pin):
                                     try:
                                         registry_licenses(package, directory, root / "rejected", reviewed_checksum)
@@ -1214,6 +1319,7 @@ def self_check():
                                 raise AssertionError("Published source mismatch accepted for exceptional Cargo metadata")
                             source_row["sha"] = original_blob
                         if dirty:
+                            tree["tree"].pop()
                             tree["tree"].pop()
                         tree_url = tree_url.replace(revision, "a" * 40)
                         license_url = license_url.replace(revision, "a" * 40)
