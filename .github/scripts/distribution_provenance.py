@@ -112,8 +112,11 @@ def verifier(root, logs):
             continue
         assert len(fields) == 4 and fields[2].startswith("v") and fields[3].startswith("h1:"), line
         module, version, checksum = fields[1:]
-        downloaded = json.loads(subprocess.check_output(["go", "mod", "download", "-json", module + "@" + version],
-            cwd=directory, text=True, timeout=180))
+        try:
+            downloaded = json.loads(subprocess.check_output(["go", "mod", "download", "-json", module + "@" + version],
+                cwd=directory, text=True, timeout=180))
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError("Go material download failed for " + module + "@" + version + ": " + error.output[-8192:]) from error
         assert downloaded.get("Sum") == checksum and not downloaded.get("Error"), module
         modules.append({"name": module, "version": version, "checksum": checksum,
             "source": go_proxy_source(module, version),
