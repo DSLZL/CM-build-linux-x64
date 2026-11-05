@@ -1038,7 +1038,7 @@ def self_check():
     from record_run import require_hosted_linux
     require_hosted_linux()
     import runtime_consumer
-    runtime_consumer.check_distribution_verifier_binding()
+    runtime_consumer.check_distribution_verifier_binding(Path(os.environ["CM_SOURCE_DIR"]))
     from types import SimpleNamespace
     ci_policy = {"source_repository": "DSLZL/CM", "source_repository_id": 1430833890}
     ci_revision = "a" * 40
@@ -1077,7 +1077,7 @@ def self_check():
     assert go_proxy_source("golang.org/x/sys", "v0.1.0") == "https://proxy.golang.org/golang.org/x/sys/@v/v0.1.0.zip"
     assert go_proxy_source("example.com/Azure/SDK", "v1.0.0-RC1") == "https://proxy.golang.org/example.com/!azure/!s!d!k/@v/v1.0.0-!r!c1.zip"
     import runtime_consumer
-    runtime_consumer.check_distribution_verifier_binding()
+    runtime_consumer.check_distribution_verifier_binding(Path(os.environ["CM_SOURCE_DIR"]))
     import retry
     import runtime_cases
     root = Path(os.environ["CM_SOURCE_DIR"])
