@@ -170,6 +170,9 @@ jobs:
           python3 -B ci/scripts/runtime_hooks.py self-check
           python3 -B ci/scripts/runtime_upgrade.py self-check
           python3 -B ci/scripts/sdk_seams.py self-check
+          if [[ -f ci/scripts/support_policy.py ]]; then
+            python3 -B ci/scripts/support_policy.py self-check
+          fi
           if [[ '${{ inputs.distribution_required }}' == 'true' ]]; then
             python3 -B ci/scripts/distribution_provenance.py self-check
           fi

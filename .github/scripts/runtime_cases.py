@@ -73,6 +73,7 @@ GROUPS = {
         "command-name-conflict", "command-actual-drift", "tui-slash", "tui-ui-owner", "tui-wrong-thread",
         "tui-stale-owner", "tui-cancel", "independent-versions", "independent-disable-delete", "legacy-abc",
         "old-host-reject", "capability-boundary"),
+    "s02": ("versions", "contracts", "zero-mod", "abc", "conflict", "disable", "labels", "boundaries"),
 }
 GROUPS["s01"] = ("identity", "independent", "inventory", "materials", "source", "install-boundary",
     "proof", "stale", "digests", "compatibility", "no-op", "transaction", "legacy", "bootstrap", "offline", "failure-boundary")
@@ -81,10 +82,11 @@ DRIVERS = {"p04": "fixtures/runtime-consumer/driver.py", "m01": "ci/scripts/mod_
            "m04": "fixtures/state/driver.py", "m05": "fixtures/mod-author/driver.py",
            "g04": "fixtures/runtime-qualification/driver.py", "g01": "fixtures/runtime-hooks/driver.py",
            "g05": "fixtures/compatibility/driver.py", "g06": "fixtures/sdk-seams/driver.py",
-           "s01": "fixtures/distribution-provenance/driver.py"}
+           "s01": "fixtures/distribution-provenance/driver.py",
+           "s02": "fixtures/compatibility-policy/driver.py"}
 MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
     ("mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
-     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases", "sdk_seams", "distribution_provenance")},
+     "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases", "sdk_seams", "distribution_provenance", "support_policy")},
     "core": "fixtures/native-loader/core_acceptance.py", "core_acceptance": "fixtures/native-loader/core_acceptance.py",
     "tool_barrier": "fixtures/native-loader/tool_barrier.py"}
 DYNAMIC = {"sdk": DRIVERS["m02"], "m": DRIVERS["m03"], "packages": "ci/scripts/mod_manifest.py",
@@ -134,6 +136,18 @@ def g06_native_dependencies(case):
     if case == "legacy-abc":
         mods += ("inputs/mods/g02a/turn-budget/", "inputs/mods/g03/tool-concurrency/")
     return tuple(sorted(set(mods))), probes
+
+
+def s02_native_dependencies(case):
+    assert case in GROUPS["s02"]
+    if case == "abc":
+        return ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/", "inputs/mods/g02a/turn-budget/",
+                "inputs/mods/g02b/review-before-send/", "inputs/mods/g03/tool-concurrency/")
+    if case in ("conflict", "disable"):
+        return ("inputs/mods/g02a/turn-budget/",)
+    if case == "boundaries":
+        return ("inputs/upgrade-baseline/host/", "inputs/upgrade-baseline/reference.json")
+    return ()
 
 
 def digest(value):

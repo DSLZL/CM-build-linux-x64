@@ -33,7 +33,10 @@ RUNTIME_FILES = (
     "ci/scripts/distribution_provenance.py", "fixtures/distribution-provenance/driver.py",
 )
 RUNTIME_DATA = ("ci/g05-baseline.json", "crates/cm/src/distribution-policy.json",
-    "crates/cm/src/distribution-root.jsonl", "docs/distribution.md", "schemas/release-receipt.schema.json")
+    "crates/cm/src/distribution-root.jsonl", "docs/distribution.md", "schemas/release-receipt.schema.json",
+    "fixtures/compatibility-policy/policy.json", "schemas/support-matrix.schema.json")
+SUPPORT_RUNTIME_FILES = ("ci/scripts/support_policy.py", "fixtures/compatibility-policy/driver.py")
+RUNTIME_FILES += SUPPORT_RUNTIME_FILES
 PHASES = {
     "consumer-matrix": (("fixtures/runtime-consumer/driver.py", "matrix"),),
     "consumer-missing-library": (("fixtures/runtime-consumer/driver.py", "missing_library"),),
@@ -117,8 +120,34 @@ def source(root, revision, path):
     return git(root, "show", revision + ":" + path).decode("utf-8")
 
 
-def projection(text, entries=None, exclude=()):
+class ProductionRouting(ast.NodeTransformer):
+    """S02 runs the same native recipes as S01; qualification names are not compiler inputs."""
+
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) != 1 or not isinstance(node.ops[0], (ast.Eq, ast.In, ast.NotEq, ast.NotIn)):
+            return node
+        subject = node.left
+        task = (isinstance(subject, ast.Subscript) and isinstance(subject.slice, ast.Constant)
+            and subject.slice.value == "task_id" or isinstance(subject, ast.Call)
+            and isinstance(subject.func, ast.Attribute) and subject.func.attr == "get"
+            and subject.args and isinstance(subject.args[0], ast.Constant) and subject.args[0].value == "task_id")
+        values = node.comparators[0]
+        values = values.elts if isinstance(values, (ast.Tuple, ast.List, ast.Set)) else [values]
+        if (not task or not values or not all(isinstance(value, ast.Constant)
+                and isinstance(value.value, str) and re.fullmatch(r"CM-[A-Z0-9]+", value.value) for value in values)
+                or not any(value.value in ("CM-S01", "CM-S02") for value in values)):
+            return node
+        names = sorted({"CM-S01" if value.value == "CM-S02" else value.value for value in values})
+        node.ops = [ast.NotIn() if isinstance(node.ops[0], (ast.NotEq, ast.NotIn)) else ast.In()]
+        node.comparators = [ast.Tuple(elts=[ast.Constant(value=name) for name in names], ctx=ast.Load())]
+        return node
+
+
+def projection(text, entries=None, exclude=(), production=False):
     module = runtime_cases.Business().visit(ast.parse(text))
+    if production:
+        module = ProductionRouting().visit(module)
     table = runtime_cases.bindings(module)
     definitions = {name for name, node in table.items() if isinstance(node,
         (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
@@ -135,7 +164,10 @@ def projection(text, entries=None, exclude=()):
 
 
 def test_inputs(root, revision):
-    texts = {path: source(root, revision, path) for path in RUNTIME_FILES if not path.endswith("ci_progress.py")}
+    texts = {path: source(root, revision, path) for path in RUNTIME_FILES
+             if not path.endswith("ci_progress.py") and path not in SUPPORT_RUNTIME_FILES}
+    available = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", *SUPPORT_RUNTIME_FILES).decode().splitlines())
+    support = {path: source(root, revision, path) for path in SUPPORT_RUNTIME_FILES if path in available}
     audit = projection(source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
     observer = projection(source(root, revision, "ci/scripts/runtime_composition.py"),
         ("audit_executions", "audit_network", "bound_bwrap_executions", "bound_sandbox_aliases",
@@ -143,6 +175,8 @@ def test_inputs(root, revision):
     result = {}
     for label, entries in PHASES.items():
         selected = runtime_cases.labels().get(label)
+        if selected and selected[0] == "s02" and len(support) != len(SUPPORT_RUNTIME_FILES):
+            continue
         dispatch = {runtime_cases.DRIVERS[selected[0]]: runtime_cases.function(selected[1], selected[0])} if selected else {}
         if selected:
             wrapper = {"m02": ("ci/scripts/runtime_sdk.py", "matrix"),
@@ -153,8 +187,16 @@ def test_inputs(root, revision):
             cli = wrapper[0] if wrapper else runtime_cases.DRIVERS[selected[0]]
         else:
             cli = entries[0][0]
-        value = runtime_cases.closure(texts, entries, dispatch=dispatch)
-        module = runtime_cases.Business().visit(ast.parse(texts[cli]))
+        if selected == ("s02", "abc"):
+            # shortcut: Terminal stores modules on self; keep explicit entries until closure resolves instance attributes.
+            entries = (*entries, *(("fixtures/runtime-sdk/driver.py", name) for name in
+                ("Provider", "command", "environment", "rows")),
+                *(("fixtures/managed-package/driver.py", name) for name in
+                ("tui_configuration", "launch_command", "identity", "tui_message_visible", "tui_mcp_listener")),
+                ("fixtures/native-loader/core_acceptance.py", "await_barrier"))
+        case_texts = {**texts, **support} if selected and selected[0] == "s02" else texts
+        value = runtime_cases.closure(case_texts, entries, dispatch=dispatch)
+        module = runtime_cases.Business().visit(ast.parse(case_texts[cli]))
         value["dependencies"][cli + ":<entrypoint>"] = digest([ast.dump(node, include_attributes=False)
             for node in module.body if isinstance(node, ast.If) and any(
                 isinstance(item, ast.Name) and item.id == "__name__" for item in ast.walk(node.test))])
@@ -166,6 +208,14 @@ def test_inputs(root, revision):
             if label == "s01-identity":
                 paths += ("schemas/release-receipt.schema.json",)
             value["qualification_data"] = {path: digest(source(root, revision, path)) for path in paths}
+        if selected and selected[0] == "s02":
+            path = "fixtures/compatibility-policy/policy.json"
+            data = json.loads(source(root, revision, path))
+            value["qualification_data"] = {path: digest({"schema_version": data["schema_version"],
+                "case": data["cases"][selected[1]]})}
+            if selected[1] in ("versions", "labels"):
+                path = "schemas/support-matrix.schema.json"
+                value["qualification_data"][path] = digest(source(root, revision, path))
         result[label] = value
     return result
 
@@ -193,7 +243,9 @@ def product_inputs(root, revision):
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
-                      "ci/scripts/runtime_cases.py", "ci/scripts/acceptance_cache.py"}
+                      "ci/scripts/runtime_cases.py", "ci/scripts/acceptance_cache.py",
+                      ".github/cm-build-routing.json", *SUPPORT_RUNTIME_FILES,
+                      "fixtures/compatibility-policy/acceptance.sh"}
     for row in filter(None, tree):
         metadata, name = row.split(b"\t", 1)
         path = name.decode()
@@ -203,10 +255,20 @@ def product_inputs(root, revision):
                 or path.startswith("fixtures/") and path.endswith(".py")
                 or "/.vscode/" in path or "/.github/" in path):
             continue
-        if path == "ci/scripts/runtime_consumer.py":
-            files[path] = projection(source(root, revision, path), ("produce",))
+        if path == ".github/cm-ci.json":
+            config = json.loads(source(root, revision, path))
+            native = {key: value for key, value in config.items() if key not in ("required_checks", "acceptance_script")}
+            if native["task_id"] in ("CM-S01", "CM-S02"):
+                del native["task_id"]
+            native["acceptance_recipe"] = digest(source(root, revision, config["acceptance_script"]))
+            files[path] = digest(native)
+        elif path in ("ci/scripts/host.py", "ci/scripts/linux_ci.py"):
+            files[path] = digest(ast.dump(ProductionRouting().visit(ast.parse(source(root, revision, path))),
+                                         include_attributes=False))
+        elif path == "ci/scripts/runtime_consumer.py":
+            files[path] = projection(source(root, revision, path), ("produce",), production=True)
         elif path in runtime_modules:
-            files[path] = projection(source(root, revision, path), exclude=runtime_modules[path])
+            files[path] = projection(source(root, revision, path), exclude=runtime_modules[path], production=True)
         else:
             files[path] = metadata.decode()
     # Gate and upload changes do not change a compiler recipe. Commands still do.
@@ -736,6 +798,7 @@ def current_producer_job():
 def overlay(root, logs):
     import runtime_consumer
     import runtime_composition
+    from linux_ci import load_config
     p = policy()
     plan = read(logs / "retry-plan.json")
     if plan["status"] == "hit":
@@ -774,6 +837,7 @@ def overlay(root, logs):
                 "inputs": {path: value for path, value in plan["probe_inputs"].items() if label in PRIVATE_PROBES[path]}}
     baseline = plan.get("checkpoint_origin")
     write(destination / "validation.json", {"schema_version": 2, "provenance": runtime_consumer.provenance(),
+        "task_id": load_config(root)["task_id"],
         "environment": environment(), "production_inputs_sha256": plan["production_inputs_sha256"],
         "build_request": plan["build_request"],
         "production_origin": origin, "checkpoint_origin": baseline,
@@ -829,7 +893,7 @@ def native_key(closure, label):
         "g04": ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/"),
         "g01": ("inputs/mods/g01/a/normal/",),
         "g05": (),
-        "g06": (), "s01": ("inputs/mods/s01/", "inputs/distribution/"),
+        "g06": (), "s01": ("inputs/mods/s01/", "inputs/distribution/"), "s02": (),
         "m05": ("inputs/mods/m05/", "inputs/mods/m02/"),
         "g02a": ("inputs/mods/g02a/", "inputs/mods/m02/"),
         "review": ("inputs/mods/g02b/", "inputs/mods/m02/"),
@@ -857,6 +921,8 @@ def native_key(closure, label):
             if entry["path"].startswith("fixture/s01-proofs/") and entry["path"] != "fixture/s01-proofs/authority.json")
     if phase == "g06":
         mods, probes = runtime_cases.g06_native_dependencies(label.removeprefix("g06-"))
+    if phase == "s02":
+        mods = runtime_cases.s02_native_dependencies(label.removeprefix("s02-"))
     if phase == "g05":
         case = label.removeprefix("g05-")
         baseline = "inputs/upgrade-baseline/"
@@ -1160,6 +1226,7 @@ def self_check():
             changed_seams if path == seams_path else original_source(directory, revision, path)):
         changed = test_inputs(root, "HEAD")
     assert {label for label in current if current[label] != changed[label]} == {"g06-cli-help"}
+    support_self_check(root, current)
     assert product_inputs(root, "HEAD")["files"]
     base = {"packages": {"libc6": "1"}, "files": [{"path": "usr/bin/python3", "sha256": "a"}, {"path": "fixture/test.py", "sha256": "a"}]}
     changed = json.loads(json.dumps(base))
@@ -1179,6 +1246,76 @@ def self_check():
     request_self_check()
     g02a_checkpoint_self_check()
     print("CM retry input/dependency/environment self-checks passed", flush=True)
+
+
+def support_self_check(root, current):
+    from unittest.mock import patch
+    original = source
+    driver = "fixtures/compatibility-policy/driver.py"
+    text = source(root, "HEAD", driver)
+    for entry, expected in (("case_versions()", {"s02-versions"}),
+            ("empty_run(home, directory)", {"s02-zero-mod", "s02-disable"})):
+        before = "def " + entry + ":\n"
+        assert text.count(before) == 1
+        changed_text = text.replace(before, before + '    assert False, "S02 dependency mutation"\n')
+        with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, path:
+                changed_text if path == driver else original(directory, revision, path)):
+            changed = test_inputs(root, "HEAD")
+        assert {label for label in current if current[label] != changed[label]} == expected
+    path = "fixtures/compatibility-policy/policy.json"
+    data = json.loads(source(root, "HEAD", path))
+    for case in runtime_cases.GROUPS["s02"]:
+        changed_data = json.loads(json.dumps(data))
+        changed_data["cases"][case]["self_check_change"] = True
+        with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, name:
+                json.dumps(changed_data) if name == path else original(directory, revision, name)):
+            changed = test_inputs(root, "HEAD")
+        assert {label for label in current if current[label] != changed[label]} == {"s02-" + case}
+    config_path = ".github/cm-ci.json"
+    config = json.loads(source(root, "HEAD", config_path))
+    production = product_inputs(root, "HEAD")
+    for field, value, same in (("task_id", "CM-S01", True), ("required_checks", ["different"], True),
+            ("task_id", "CM-G06", False),
+            ("acceptance_script", "fixtures/distribution-provenance/acceptance.sh", True),
+            ("build_profile", "dev", False), ("rust_toolchain", "1.0.0", False), ("units", [], False)):
+        changed_config = {**config, field: value}
+        assert changed_config != config
+        with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, path:
+                json.dumps(changed_config) if path == config_path else original(directory, revision, path)):
+            assert (product_inputs(root, "HEAD") == production) is same, field
+    path = json.loads(source(root, "HEAD", config_path))["acceptance_script"]
+    recipe = source(root, "HEAD", path)
+    with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, name:
+            recipe + "\ncargo build --release\n" if name == path else original(directory, revision, name)):
+        assert product_inputs(root, "HEAD") != production
+    old = 'def build(cfg):\n    if cfg["task_id"] == "CM-S01":\n        return ["cargo", "build", "--locked"]\n'
+    new = old.replace('== "CM-S01"', 'in ("CM-S01", "CM-S02")')
+    assert projection(old, production=True) == projection(new, production=True)
+    assert projection(old, production=True) != projection(new.replace('"--locked"', '"--release"'), production=True)
+    assert projection(old, production=True) != projection(old.replace('"CM-S01"', '"CM-G06"'), production=True)
+    old = old.replace('== "CM-S01"', '!= "CM-S01"')
+    new = old.replace('!= "CM-S01"', 'not in ("CM-S01", "CM-S02")')
+    assert projection(old, production=True) == projection(new, production=True)
+    # Missing S02 files in an ancestor disable only S02 checkpoints.
+    original_git = git
+    with patch.object(sys.modules[__name__], "git", side_effect=lambda directory, *args:
+            b"" if args[:1] == ("ls-tree",) and args[-len(SUPPORT_RUNTIME_FILES):] == SUPPORT_RUNTIME_FILES
+            else original_git(directory, *args)):
+        legacy = test_inputs(root, "HEAD")
+    assert legacy == {label: value for label, value in current.items() if not label.startswith("s02-")}
+    for path, entry in (("fixtures/runtime-sdk/driver.py", "def environment(home, directory, mode=\"handles\", old_handle=None):\n"),
+            ("fixtures/managed-package/driver.py", "def tui_configuration(arguments, directory):\n")):
+        text = source(root, "HEAD", path)
+        assert text.count(entry) == 1
+        updated = text.replace(entry, entry + '    assert False, "instance-held dependency mutation"\n')
+        with patch.object(sys.modules[__name__], "source", side_effect=lambda directory, revision, name:
+                updated if name == path else original(directory, revision, name)):
+            changed = test_inputs(root, "HEAD")
+        assert {label for label in current if label.startswith("s02-") and current[label] != changed[label]} == {"s02-abc"}
+    base = {"packages": {}, "files": [{"path": "inputs/mods/g02a/turn-budget/payload.so", "sha256": "a"}]}
+    native = {case: native_key(base, "s02-" + case) for case in runtime_cases.GROUPS["s02"]}
+    base["files"][0]["sha256"] = "b"
+    assert {case for case in native if native_key(base, "s02-" + case) != native[case]} == {"abc", "conflict", "disable"}
 
 
 def native_self_check():
