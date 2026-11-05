@@ -1273,6 +1273,15 @@ def support_self_check(root, current):
         assert {label for label in current if current[label] != changed[label]} == {"s02-" + case}
     config_path = ".github/cm-ci.json"
     config = json.loads(source(root, "HEAD", config_path))
+    import acceptance_cache
+    with patch.object(acceptance_cache, "load_config", return_value={**config, "task_id": "CM-S01"}):
+        previous_recipes = acceptance_cache.recipes(root)
+    with patch.object(acceptance_cache, "load_config", return_value={**config, "task_id": "CM-S02"}):
+        support_recipes = acceptance_cache.recipes(root)
+    assert support_recipes == previous_recipes
+    assert {"m02-native-probe-build", "review-tui-probe-build", "g03-local-backend-contract", "g06-c-abi"} <= support_recipes.keys()
+    assert {"g06-sdk-" + owner + "-" + variant for owner in ("a", "b")
+            for variant in ("v1", "v2", "replacement")} <= support_recipes.keys()
     production = product_inputs(root, "HEAD")
     for field, value, same in (("task_id", "CM-S01", True), ("required_checks", ["different"], True),
             ("task_id", "CM-G06", False),
