@@ -277,6 +277,8 @@ jobs:
             ${{ env.CM_CI_LOG_DIR }}/runtime-step-results.json
             ${{ env.CM_CI_LOG_DIR }}/run-metadata.json
             ${{ env.CM_CI_LOG_DIR }}/*.log
+            ${{ env.CM_CI_LOG_DIR }}/acceptance-evidence/*.json
+            ${{ env.CM_CI_LOG_DIR }}/acceptance-evidence/g05/*/reports.json
           if-no-files-found: warn
           retention-days: 14
       - name: Upload actual consumer product evidence
