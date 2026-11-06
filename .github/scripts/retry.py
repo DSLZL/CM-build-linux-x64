@@ -1274,9 +1274,11 @@ def support_self_check(root, current):
     config_path = ".github/cm-ci.json"
     config = json.loads(source(root, "HEAD", config_path))
     import acceptance_cache
-    with patch.object(acceptance_cache, "load_config", return_value={**config, "task_id": "CM-S01"}):
+    with (patch.object(acceptance_cache, "load_config", return_value={**config, "task_id": "CM-S01"}),
+            patch("linux_ci.load_config", return_value={**config, "task_id": "CM-S01"})):
         previous_recipes = acceptance_cache.recipes(root)
-    with patch.object(acceptance_cache, "load_config", return_value={**config, "task_id": "CM-S02"}):
+    with (patch.object(acceptance_cache, "load_config", return_value={**config, "task_id": "CM-S02"}),
+            patch("linux_ci.load_config", return_value={**config, "task_id": "CM-S02"})):
         support_recipes = acceptance_cache.recipes(root)
     assert support_recipes == previous_recipes
     assert {"m02-native-probe-build", "review-tui-probe-build", "g03-local-backend-contract", "g06-c-abi"} <= support_recipes.keys()
