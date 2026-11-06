@@ -792,6 +792,9 @@ def prepare(root, inputs, frozen, logs, authors):
                 (("sbom", "sbom.spdx.json"), ("notice", "NOTICE.json"), ("source", "source.json"))},
             "policy_sha256": sha(root / POLICY_PATH)}
         write(material / "draft.json", draft)
+        if role != "host":
+            # Small data-only archive for the reviewed catalog signer; never executes candidate code.
+            shutil.copyfile(archive, material / "transport.cmod")
         artifacts[name] = {"directory": str(directory.relative_to(inputs)),
             "archive": archive.name if role == "host" else str(archive.relative_to(inputs)),
             "draft_sha256": sha(material / "draft.json")}

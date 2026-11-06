@@ -214,6 +214,8 @@ def qualification_receipt(receipt, origin, jobs, source, worker):
         record = api("repos/" + worker + "/actions/artifacts/" + str(origin["input_artifact_id"]))
         artifact_binding(record, origin["input_artifact_id"], "cm-linux-x64-runtime-inputs-" + origin["request_id"] + "-" + str(origin["run_attempt"]),
                          origin["input_artifact_sha256"], origin["run_id"])
+    if receipt.get("index") is not None:
+        verify_index_receipt(receipt["index"], jobs=jobs, ci=ci, consumer=consumer)
     return ci
 
 
@@ -305,7 +307,7 @@ def preflight():
     mode = "write" if sha == source_head else "read"
     config_record = api("repos/" + source + "/contents/.github/cm-ci.json?ref=" + sha)
     config = json.loads(base64.b64decode(config_record["content"]))
-    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02", "CM-M03", "CM-M04", "CM-M05", "CM-G02A", "CM-G02B", "CM-G03", "CM-G04", "CM-G01", "CM-G05", "CM-G06", "CM-S01", "CM-S02") else "false"
+    consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02", "CM-M03", "CM-M04", "CM-M05", "CM-G02A", "CM-G02B", "CM-G03", "CM-G04", "CM-G01", "CM-G05", "CM-G06", "CM-S01", "CM-S02", "CM-S03") else "false"
     if kind == "mod-only":
         if config.get("task_id") != "CM-M05":
             raise RuntimeError("Mod-only requires the reviewed M05 mapping")
@@ -314,7 +316,8 @@ def preflight():
               "observed_source_default_sha": source_head, "builder_repository": worker,
               "workflow_sha": workflow_sha, "worker_default_branch": worker_branch,
               "request_id": request, "target": TARGET, "cache_mode": mode, "consumer_required": consumer_required,
-              "build_kind": kind, "distribution_required": "true" if config.get("task_id") in ("CM-S01", "CM-S02") else "false"}
+              "build_kind": kind, "distribution_required": "true" if config.get("task_id") in ("CM-S01", "CM-S02", "CM-S03") else "false",
+              "index_required": "true" if config.get("task_id") == "CM-S03" else "false"}
     Path(os.environ["RUNNER_TEMP"], "cm-worker-preflight.json").write_text(json.dumps(record, indent=2) + "\n")
     output({**record, "source_default_sha_verified": "true" if mode == "write" else "false"})
     print(json.dumps(record, indent=2))
@@ -480,6 +483,7 @@ def self_check():
               "expired": False, "workflow_run": {"id": 2}}
     assert artifact_binding(record, 1, "input", "a" * 64, 2)["artifact_id"] == 1
     assert successful_job([{"id": 3, "name": "consumer", "conclusion": "success"}], "consumer")["job_id"] == 3
+    index_binding_self_check()
     ready = {"jobs": [{"id": 3, "name": "producer", "status": "completed", "conclusion": "success"},
                       {"id": 4, "name": "consumer", "status": "completed", "conclusion": "success"}]}
     pending = {"jobs": [ready["jobs"][0], {"id": 4, "name": "consumer", "status": "in_progress", "conclusion": None}]}
@@ -649,6 +653,104 @@ def self_check():
         assert (destination / "hardlink").samefile(destination / "cli")
 
 
+def index_binding_self_check():
+    from copy import deepcopy
+    ci = {"source_sha": "a" * 40, "workflow_sha": "b" * 40, "production_origin": {"run_id": 1},
+        "repository": "DSLZL/CM-build-linux-x64", "run_id": 20, "run_attempt": 2, "request_id": "cm-fixture"}
+    consumer = {"artifact_id": 21, "job_id": 22}
+    jobs, records = [], {}
+    value = {"status": "pass", "source_sha": ci["source_sha"], "workflow_sha": ci["workflow_sha"],
+        "production_origin": ci["production_origin"], "main_consumer_artifact_id": 21,
+        "main_consumer_job_id": 22, "release_ready": False}
+    for number, role, prefix, job in ((23, "qualification", "index-qualification", "attest-index-qualification"),
+            (24, "proof_consumer", "index-proof-consumer", "index-proof-consumer")):
+        name = "cm-linux-x64-" + prefix + "-cm-fixture-2"
+        jobs.append({"id": number, "name": job, "conclusion": "success"})
+        records[str(number)] = {"id": number, "name": name, "digest": "sha256:" + "c" * 64,
+            "expired": False, "workflow_run": {"id": 20}}
+        value[role] = {"job": job, "job_id": number, "job_conclusion": "success",
+            "artifact": {"artifact_id": number, "artifact_name": name, "artifact_sha256": "c" * 64}}
+    def verify(candidate, selected_jobs=jobs):
+        return verify_index_receipt(candidate, jobs=selected_jobs, ci=ci, consumer=consumer,
+            fetch=lambda path: records[path.rsplit("/", 1)[1]])
+    assert verify(value) == value
+    invalid = [{**value, "source_sha": "d" * 40}, {**value, "status": "behavior_pass"},
+        {**value, "main_consumer_artifact_id": 99}, {**value, "release_ready": True}]
+    changed = deepcopy(value)
+    changed["proof_consumer"]["artifact"]["artifact_sha256"] = "d" * 64
+    invalid.append(changed)
+    for candidate in invalid:
+        try:
+            verify(candidate)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Index receipt accepted a different identity or intermediate result")
+    try:
+        verify(value, [{**job, "conclusion": "failure"} for job in jobs])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Index receipt accepted a failed proof job")
+
+
+def verify_index_receipt(value, *, jobs, ci, consumer, fetch=None):
+    fetch = fetch or api
+    expected = {"status": "pass", "source_sha": ci["source_sha"], "workflow_sha": ci["workflow_sha"],
+        "production_origin": ci["production_origin"], "main_consumer_artifact_id": consumer["artifact_id"],
+        "main_consumer_job_id": consumer["job_id"], "release_ready": False}
+    if any(value.get(key) != item for key, item in expected.items()):
+        raise RuntimeError("Index receipt differs from the exact source, producer or main consumer")
+    for role, prefix, job in (("qualification", "index-qualification", "attest-index-qualification"),
+            ("proof_consumer", "index-proof-consumer", "index-proof-consumer")):
+        item = value[role]
+        if any(item.get(key) != data for key, data in successful_job(jobs, job).items()):
+            raise RuntimeError("Index receipt has no exact successful " + job)
+        bound = item["artifact"]
+        name = "cm-linux-x64-" + prefix + "-" + ci["request_id"] + "-" + str(ci["run_attempt"])
+        record = fetch("repos/" + ci["repository"] + "/actions/artifacts/" + str(bound["artifact_id"]))
+        artifact_binding(record, bound["artifact_id"], name, bound["artifact_sha256"], ci["run_id"])
+        if bound["artifact_name"] != name:
+            raise RuntimeError("Index artifact name differs from the exact run/attempt")
+    return value
+
+
+def index_receipt(jobs, consumer, origin):
+    from retry import checked_artifact, small_archive
+    _, worker, sha, workflow_sha, request = identities()
+    artifacts = {}
+    for role, prefix, job in (("INDEX_QUALIFICATION", "index-qualification", "attest-index-qualification"),
+            ("INDEX_PROOF", "index-proof-consumer", "index-proof-consumer")):
+        artifact_id = int(os.environ["CM_" + role + "_ARTIFACT_ID"])
+        record = checked_artifact(api("repos/" + worker + "/actions/artifacts/" + str(artifact_id)), int(os.environ["GITHUB_RUN_ID"]))
+        bound = artifact_binding(record, artifact_id, "cm-linux-x64-" + prefix + "-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"],
+            os.environ["CM_" + role + "_ARTIFACT_DIGEST"].removeprefix("sha256:"), int(os.environ["GITHUB_RUN_ID"]))
+        artifacts[role] = {"artifact": bound, **successful_job(jobs, job)}
+        if role == "INDEX_PROOF":
+            with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
+                with small_archive(worker, record, Path(directory) / "index-proof.zip") as archive:
+                    acceptance = archive_json(archive, "acceptance.json")
+                    binding = archive_json(archive, "proof-consumer-binding.json")
+            assert acceptance["task_id"] == "CM-S03" and acceptance["status"] == "pass"
+            assert acceptance["implementation_commit"] == sha and acceptance["post_consumer_qualification"] is True
+            assert {row["id"] for row in acceptance["checks"]} == {"CM-S03-AC0" + str(index) for index in range(1, 7)}
+            assert all(row["status"] == "pass" and row["post_consumer_qualification"] is True for row in acceptance["checks"])
+            assert binding["production_origin"] == origin
+            assert binding["provenance"] == {"CM_SOURCE_REPOSITORY": os.environ["CM_SOURCE_REPOSITORY"], "CM_SOURCE_SHA": sha,
+                "GITHUB_REPOSITORY": worker, "GITHUB_WORKFLOW_SHA": workflow_sha, "GITHUB_RUN_ID": os.environ["GITHUB_RUN_ID"],
+                "GITHUB_RUN_ATTEMPT": os.environ["GITHUB_RUN_ATTEMPT"], "CM_REQUEST_ID": request}
+            assert binding["audit"]["status"] == "pass" and binding["audit"]["cache_mode"] == "none"
+            assert binding["audit"]["isolation_probes"] == "pass" and not binding["audit"]["canary_hits"]
+            assert all(row["compiler_linker_jit_build_service_calls"] == 0 for row in binding["audit"]["steps"].values())
+            qualification = binding["qualification_artifact"]["artifact"]
+            expected = artifacts["INDEX_QUALIFICATION"]["artifact"]
+            assert qualification["id"] == expected["artifact_id"]
+            assert qualification["digest"] == "sha256:" + expected["artifact_sha256"]
+    return {"status": "pass", "source_sha": sha, "workflow_sha": workflow_sha, "production_origin": origin,
+        "main_consumer_artifact_id": consumer["artifact_id"], "main_consumer_job_id": consumer["job_id"],
+        "qualification": artifacts["INDEX_QUALIFICATION"], "proof_consumer": artifacts["INDEX_PROOF"], "release_ready": False}
+
+
 def receipt():
     source, worker, sha, workflow_sha, request = identities()
     artifact_id = int(os.environ["CM_ARTIFACT_ID"])
@@ -667,6 +769,8 @@ def receipt():
         names.append("runtime-consumer")
     if os.environ.get("CM_DISTRIBUTION_REQUIRED") == "true":
         names.append("attest-distribution")
+    if os.environ.get("CM_INDEX_REQUIRED") == "true":
+        names.extend(("attest-index-qualification", "index-proof-consumer"))
     jobs = receipt_jobs("repos/" + worker + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100", names)
     producer_job = successful_job(jobs, os.environ["CM_BUILD_JOB"])
     ci = {"provider": "github_actions", "repository": worker, "source_repository": source,
@@ -725,10 +829,11 @@ def receipt():
         proof_ref = artifact_binding(record, proof_id, proof_name, proof_digest, int(os.environ["GITHUB_RUN_ID"]))
         distribution = {"job": "attest-distribution", **successful_job(jobs, "attest-distribution"),
             "artifact": proof_ref, "production_origin": origin, "consumer_job_id": consumer["job_id"]}
+    index = index_receipt(jobs, consumer, origin) if os.environ.get("CM_INDEX_REQUIRED") == "true" else None
     out = Path(os.environ["RUNNER_TEMP"], "cm-worker-receipt")
     out.mkdir(exist_ok=True)
     (out / "worker-receipt.json").write_text(json.dumps({"schema_version": 1, "ci": ci, "consumer": consumer,
-        "distribution": distribution,
+        "distribution": distribution, "index": index,
         "note": "Artifact identity verified; final workflow conclusion must be fetched after this run completes."}, indent=2) + "\n")
 
 

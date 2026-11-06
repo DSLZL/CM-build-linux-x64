@@ -55,6 +55,7 @@ jobs:
       consumer_required: ${{ steps.policy.outputs.consumer_required }}
       build_kind: ${{ steps.policy.outputs.build_kind }}
       distribution_required: ${{ steps.policy.outputs.distribution_required }}
+      index_required: ${{ steps.policy.outputs.index_required }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -140,6 +141,7 @@ jobs:
       CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
       CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
       CM_BUILD_JOB: ${{ needs.build-read.result == 'success' && 'build-read / linux-x64' || 'build-write / linux-x64' }}
+      CM_INDEX_REQUIRED: ${{ needs.preflight.outputs.index_required }}
       CM_POLICY_TOKEN: ${{ github.token }}
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -163,6 +165,40 @@ jobs:
           CM_PROOF_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
           CM_PROOF_DIRECTORY: ${{ steps.candidate.outputs.proof_directory }}
         run: cp -- "$CM_PROOF_BUNDLE" "$CM_PROOF_DIRECTORY/bundle.jsonl"
+      - name: Prepare bounded negative archive subjects as data
+        if: needs.preflight.outputs.index_required == 'true'
+        id: index-archives
+        run: /usr/bin/python3 -B .github/scripts/binary_index.py prepare-archives
+      - name: Attest archive bytes before the index can reference their proof
+        if: needs.preflight.outputs.index_required == 'true'
+        id: index-archive-attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ steps.index-archives.outputs.negative_subject_path }}
+      - name: Preserve the negative archive proof
+        if: needs.preflight.outputs.index_required == 'true'
+        env:
+          CM_BUNDLE: ${{ steps.index-archive-attest.outputs.bundle-path }}
+          CM_DIRECTORY: ${{ steps.index-archives.outputs.index_directory }}
+        run: cp -- "$CM_BUNDLE" "$CM_DIRECTORY/negative-bundle.jsonl"
+      - name: Prepare candidate indexes without platform qualification
+        if: needs.preflight.outputs.index_required == 'true'
+        id: index
+        run: /usr/bin/python3 -B .github/scripts/binary_index.py prepare-indexes
+      - name: Attest the exact candidate index subjects
+        if: needs.preflight.outputs.index_required == 'true'
+        id: index-attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ steps.index.outputs.index_subject_path }}
+      - name: Preserve candidate index sidecars
+        if: needs.preflight.outputs.index_required == 'true'
+        env:
+          CM_BUNDLE: ${{ steps.index-attest.outputs.bundle-path }}
+          CM_DIRECTORY: ${{ steps.index.outputs.index_directory }}
+        run: |
+          cp -- "$CM_BUNDLE" "$CM_DIRECTORY/index-bundle.jsonl"
+          /usr/bin/python3 -B .github/scripts/binary_index.py finish-indexes
       - name: Upload only receipts and offline proofs
         id: proofs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -188,6 +224,8 @@ jobs:
     outputs:
       artifact_id: ${{ steps.payload.outputs.artifact-id }}
       artifact_digest: ${{ steps.payload.outputs.artifact-digest }}
+      qualification_input_artifact_id: ${{ steps.index-input.outputs.artifact-id }}
+      qualification_input_artifact_digest: ${{ steps.index-input.outputs.artifact-digest }}
     env:
       CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
       CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
@@ -268,6 +306,15 @@ jobs:
         env:
           CM_POLICY_TOKEN: ${{ github.token }}
         run: /usr/bin/python3 -B "$CM_CONSUMER_INPUT_DIR/runtime_consumer.py" consume
+      - name: Upload small data inputs for the isolated qualification signer
+        if: success() && needs.preflight.outputs.index_required == 'true'
+        id: index-input
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-index-qualification-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-index-qualification-inputs
+          if-no-files-found: error
+          retention-days: 14
       - name: Retain compact consumer status and logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -307,12 +354,201 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  receipt:
+
+  attest-index-qualification:
     needs: [preflight, build-read, build-write, attest-distribution, runtime-consumer]
+    if: >-
+      ${{ always() && needs.preflight.outputs.index_required == 'true' &&
+      needs.runtime-consumer.result == 'success' && needs.attest-distribution.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    cache-mode: none
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    outputs:
+      artifact_id: ${{ steps.qualification.outputs.artifact-id }}
+      artifact_digest: ${{ steps.qualification.outputs.artifact-digest }}
+    env:
+      CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
+      CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
+      CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
+      CM_CONSUMER_ARTIFACT_ID: ${{ needs.runtime-consumer.outputs.artifact_id }}
+      CM_CONSUMER_ARTIFACT_DIGEST: ${{ needs.runtime-consumer.outputs.artifact_digest }}
+      CM_INDEX_INPUT_ARTIFACT_ID: ${{ needs.runtime-consumer.outputs.qualification_input_artifact_id }}
+      CM_INDEX_INPUT_ARTIFACT_DIGEST: ${{ needs.runtime-consumer.outputs.qualification_input_artifact_digest }}
+      CM_DISTRIBUTION_ARTIFACT_ID: ${{ needs.attest-distribution.outputs.artifact_id }}
+      CM_DISTRIBUTION_ARTIFACT_DIGEST: ${{ needs.attest-distribution.outputs.artifact_digest }}
+      CM_POLICY_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout reviewed signing infrastructure only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Check actual consumer success reports audit and exact artifact identities as bounded data
+        id: candidate
+        run: /usr/bin/python3 -B .github/scripts/binary_index.py prepare-qualification
+      - name: Attest exact post-consumer qualification statements
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ steps.candidate.outputs.qualification_subject_path }}
+      - name: Preserve qualification proof and prepare the referring index
+        env:
+          CM_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          CM_DIRECTORY: ${{ steps.candidate.outputs.qualification_directory }}
+        run: |
+          cp -- "$CM_BUNDLE" "$CM_DIRECTORY/index/qualification-bundle.jsonl"
+          /usr/bin/python3 -B .github/scripts/binary_index.py prepare-qualified-index
+        id: index
+      - name: Attest the exact referring indexes
+        id: index-attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: ${{ steps.index.outputs.qualified_index_subject_path }}
+      - name: Preserve qualified index sidecars
+        env:
+          CM_BUNDLE: ${{ steps.index-attest.outputs.bundle-path }}
+          CM_DIRECTORY: ${{ steps.candidate.outputs.qualification_directory }}
+        run: |
+          cp -- "$CM_BUNDLE" "$CM_DIRECTORY/index/qualified-index-bundle.jsonl"
+          /usr/bin/python3 -B .github/scripts/binary_index.py finish-qualified-index
+      - name: Upload bounded post-consumer statements proofs and original report data
+        id: qualification
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-index-qualification-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ steps.candidate.outputs.qualification_directory }}
+          if-no-files-found: error
+          retention-days: 14
+
+  index-proof-consumer:
+    needs: [preflight, build-read, build-write, attest-distribution, attest-index-qualification]
+    if: >-
+      ${{ always() && needs.preflight.result == 'success' &&
+      needs.preflight.outputs.index_required == 'true' && needs.attest-index-qualification.result == 'success' &&
+      (needs.preflight.outputs.distribution_required != 'true' || needs.attest-distribution.result == 'success') &&
+      (needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    cache-mode: none
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      artifact_id: ${{ steps.payload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.payload.outputs.artifact-digest }}
+    env:
+      CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
+      CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+      CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_EXECUTION_ROLE: runtime_consumer
+      CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
+      CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
+      CM_VALIDATION_ARTIFACT_ID: ${{ needs.build-read.outputs.validation_artifact_id || needs.build-write.outputs.validation_artifact_id }}
+      CM_VALIDATION_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.validation_artifact_digest || needs.build-write.outputs.validation_artifact_digest }}
+      CM_DISTRIBUTION_ARTIFACT_ID: ${{ needs.attest-distribution.outputs.artifact_id }}
+      CM_DISTRIBUTION_ARTIFACT_DIGEST: ${{ needs.attest-distribution.outputs.artifact_digest }}
+      CM_INDEX_QUALIFICATION_ARTIFACT_ID: ${{ needs.attest-index-qualification.outputs.artifact_id }}
+      CM_INDEX_QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.attest-index-qualification.outputs.artifact_digest }}
+      CM_CACHE_MODE: none
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout trusted worker only
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Set independent consumer paths
+        run: |
+          mkdir -p "$RUNNER_TEMP/cm-runtime-evidence"
+          echo 'Initialized evidence before consumer authority checks.' > "$RUNNER_TEMP/cm-runtime-evidence/setup.log"
+          echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-extracted/runtime-inputs" >> "$GITHUB_ENV"
+          echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer" >> "$GITHUB_ENV"
+          echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-runtime-evidence" >> "$GITHUB_ENV"
+          echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-runtime-artifacts" >> "$GITHUB_ENV"
+          echo "CM_VALIDATION_INPUT_DIR=$RUNNER_TEMP/cm-validation-inputs" >> "$GITHUB_ENV"
+          echo "CM_RUNTIME_CHECKPOINT_DIR=$RUNNER_TEMP/cm-runtime-checkpoints" >> "$GITHUB_ENV"
+          echo "CM_WORKER_POLICY_DIR=$GITHUB_WORKSPACE/.github/scripts" >> "$GITHUB_ENV"
+      - name: Verify and export runner-injected cache-none authority
+        uses: ./.github/actions/cache-authority
+      - name: Verify exact producer artifact and actual cache-none authority
+        id: input
+        env:
+          CM_INPUT_ARTIFACT_ID: ${{ needs.build-read.outputs.input_artifact_id || needs.build-write.outputs.input_artifact_id }}
+          CM_INPUT_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.input_artifact_digest || needs.build-write.outputs.input_artifact_digest }}
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -B .github/scripts/worker_policy.py verify-consumer
+      - name: Record independent consumer without a product source checkout
+        run: /usr/bin/python3 -B .github/scripts/record_run.py "$CM_CI_LOG_DIR"
+      - name: Download original frozen inputs and the current small test overlay
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CM_INPUT_ARTIFACT_NAME: ${{ steps.input.outputs.input_artifact_name }}
+          CM_INPUT_RUN_ID: ${{ steps.input.outputs.input_run_id }}
+          CM_VALIDATION_ARTIFACT_NAME: ${{ steps.input.outputs.validation_artifact_name }}
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$CM_INPUT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_INPUT_ARTIFACT_NAME" --dir "$CM_CONSUMER_TRANSFER_DIR"
+          /usr/bin/python3 -B .github/scripts/worker_policy.py extract-consumer
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_VALIDATION_ARTIFACT_NAME" --dir "$CM_VALIDATION_INPUT_DIR"
+          /usr/bin/python3 -B "$CM_VALIDATION_INPUT_DIR/retry.py" refresh
+      - name: Fetch API-bound proofs and independent pinned bootstrap verifier
+        if: needs.preflight.outputs.distribution_required == 'true'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ env.CM_WORKER_POLICY_DIR }}:${{ env.CM_CONSUMER_INPUT_DIR }}
+        run: /usr/bin/python3 -B .github/scripts/distribution_provenance.py consume-proofs
+      - name: Bind current signed qualification artifact without candidate execution
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ env.CM_WORKER_POLICY_DIR }}:${{ env.CM_CONSUMER_INPUT_DIR }}
+        run: /usr/bin/python3 -B .github/scripts/binary_index.py consume-qualification
+      - name: Prepare observation tools and user namespaces before consumption
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends strace binutils bubblewrap
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Verify support display in a fresh minimal rootfs
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -B "$CM_CONSUMER_INPUT_DIR/runtime_consumer.py" index-proof
+      - name: Upload final six reports and actual proof consumption
+        id: payload
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-index-proof-consumer-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain fresh proof logs and sanitized failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-index-proof-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_LOG_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+
+  receipt:
+    needs: [preflight, build-read, build-write, attest-distribution, runtime-consumer, attest-index-qualification, index-proof-consumer]
     if: >-
       ${{ always() && needs.preflight.result == 'success' &&
       (needs.build-read.result == 'success' || needs.build-write.result == 'success') &&
-      (needs.preflight.outputs.consumer_required != 'true' || needs.runtime-consumer.result == 'success') }}
+      (needs.preflight.outputs.consumer_required != 'true' || needs.runtime-consumer.result == 'success') &&
+      (needs.preflight.outputs.index_required != 'true' ||
+      (needs.attest-index-qualification.result == 'success' && needs.index-proof-consumer.result == 'success')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     cache-mode: none
@@ -344,6 +580,11 @@ jobs:
           CM_CONSUMER_REQUIRED: ${{ needs.preflight.outputs.consumer_required }}
           CM_CONSUMER_ARTIFACT_ID: ${{ needs.runtime-consumer.outputs.artifact_id }}
           CM_CONSUMER_ARTIFACT_DIGEST: ${{ needs.runtime-consumer.outputs.artifact_digest }}
+          CM_INDEX_REQUIRED: ${{ needs.preflight.outputs.index_required }}
+          CM_INDEX_QUALIFICATION_ARTIFACT_ID: ${{ needs.attest-index-qualification.outputs.artifact_id }}
+          CM_INDEX_QUALIFICATION_ARTIFACT_DIGEST: ${{ needs.attest-index-qualification.outputs.artifact_digest }}
+          CM_INDEX_PROOF_ARTIFACT_ID: ${{ needs.index-proof-consumer.outputs.artifact_id }}
+          CM_INDEX_PROOF_ARTIFACT_DIGEST: ${{ needs.index-proof-consumer.outputs.artifact_digest }}
           CM_INPUT_ARTIFACT_ID: ${{ needs.build-read.outputs.input_artifact_id || needs.build-write.outputs.input_artifact_id }}
           CM_INPUT_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.input_artifact_digest || needs.build-write.outputs.input_artifact_digest }}
           CM_POLICY_TOKEN: ${{ github.token }}
