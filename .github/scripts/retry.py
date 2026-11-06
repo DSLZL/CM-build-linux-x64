@@ -1289,7 +1289,7 @@ def support_self_check(root, current):
         'sin_addr=inet_addr("127.0.0.1")}, [16]) = 0']
     listener_connections = SimpleNamespace(provider_tcp_connections=lambda rows, ports: {"13"})
     assert runtime_consumer.bind_tui_mcp_listener(listener_record, listener_metadata,
-        {listener_host: listener_identity}, listener_connections)["port"] == 3000
+        {listener_host: listener_identity}, listener_connections)["port"] == "3000"
     for listener_home, listener_digest, listener_rows in (
             ("/profile/s02/abc-extra", listener_identity, listener_metadata),
             ("/profile/s02/abc/../other", listener_identity, listener_metadata),
