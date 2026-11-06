@@ -264,7 +264,13 @@ def bindings(module):
 
 
 def closure(texts, entries, dispatch=None):
-    dispatch = dispatch or {}
+    return deepcopy(_closure(tuple(sorted(texts.items())), tuple(entries),
+        tuple(sorted((dispatch or {}).items()))))
+
+
+@lru_cache(maxsize=512)
+def _closure(texts, entries, dispatch):
+    texts, dispatch = dict(texts), dict(dispatch)
     class Dispatch(ast.NodeTransformer):
         def __init__(self, function):
             self.function = function
@@ -434,6 +440,10 @@ def self_check():
         assert not missing, ("Missing case roots", phase, sorted(missing))
     texts = {"a.py": "UNUSED=1\nUSED=2\ndef other():return UNUSED\ndef entry():\n return USED\n"}
     original = closure(texts, [("a.py", "entry")])
+    caller = closure(texts, [("a.py", "entry")])
+    caller["dependencies"].clear()
+    caller["conservative_reasons"].append("caller mutation")
+    assert closure(texts, [("a.py", "entry")]) == original
     assert original == closure({"a.py": texts["a.py"].replace("UNUSED=1", "UNUSED=9")}, [("a.py", "entry")])
     assert original != closure({"a.py": texts["a.py"].replace("USED=2", "USED=9")}, [("a.py", "entry")])
     assert original == closure({"a.py": texts["a.py"].replace("return USED", 'ci_progress.emit("heartbeat", "running")\n return USED')},

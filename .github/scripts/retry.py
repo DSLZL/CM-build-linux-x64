@@ -208,7 +208,7 @@ def test_inputs(root, revision):
                 entries = (*entries, *(("fixtures/sdk-seams/driver.py", name) for name in
                     ("real", "release_native", "Provider", "environment", "settled")))
         value = runtime_cases.closure(case_texts, entries, dispatch=dispatch)
-        module = runtime_cases.Business().visit(ast.parse(case_texts[cli]))
+        module = runtime_cases.business_module(case_texts[cli])
         value["dependencies"][cli + ":<entrypoint>"] = digest([ast.dump(node, include_attributes=False)
             for node in module.body if isinstance(node, ast.If) and any(
                 isinstance(item, ast.Name) and item.id == "__name__" for item in ast.walk(node.test))])
