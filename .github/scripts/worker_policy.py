@@ -35,12 +35,15 @@ def api(path):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.load(response)
-        except urllib.error.HTTPError as error:
-            if error.code not in (502, 503, 504) or attempt == 2:
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+            transient = (error.code in (502, 503, 504) if isinstance(error, urllib.error.HTTPError)
+                         else isinstance(getattr(error, "reason", error), (ConnectionError, TimeoutError)))
+            if not transient or attempt == 2:
                 raise
-            error.close()
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
             delay = 5 * (attempt + 1)
-            print(f"CM policy: GitHub API HTTP {error.code}; retry {attempt + 1}/2 in {delay}s", flush=True)
+            print(f"CM policy: GitHub API {error}; retry {attempt + 1}/2 in {delay}s", flush=True)
             time.sleep(delay)
 
 
@@ -478,6 +481,27 @@ def self_check():
             pass
         else:
             raise AssertionError("Malformed GitHub response was accepted")
+        assert fetch.call_count == 1 and pause.call_count == 0
+    for error in (urllib.error.URLError(ConnectionResetError("reset")), TimeoutError("deadline")):
+        with patch("urllib.request.urlopen", side_effect=[error, io.BytesIO(b'{"ok": true}')]) as fetch, patch("time.sleep") as pause:
+            assert api("fixture") == {"ok": True}
+            assert fetch.call_count == 2
+            pause.assert_called_once_with(5)
+        with patch("urllib.request.urlopen", side_effect=error) as fetch, patch("time.sleep") as pause:
+            try:
+                api("fixture")
+            except type(error):
+                pass
+            else:
+                raise AssertionError("Persistent network failure was accepted")
+            assert fetch.call_count == 3 and pause.call_count == 2
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("certificate rejected")) as fetch, patch("time.sleep") as pause:
+        try:
+            api("fixture")
+        except urllib.error.URLError:
+            pass
+        else:
+            raise AssertionError("Permanent network failure was accepted")
         assert fetch.call_count == 1 and pause.call_count == 0
     record = {"id": 1, "name": "input", "digest": "sha256:" + "a" * 64,
               "expired": False, "workflow_run": {"id": 2}}

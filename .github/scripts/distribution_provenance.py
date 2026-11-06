@@ -8,7 +8,9 @@ import re
 import shutil
 import subprocess
 import tarfile
+import time
 import tomllib
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -96,8 +98,21 @@ def fetch(url, maximum=LIMIT):
         import worker_policy
         value = canonical(worker_policy.api(url.removeprefix("https://api.github.com/")))
     else:
-        with urllib.request.urlopen(url, timeout=90) as response:
-            value = response.read(maximum + 1)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(url, timeout=90) as response:
+                    value = response.read(maximum + 1)
+                break
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+                transient = (error.code in (502, 503, 504) if isinstance(error, urllib.error.HTTPError)
+                             else isinstance(getattr(error, "reason", error), (ConnectionError, TimeoutError)))
+                if not transient or attempt == 2:
+                    raise
+                if isinstance(error, urllib.error.HTTPError):
+                    error.close()
+                delay = 5 * (attempt + 1)
+                print(f"CM materials: {error}; retry {attempt + 1}/2 in {delay}s: {url}", flush=True)
+                time.sleep(delay)
     assert 0 < len(value) <= maximum, "Material exceeds bound: " + url
     return value
 
@@ -1043,6 +1058,31 @@ def self_check():
     import runtime_consumer
     runtime_consumer.check_distribution_verifier_binding(Path(os.environ["CM_SOURCE_DIR"]))
     from types import SimpleNamespace
+    from unittest import mock
+    for error in (urllib.error.URLError(ConnectionResetError("reset")), TimeoutError("deadline"),
+                  urllib.error.HTTPError("https://example.invalid/pinned", 503, "unavailable", {}, None)):
+        with mock.patch("urllib.request.urlopen", side_effect=[error, io.BytesIO(b"pinned")]) as request, mock.patch("time.sleep") as pause:
+            assert fetch("https://example.invalid/pinned") == b"pinned"
+            assert request.call_count == 2
+            pause.assert_called_once_with(5)
+        with mock.patch("urllib.request.urlopen", side_effect=error) as request, mock.patch("time.sleep") as pause:
+            try:
+                fetch("https://example.invalid/pinned")
+            except type(error):
+                pass
+            else:
+                raise AssertionError("Persistent material download failure was accepted")
+            assert request.call_count == 3 and pause.call_count == 2
+    for error in (urllib.error.HTTPError("https://example.invalid/pinned", 404, "missing", {}, None),
+                  urllib.error.URLError("certificate rejected")):
+        with mock.patch("urllib.request.urlopen", side_effect=error) as request, mock.patch("time.sleep") as pause:
+            try:
+                fetch("https://example.invalid/pinned")
+            except type(error):
+                pass
+            else:
+                raise AssertionError("Permanent material download failure was accepted")
+            assert request.call_count == 1 and pause.call_count == 0
     ci_policy = {"source_repository": "DSLZL/CM", "source_repository_id": 1430833890}
     ci_revision = "a" * 40
     ci_run = {"id": 1, "run_attempt": 1, "head_sha": ci_revision, "head_branch": "main",
