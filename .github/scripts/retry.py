@@ -1276,6 +1276,33 @@ def support_self_check(root, current):
     config_path = ".github/cm-ci.json"
     config = json.loads(source(root, "HEAD", config_path))
     import acceptance_cache
+    import runtime_consumer
+    from types import SimpleNamespace
+    listener_host = "/inputs/host/bin/codex"
+    listener_identity = "a" * 64
+    listener_record = {"command": [listener_host, "cm", "--home", "/profile/s02/abc", "launch", "--"],
+        "tui": True, "empty_launch_argv": True,
+        "identity": {"proc_exe": listener_host, "executable_sha256": listener_identity},
+        "provider_requests": [{"tools": [{"name": "mcp__codex_worktrees"}]}],
+        "tui_mcp_listener": {"inode": "12", "port": 3000}}
+    listener_metadata = ['1 getsockname(3<TCP:[12]>, {sa_family=AF_INET, sin_port=htons(3000), '
+        'sin_addr=inet_addr("127.0.0.1")}, [16]) = 0']
+    listener_connections = SimpleNamespace(provider_tcp_connections=lambda rows, ports: {"13"})
+    assert runtime_consumer.bind_tui_mcp_listener(listener_record, listener_metadata,
+        {listener_host: listener_identity}, listener_connections)["port"] == 3000
+    for listener_home, listener_digest, listener_rows in (
+            ("/profile/s02/abc-extra", listener_identity, listener_metadata),
+            ("/profile/s02/abc/../other", listener_identity, listener_metadata),
+            ("/profile/s02/versions", listener_identity, listener_metadata),
+            ("/profile/s02/abc", "b" * 64, listener_metadata), ("/profile/s02/abc", listener_identity, [])):
+        listener_record["command"][3] = listener_home
+        try:
+            runtime_consumer.bind_tui_mcp_listener(listener_record, listener_rows,
+                {listener_host: listener_digest}, listener_connections)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("TUI listener escaped exact profile, Host or socket binding")
     with (patch.object(acceptance_cache, "load_config", return_value={**config, "task_id": "CM-S01"}),
             patch("linux_ci.load_config", return_value={**config, "task_id": "CM-S01"})):
         previous_recipes = acceptance_cache.recipes(root)
