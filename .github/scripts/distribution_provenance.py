@@ -546,7 +546,7 @@ def system_components(package, destination):
 def cargo_audit():
     import host
     root = Path(os.environ["CM_SOURCE_DIR"])
-    if host.load_config(root)["task_id"] not in ("CM-S01", "CM-S02"):
+    if host.load_config(root)["task_id"] not in ("CM-S01", "CM-S02", "CM-S03"):
         return
     assert os.environ["GITHUB_REPOSITORY"] == "DSLZL/CM-build-linux-x64"
     metadata = json.loads(subprocess.check_output(
