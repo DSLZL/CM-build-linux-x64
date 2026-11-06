@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 
 import runtime_cases
@@ -1174,6 +1175,8 @@ class Checkpoints:
         except Exception as error:
             with self.lock:
                 self.results[label] = {"status": "failed", "kind": "executed", "error": repr(error),
+                    "traceback": [{"file": Path(frame.filename).name, "line": frame.lineno, "function": frame.name}
+                                  for frame in traceback.extract_tb(error.__traceback__)],
                     **self.decision(label)}
             ci_progress.emit(label, "failed", started)
             return subprocess.CompletedProcess(command, 1)
