@@ -798,7 +798,6 @@ def current_producer_job():
 def overlay(root, logs):
     import runtime_consumer
     import runtime_composition
-    from linux_ci import load_config
     p = policy()
     plan = read(logs / "retry-plan.json")
     if plan["status"] == "hit":
@@ -837,7 +836,7 @@ def overlay(root, logs):
                 "inputs": {path: value for path, value in plan["probe_inputs"].items() if label in PRIVATE_PROBES[path]}}
     baseline = plan.get("checkpoint_origin")
     write(destination / "validation.json", {"schema_version": 2, "provenance": runtime_consumer.provenance(),
-        "task_id": load_config(root)["task_id"],
+        "task_id": read(root / ".github/cm-ci.json")["task_id"],
         "environment": environment(), "production_inputs_sha256": plan["production_inputs_sha256"],
         "build_request": plan["build_request"],
         "production_origin": origin, "checkpoint_origin": baseline,
