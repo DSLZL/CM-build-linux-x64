@@ -1410,6 +1410,7 @@ def collect():
 
 def self_check():
     import ast
+    from contextlib import chdir
     from copy import deepcopy
     import runpy
     import tempfile
@@ -1417,12 +1418,29 @@ def self_check():
     import runtime_cases
     import worker_policy
     import runtime_consumer
+    import linux_ci
     from types import SimpleNamespace
     os.environ.setdefault("CM_SOURCE_DIR", os.environ["GITHUB_WORKSPACE"])
     assert len(STAGES) * len(ROLES) * len(config()["repetitions"]) == 36
     states = read(root() / RUNTIME)["states"]
     assert len(states) == 10 and len(states) * 3 == 30
     assert len({state["id"] for state in states}) == 10
+    source = root().resolve()
+    expected_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
+    check_output = subprocess.check_output
+    def identity_command(arguments, **kwargs):
+        if arguments[0] == "git":
+            return check_output(arguments, **kwargs)
+        return {"rustc": "self-check rustc", "cargo": "self-check cargo", "sccache": "sccache " + linux_ci.SCCACHE_VERSION}[arguments[0]]
+    with tempfile.TemporaryDirectory() as temporary:
+        logs = Path(temporary)
+        outside = logs / "outside-checkout"
+        outside.mkdir()
+        cfg = {"native_tools": [], "units": [], "build_profile": "dev", "test_profile": "test", "clippy_profile": "dev"}
+        with patch.dict(os.environ, {"GITHUB_OUTPUT": str(logs / "outputs"), "GITHUB_REPOSITORY": "worker/repo",
+                "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64"}), patch.object(subprocess, "check_output", side_effect=identity_command), chdir(outside):
+            linux_ci.identify(source, logs, cfg)
+        assert read(logs / "build-identity.json")["checkout_head"] == expected_head, "Compiler identity used the caller directory instead of its source checkout"
     cache = config()["cache"]
     assert cache["repository_limit_bytes"] == cache["free_limit_bytes"] == 10 ** 10
     with patch.dict(os.environ, {"GITHUB_REPOSITORY": "DSLZL/CM-build-linux-x64"}):
@@ -1620,7 +1638,7 @@ def self_check():
             "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
             "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier",
             "digest-verified fixture state identity relocation", "fresh checkpoint parent before samples",
-            "owner-confirmed free cache capacity and usage-only guard"]})
+            "owner-confirmed free cache capacity and usage-only guard", "compiler identity outside its source checkout"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
