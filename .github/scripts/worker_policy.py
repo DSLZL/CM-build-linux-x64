@@ -326,6 +326,28 @@ def preflight():
     print(json.dumps(record, indent=2))
 
 
+def benchmark_capacity(cache):
+    result = {"status": "unavailable", "save_allowed": False, "billing_expansion": False, "deletion": False}
+    try:
+        limit = cache["repository_limit_bytes"]
+        free, reserve = cache["free_limit_bytes"], cache["max_new_bytes"]
+        assert cache["repository_limit_source"] == "owner-confirmed-free-tier", "Repository limit needs owner confirmation"
+        assert all(type(value) is int and value > 0 for value in (limit, free, reserve)), "Invalid cache byte limits"
+        maximum = min(limit, free)
+        usage = api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/cache/usage")
+        used = usage["active_caches_size_in_bytes"]
+        assert type(used) is int and used >= 0, "Invalid live cache usage"
+        allowed = used + reserve <= maximum
+        result.update(status="available", save_allowed=allowed, usage=usage,
+            limit={"max_cache_size_bytes": limit, "source": cache["repository_limit_source"]},
+            maximum_bytes=maximum, reserved_new_bytes=reserve,
+            reason=None if allowed else "Insufficient confirmed headroom; no eviction or paid expansion")
+    except (urllib.error.URLError, KeyError, AssertionError, TypeError, ValueError) as error:
+        result.update(reason=str(error) or type(error).__name__,
+            http_status=error.code if isinstance(error, urllib.error.HTTPError) else None)
+    return result
+
+
 def benchmark_preflight():
     preflight()
     source, worker, sha, workflow_sha, _ = identities()
@@ -344,17 +366,7 @@ def benchmark_preflight():
     qualified = parse_origin(runtime["qualification"]["origin"])
     verify_origin(qualified, source, worker, workflow_sha)
     record.update(task_id="CM-S04", pr_number=int(number), pr_sha=pr_sha, real_pr_url=pull["html_url"])
-    capacity = {"status": "unavailable", "save_allowed": False, "billing_expansion": False, "deletion": False}
-    try:
-        usage = api("repos/" + worker + "/actions/cache/usage")
-        limit = api("repos/" + worker + "/actions/cache/storage-limit")
-        maximum = min(limit["max_cache_size_gb"] * 1000 ** 3, definition["cache"]["free_limit_bytes"])
-        assert type(limit["max_cache_size_gb"]) is int and maximum > 0
-        allowed = usage["active_caches_size_in_bytes"] + definition["cache"]["max_new_bytes"] <= maximum
-        capacity.update(status="available", save_allowed=allowed, usage=usage, limit=limit,
-            reason=None if allowed else "Insufficient confirmed headroom; no eviction or paid expansion")
-    except (urllib.error.URLError, KeyError, AssertionError, TypeError) as error:
-        capacity.update(reason=str(error), http_status=error.code if isinstance(error, urllib.error.HTTPError) else None)
+    capacity = benchmark_capacity(definition["cache"])
     record["cache_capacity"] = capacity
     seed = definition["host_seed"]
     seed_status = {"status": "unavailable", "usable": False}

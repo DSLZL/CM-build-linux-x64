@@ -516,12 +516,9 @@ def cache_save_plan(role):
         assert os.environ["CM_BENCHMARK_STAGE"] == "cold" and os.environ["CM_BENCHMARK_REPETITION"] == "1"
         sample = read(logs / "sample.json")
         assert sample["status"] == "pass" and not sample["measurement_reused"]
-        worker = os.environ["GITHUB_REPOSITORY"]
-        usage = policy.api("repos/" + worker + "/actions/cache/usage")
-        limit = policy.api("repos/" + worker + "/actions/cache/storage-limit")
         cache = config()["cache"]
-        assert type(limit.get("max_cache_size_gb")) is int and limit["max_cache_size_gb"] > 0
-        maximum = min(limit["max_cache_size_gb"] * 1000 ** 3, cache["free_limit_bytes"])
+        capacity = policy.benchmark_capacity(cache)
+        assert capacity["save_allowed"], capacity.get("reason")
         directories = [paths(role)["CARGO_HOME"] / part for part in ("registry/index", "registry/cache", "git/db")]
         if role != "H":
             directories.append(paths(role)["SCCACHE_DIR"])
@@ -529,11 +526,10 @@ def cache_save_plan(role):
         previous = Path(os.environ["RUNNER_TEMP"]) / "cm-s04-new-cache-budget.json"
         used = read(previous)["reserved_uncompressed_bytes"] if previous.exists() else 0
         assert size > 0 and used + size + cache["canary_reserve_bytes"] <= cache["max_new_bytes"], "New cache budget insufficient"
-        assert usage["active_caches_size_in_bytes"] + cache["max_new_bytes"] <= maximum, "Existing caches must not be evicted by this campaign"
         assert shutil.disk_usage(Path(os.environ["RUNNER_TEMP"])).free > size + cache["minimum_disk_reserve_bytes"], "Insufficient cache archive disk space"
         policy.verify_checkout()
         write(previous, {"reserved_uncompressed_bytes": used + size})
-        result.update(status="allowed", save=True, usage=usage, limit=limit, estimated_uncompressed_bytes=size,
+        result.update(status="allowed", save=True, usage=capacity["usage"], limit=capacity["limit"], estimated_uncompressed_bytes=size,
             billing_expansion=False, eviction_or_deletion=False)
         write(Path(os.environ["RUNNER_TEMP"]) / ("cm-s04-" + role + "-seed.json"), {
             "schema_version": 1, "role": role, "origin": origin(), "environment": read(logs / "prepared.json")["environment"],
@@ -1191,10 +1187,9 @@ def trust_prepare():
     assert not destination.exists()
     destination.mkdir()
     if role == "write":
-        usage = policy.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/cache/usage")
-        limit = policy.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/cache/storage-limit")
-        assert usage["active_caches_size_in_bytes"] + config()["cache"]["max_new_bytes"] <= min(
-            limit["max_cache_size_gb"] * 1000 ** 3, config()["cache"]["free_limit_bytes"]), "No confirmed space for a trust seed"
+        capacity = policy.benchmark_capacity(config()["cache"])
+        write(Path(os.environ["CM_CI_LOG_DIR"]) / "cache-capacity.json", capacity)
+        assert capacity["save_allowed"], capacity.get("reason")
         (destination / "payload.txt").write_text("CM-S04 trusted default-branch seed\n")
         write(destination / "identity.json", {"origin": origin(), "key": trust_key(), "cache_mode": mode})
     output({"trust_key": trust_key(), "trust_path": str(destination)})
@@ -1428,6 +1423,32 @@ def self_check():
     states = read(root() / RUNTIME)["states"]
     assert len(states) == 10 and len(states) * 3 == 30
     assert len({state["id"] for state in states}) == 10
+    cache = config()["cache"]
+    assert cache["repository_limit_bytes"] == cache["free_limit_bytes"] == 10 ** 10
+    with patch.dict(os.environ, {"GITHUB_REPOSITORY": "DSLZL/CM-build-linux-x64"}):
+        for used, allowed in ((8836306629, True), (10 ** 10 - cache["max_new_bytes"], True),
+                              (10 ** 10 - cache["max_new_bytes"] + 1, False)):
+            with patch.object(worker_policy, "api", return_value={"active_caches_size_in_bytes": used}) as fetch:
+                capacity = worker_policy.benchmark_capacity(cache)
+                fetch.assert_called_once_with("repos/DSLZL/CM-build-linux-x64/actions/cache/usage")
+                assert capacity["status"] == "available" and capacity["save_allowed"] is allowed
+                assert capacity["maximum_bytes"] == 10 ** 10
+                assert capacity["billing_expansion"] is capacity["deletion"] is False
+        for invalid in ({key: value for key, value in cache.items() if key != "repository_limit_bytes"},
+                        {**cache, "repository_limit_source": "assumed-default"},
+                        {**cache, "repository_limit_bytes": True}, {**cache, "free_limit_bytes": -1},
+                        {**cache, "max_new_bytes": "unknown"}):
+            with patch.object(worker_policy, "api") as fetch:
+                capacity = worker_policy.benchmark_capacity(invalid)
+                assert capacity["status"] == "unavailable" and not capacity["save_allowed"]
+                fetch.assert_not_called()
+        for invalid in ({}, {"active_caches_size_in_bytes": True}, {"active_caches_size_in_bytes": -1}):
+            with patch.object(worker_policy, "api", return_value=invalid):
+                capacity = worker_policy.benchmark_capacity(cache)
+                assert capacity["status"] == "unavailable" and not capacity["save_allowed"]
+        with patch.object(worker_policy, "api", side_effect=urllib.error.HTTPError("https://api.github.com/usage", 503, "unavailable", {}, None)):
+            capacity = worker_policy.benchmark_capacity(cache)
+            assert not capacity["save_allowed"] and capacity["http_status"] == 503
     assert distribution([1, 2, 3])["median"] == 2
     assert distribution([])["status"] == "unavailable"
     counters = cache_counts({"status": "available", "raw": {"stats": {
@@ -1573,6 +1594,8 @@ def self_check():
         assert all(runtime_method(state, native)["sha256"] != methods[state["id"]] for state in states), "A shared isolation audit change was omitted"
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", "collect")):
         assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Report formatting invalidated a runtime measurement"
+    with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/worker_policy.py", "benchmark_capacity")):
+        assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Author cache capacity invalidated a runtime measurement"
     runtime_consumer.benchmark_tui_binding_self_check()
     command = ["/inputs/host/bin/codex", "cm", "--home", "/profile/s04/block-1", "launch", "--"]
     record = {"command": command, "tui": True, "empty_launch_argv": True, "identity": {"pid": 7,
@@ -1596,7 +1619,8 @@ def self_check():
         "job": os.environ["GITHUB_JOB"], "checks": ["66 unique slots", "exact original sample reuse", "target and case dependency invalidation",
             "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
             "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier",
-            "digest-verified fixture state identity relocation", "fresh checkpoint parent before samples"]})
+            "digest-verified fixture state identity relocation", "fresh checkpoint parent before samples",
+            "owner-confirmed free cache capacity and usage-only guard"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
