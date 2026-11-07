@@ -1416,6 +1416,7 @@ def collect():
 def self_check():
     import ast
     from copy import deepcopy
+    import runpy
     from unittest.mock import patch
     import runtime_cases
     import worker_policy
@@ -1431,6 +1432,11 @@ def self_check():
         "cache_hits": {"counts": {"Rust": 3}, "adv_counts": {"rust": 3}},
         "cache_misses": {"counts": {}, "adv_counts": {}}, "cache_errors": {"counts": {}, "adv_counts": {}}}}})
     assert counters["hits"] == 3 and counters["misses"] == counters["errors"] == 0, "Detailed counters were counted twice"
+    settled = runpy.run_path(str(root() / "fixtures/review-before-send/driver.py"))["turns_settled"]
+    no_mods = [{"event": "ready", "detail": {"mod_count": 0, "plan": {"mods": {}}}}]
+    assert settled(no_mods) and not settled([])
+    assert not settled([*no_mods, {"event": "runtime-request-released"}]), "A no-Mod plan accepted native callbacks"
+    assert not settled([{"event": "ready", "detail": {"mod_count": 1, "plan": {"mods": {"mod": {}}}}}])
     qualified = {"source_sha": "a" * 40, "workflow_sha": "b" * 40, "run_id": 20, "run_attempt": 1, "request_id": "fixture"}
     provenance = {"CM_SOURCE_REPOSITORY": "source/repo", "CM_SOURCE_SHA": qualified["source_sha"],
         "GITHUB_REPOSITORY": "worker/repo", "GITHUB_WORKFLOW_SHA": qualified["workflow_sha"],
@@ -1537,7 +1543,7 @@ def self_check():
         "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
         "job": os.environ["GITHUB_JOB"], "checks": ["66 unique slots", "exact original sample reuse", "target and case dependency invalidation",
             "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
-            "exact S03 post-consumer qualification", "aggregate cache counters counted once"]})
+            "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
