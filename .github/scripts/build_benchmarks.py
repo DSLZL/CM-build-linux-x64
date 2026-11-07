@@ -1422,6 +1422,7 @@ def self_check():
     import runtime_cases
     import worker_policy
     import runtime_consumer
+    from types import SimpleNamespace
     os.environ.setdefault("CM_SOURCE_DIR", os.environ["GITHUB_WORKSPACE"])
     assert len(STAGES) * len(ROLES) * len(config()["repetitions"]) == 36
     states = read(root() / RUNTIME)["states"]
@@ -1438,6 +1439,16 @@ def self_check():
     assert settled(no_mods) and not settled([])
     assert not settled([*no_mods, {"event": "runtime-request-released"}]), "A no-Mod plan accepted native callbacks"
     assert not settled([{"event": "ready", "detail": {"mod_count": 1, "plan": {"mods": {"mod": {}}}}}])
+    driver_path = root() / "fixtures/build-benchmarks/driver.py"
+    entrypoint = ast.Module(body=[ast.parse(driver_path.read_text()).body[-1]], type_ignores=[])
+    with tempfile.TemporaryDirectory() as temporary:
+        profile_root = Path(temporary) / "profile/s04"
+        calls = []
+        namespace = {"__name__": "__main__", "sys": SimpleNamespace(argv=[str(driver_path), "block", "1"]),
+            "Path": lambda value: profile_root if value == "/profile/s04" else Path(value),
+            "run_block": lambda block: calls.append((block, profile_root.is_dir()))}
+        exec(compile(entrypoint, str(driver_path), "exec"), namespace)
+        assert calls == [(1, True)], "A fresh restore started before its profile parent was initialized"
     relocate = runpy.run_path(str(root() / "fixtures/build-benchmarks/driver.py"))["relocate_profile_identity"]
     with tempfile.TemporaryDirectory() as temporary:
         home = Path(temporary)
@@ -1569,7 +1580,6 @@ def self_check():
         "tui_mcp_listener": {"inode": "123", "port": 1234}}
     metadata = ['20 getsockname(3<TCP:[123]>, {sa_family=AF_INET, sin_port=htons(1234), sin_addr=inet_addr("127.0.0.1")}, [16]) = 0']
     calls = ['20 getpid() = 7', '20 execve("' + command[0] + '", ' + json.dumps(command) + ', 0x1) = 0']
-    from types import SimpleNamespace
     observer = SimpleNamespace(provider_tcp_connections=lambda *args: {"456"})
     assert runtime_consumer.bind_tui_mcp_listener(record, metadata, {command[0]: "a" * 64}, observer, process_calls=calls)
     for altered in ({**record, "identity": {**record["identity"], "executable_sha256": "b" * 64}},
@@ -1586,7 +1596,7 @@ def self_check():
         "job": os.environ["GITHUB_JOB"], "checks": ["66 unique slots", "exact original sample reuse", "target and case dependency invalidation",
             "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
             "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier",
-            "digest-verified fixture state identity relocation"]})
+            "digest-verified fixture state identity relocation", "fresh checkpoint parent before samples"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
