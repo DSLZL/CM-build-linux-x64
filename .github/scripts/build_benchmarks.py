@@ -680,7 +680,9 @@ def repair_cargo_seed(role):
         return
     prepare_host()
     cfg = load_config(root())
-    command(logs, "H-seed-locked-downloads", ["cargo", "fetch", "--locked", "--manifest-path", cfg["units"][0]["manifest"], "--target", TARGET], trace=True)
+    # A traced sccache daemon outlives fetch when its idle timeout is disabled.
+    command(logs, "H-seed-locked-downloads", ["cargo", "fetch", "--locked", "--manifest-path", cfg["units"][0]["manifest"], "--target", TARGET],
+        env={**os.environ, "RUSTC_WRAPPER": ""}, trace=True)
     assert not paths(role)["CARGO_TARGET_DIR"].exists(), "Download-only seed repair created a linked target"
     write(logs / "cargo-seed-preparation.json", {"status": "pass", "role": role, "origin": origin(),
         "keys": prepared["keys"], "environment": prepared["environment"], "sample_id": sample["sample_id"],
@@ -1538,7 +1540,8 @@ def self_check():
         mocks = {"origin": Mock(return_value=current), "prior_samples": Mock(return_value=[original]),
             "prepare_host": Mock(), "command": Mock(), "output": Mock()}
         with patch.dict(os.environ, {"RUNNER_TEMP": temporary, "CM_CI_LOG_DIR": str(logs), "GITHUB_REPOSITORY": "worker/repo",
-                "CM_BENCHMARK_STAGE": "cold", "CM_BENCHMARK_REPETITION": "1", "CM_CACHE_MODE": "write", "ACTIONS_CACHE_MODE": "write"}), \
+                "CM_BENCHMARK_STAGE": "cold", "CM_BENCHMARK_REPETITION": "1", "CM_CACHE_MODE": "write", "ACTIONS_CACHE_MODE": "write",
+                "RUSTC_WRAPPER": "sccache"}), \
                 patch.dict(globals(), mocks), patch.object(worker_policy, "verify_checkout"), \
                 patch.object(worker_policy, "api") as fetch, patch.object(linux_ci, "load_config", return_value={"units": [{"manifest": "locked/Cargo.toml"}]}):
             fetch.return_value = {"actions_caches": [{"key": "exact-H-seed", "ref": "refs/heads/main", "size_in_bytes": 1}]}
@@ -1550,7 +1553,9 @@ def self_check():
             repair_cargo_seed("H")
             mocks["prepare_host"].assert_called_once_with()
             mocks["command"].assert_called_once_with(logs, "H-seed-locked-downloads",
-                ["cargo", "fetch", "--locked", "--manifest-path", "locked/Cargo.toml", "--target", TARGET], trace=True)
+                ["cargo", "fetch", "--locked", "--manifest-path", "locked/Cargo.toml", "--target", TARGET],
+                env={**os.environ, "RUSTC_WRAPPER": ""}, trace=True)
+            assert os.environ["RUSTC_WRAPPER"] == "sccache", "Download-only repair changed the build wrapper"
             repair = read(logs / "cargo-seed-preparation.json")
             assert repair["sample_id"] == original["sample_id"] and repair["execution_origin"] == original["execution_origin"]
             assert (logs / "sample.json").read_bytes() == sample_bytes and not paths("H")["CARGO_TARGET_DIR"].exists()
