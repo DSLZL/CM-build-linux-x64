@@ -319,6 +319,14 @@ def bound_artifact(prefix, role):
     return policy, record
 
 
+def copy_qualification_index(material, output):
+    # Qualification uses sdk-a; keep unrelated distribution subjects and rejection archives out of this bounded package.
+    for name in ("subjects/catalog.json", "archives/sdk-a.cmod", "receipts/sdk-a.json", "release-bundle.jsonl"):
+        target = output / "index" / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(material / "index" / name, target)
+
+
 def prepare_qualification():
     import worker_policy as worker
     worker.identities()
@@ -360,7 +368,9 @@ def prepare_qualification():
     assert ready[0]["candidate_contents"] == claim["plan"]["candidate_contents"]
     policy, distribution_artifact = bound_artifact("distribution-proofs", "DISTRIBUTION")
     output = Path(os.environ["RUNNER_TEMP"]) / "cm-index-qualification"
-    distribution.artifact_download(policy, distribution_artifact, output)
+    material = Path(os.environ["RUNNER_TEMP"]) / "cm-index-distribution"
+    distribution.artifact_download(policy, distribution_artifact, material)
+    copy_qualification_index(material, output)
     shutil.copytree(directory, output / "main-consumer")
     root = output / "index"
     catalog = distribution.read(root / "subjects/catalog.json")
@@ -416,11 +426,16 @@ def prepare_qualified_index():
 
 
 def finish_qualified_index():
-    root = Path(os.environ["RUNNER_TEMP"]) / "cm-index-qualification/index"
+    output = Path(os.environ["RUNNER_TEMP"]) / "cm-index-qualification"
+    root = output / "index"
     for path in (root / "qualified").glob("*.json"):
         target = root / ("qualified-" + path.name)
         shutil.copyfile(path, target)
         shutil.copyfile(root / "qualified-index-bundle.jsonl", target.with_name(target.name + ".bundle.jsonl"))
+    files = [path for path in output.rglob("*") if path.is_file()]
+    size = sum(path.stat().st_size for path in files)
+    assert 0 < len(files) <= 512 and size <= distribution.LIMIT, (len(files), size)
+    print(json.dumps({"qualification_files": len(files), "qualification_uncompressed_bytes": size}))
 
 
 def consume_qualification():
@@ -495,6 +510,18 @@ def self_check(root):
         assert "def " + runtime_cases.function(case, "s03") + "(" in (root / "fixtures/binary-index/driver.py").read_text()
     with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
         inputs = Path(directory)
+        material, output = inputs / "material", inputs / "qualification"
+        for name in ("subjects/catalog.json", "archives/sdk-a.cmod", "receipts/sdk-a.json", "release-bundle.jsonl",
+                "archives/byte-limit.cmod", "unrelated.json"):
+            path = material / "index" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(name.encode())
+        copy_qualification_index(material, output)
+        assert len([path for path in output.rglob("*") if path.is_file()]) == 4
+        assert not (output / "index/archives/byte-limit.cmod").exists()
+        for path in output.rglob("*"):
+            if path.is_file():
+                assert path.read_bytes() == (material / path.relative_to(output)).read_bytes()
         evidence = inputs / "reports"
         for name in REPORTS:
             distribution.write(evidence / name, {"status": "behavior_pass"})
