@@ -791,6 +791,27 @@ def runtime_method(state, native):
         "algorithms": algorithms}), "inputs": inputs, "dependencies": closure}
 
 
+def verify_runtime_qualification(accepted, binding, receipt, qualified, source, worker):
+    import worker_policy as policy
+    provenance = {"CM_SOURCE_REPOSITORY": source, "CM_SOURCE_SHA": qualified["source_sha"],
+        "GITHUB_REPOSITORY": worker, "GITHUB_WORKFLOW_SHA": qualified["workflow_sha"],
+        "GITHUB_RUN_ID": str(qualified["run_id"]), "GITHUB_RUN_ATTEMPT": str(qualified["run_attempt"]),
+        "CM_REQUEST_ID": qualified["request_id"]}
+    assert accepted["task_id"] == "CM-S03" and accepted["status"] == "pass"
+    assert accepted["implementation_commit"] == qualified["source_sha"] and accepted["post_consumer_qualification"] is True
+    assert [check["id"] for check in accepted["checks"]] == ["CM-S03-AC0" + str(number) for number in range(1, 7)]
+    assert all(check["status"] == "pass" and check["post_consumer_qualification"] is True for check in accepted["checks"])
+    assert accepted["proof_consumer"] == binding["provenance"] == provenance
+    assert binding["production_origin"] == receipt["ci"]["production_origin"]
+    bound = receipt["index"]["qualification"]["artifact"]
+    policy.artifact_binding(binding["qualification_artifact"]["artifact"], bound["artifact_id"],
+        bound["artifact_name"], bound["artifact_sha256"], qualified["run_id"])
+    audit = binding["audit"]
+    assert audit["provenance"] == provenance and audit["status"] == "pass" and audit["cache_mode"] == "none"
+    assert audit["isolation_probes"] == "pass" and not audit["canary_hits"] and audit["steps"]
+    assert all(step["compiler_linker_jit_build_service_calls"] == 0 for step in audit["steps"].values())
+
+
 def prepare_runtime():
     import worker_policy as policy
     assert os.environ["CM_CACHE_MODE"] == os.environ["ACTIONS_CACHE_MODE"] == "none"
@@ -811,11 +832,15 @@ def prepare_runtime():
     production = receipt["ci"]["production_origin"]
     assert production["run_id"] == definition["production"]["run_id"]
     assert production["source_sha"] == definition["production"]["source_sha"]
-    with policy.download_origin_archive(worker, remote["artifacts"]["consumer"], temporary / "acceptance.zip", maximum=64 * 1024 ** 2) as archive:
+    # S03's post-consumer proof is separate from the main consumer's acceptance.
+    qualified_proof = receipt["index"]["proof_consumer"]["artifact"]
+    record = policy.api("repos/" + worker + "/actions/artifacts/" + str(qualified_proof["artifact_id"]))
+    policy.artifact_binding(record, qualified_proof["artifact_id"], qualified_proof["artifact_name"],
+        qualified_proof["artifact_sha256"], qualified["run_id"])
+    with policy.download_origin_archive(worker, record, temporary / "acceptance.zip", maximum=64 * 1024 ** 2) as archive:
         accepted = policy.archive_json(archive, "acceptance.json")
-        assert accepted["task_id"] == "CM-S03" and accepted["status"] == "pass"
-        assert accepted["implementation_commit"] == qualified["source_sha"] and len(accepted["checks"]) == 6
-        assert all(check["status"] == "pass" for check in accepted["checks"])
+        binding = policy.archive_json(archive, "proof-consumer-binding.json")
+        verify_runtime_qualification(accepted, binding, receipt, qualified, source, worker)
     with policy.download_origin_archive(worker, remote["artifacts"]["input"], temporary / "runtime.zip") as archive:
         assert archive.namelist() == ["runtime-inputs.tar"]
         with archive.open("runtime-inputs.tar") as stream, (temporary / "runtime-inputs.tar").open("xb") as output_stream:
@@ -884,7 +909,7 @@ def prepare_runtime():
         "methods": {str(block): methods for block in definition["blocks"]}})
     entries = [row for row in runtime.inventory(inputs) if row["path"] != "input-manifest.json"]
     write(inputs / "input-manifest.json", {"files": entries, "sha256": runtime.digest(entries)})
-    write(logs / "frozen-authority.json", {"qualification": qualified, "production": production, "receipt": receipt,
+    write(logs / "frozen-authority.json", {"qualification": qualified, "qualification_proof": qualified_proof, "production": production, "receipt": receipt,
         "input_manifest_sha256": runtime.digest(entries), "source_checkout": False, "current_fixture_source_sha": os.environ["CM_SOURCE_SHA"]})
 
 
@@ -1387,6 +1412,7 @@ def collect():
 
 def self_check():
     import ast
+    from copy import deepcopy
     from unittest.mock import patch
     import runtime_cases
     import worker_policy
@@ -1398,6 +1424,34 @@ def self_check():
     assert len({state["id"] for state in states}) == 10
     assert distribution([1, 2, 3])["median"] == 2
     assert distribution([])["status"] == "unavailable"
+    qualified = {"source_sha": "a" * 40, "workflow_sha": "b" * 40, "run_id": 20, "run_attempt": 1, "request_id": "fixture"}
+    provenance = {"CM_SOURCE_REPOSITORY": "source/repo", "CM_SOURCE_SHA": qualified["source_sha"],
+        "GITHUB_REPOSITORY": "worker/repo", "GITHUB_WORKFLOW_SHA": qualified["workflow_sha"],
+        "GITHUB_RUN_ID": "20", "GITHUB_RUN_ATTEMPT": "1", "CM_REQUEST_ID": "fixture"}
+    bound = {"artifact_id": 21, "artifact_name": "index-qualification", "artifact_sha256": "c" * 64}
+    receipt = {"ci": {"production_origin": {"run_id": 1}}, "index": {"qualification": {"artifact": bound}}}
+    accepted = {"task_id": "CM-S03", "status": "pass", "implementation_commit": qualified["source_sha"],
+        "post_consumer_qualification": True, "proof_consumer": provenance,
+        "checks": [{"id": "CM-S03-AC0" + str(number), "status": "pass", "post_consumer_qualification": True} for number in range(1, 7)]}
+    binding = {"provenance": provenance, "production_origin": {"run_id": 1},
+        "qualification_artifact": {"artifact": {"id": 21, "name": "index-qualification", "digest": "sha256:" + "c" * 64,
+            "expired": False, "workflow_run": {"id": 20}}},
+        "audit": {"provenance": provenance, "status": "pass", "cache_mode": "none", "isolation_probes": "pass",
+            "canary_hits": [], "steps": {"probe": {"compiler_linker_jit_build_service_calls": 0}}}}
+    verify_runtime_qualification(accepted, binding, receipt, qualified, "source/repo", "worker/repo")
+    invalid = [({**accepted, "task_id": "CM-S01"}, binding), ({**accepted, "implementation_commit": "d" * 40}, binding),
+        (accepted, {**binding, "production_origin": {"run_id": 2}}),
+        (accepted, {**binding, "audit": {**binding["audit"], "status": "failed"}})]
+    duplicate = deepcopy(accepted)
+    duplicate["checks"][1] = deepcopy(duplicate["checks"][0])
+    invalid.append((duplicate, binding))
+    for candidate, evidence in invalid:
+        try:
+            verify_runtime_qualification(candidate, evidence, receipt, qualified, "source/repo", "worker/repo")
+        except (AssertionError, RuntimeError):
+            pass
+        else:
+            raise AssertionError("Runtime qualification accepted the wrong task, source, producer, checks or audit")
     fingerprint = {"sha256": "a" * 64}
     sample = {"slot": "author/cold/1/A", "sample_id": "old", "status": "pass", "fingerprint": fingerprint}
     assert select_sample([sample, {**sample, "status": "failed"}], sample["slot"], fingerprint)["sample_id"] == "old"
@@ -1475,7 +1529,8 @@ def self_check():
         "source_sha": os.environ.get("CM_SOURCE_SHA", os.environ["GITHUB_SHA"]), "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
         "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
         "job": os.environ["GITHUB_JOB"], "checks": ["66 unique slots", "exact original sample reuse", "target and case dependency invalidation",
-            "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding"]})
+            "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
+            "exact S03 post-consumer qualification"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
