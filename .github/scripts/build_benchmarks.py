@@ -1050,6 +1050,9 @@ def cache_counts(snapshot):
     assert "cache_hits" in raw and "cache_misses" in raw, "Unknown sccache statistics schema"
     def total(value):
         if isinstance(value, dict):
+            # Aggregate and detailed counters describe the same events.
+            if "counts" in value:
+                return total(value["counts"])
             return sum(total(item) for item in value.values())
         return value if type(value) in (int, float) else 0
     return {"hits": total(raw["cache_hits"]), "misses": total(raw["cache_misses"]),
@@ -1424,6 +1427,10 @@ def self_check():
     assert len({state["id"] for state in states}) == 10
     assert distribution([1, 2, 3])["median"] == 2
     assert distribution([])["status"] == "unavailable"
+    counters = cache_counts({"status": "available", "raw": {"stats": {
+        "cache_hits": {"counts": {"Rust": 3}, "adv_counts": {"rust": 3}},
+        "cache_misses": {"counts": {}, "adv_counts": {}}, "cache_errors": {"counts": {}, "adv_counts": {}}}}})
+    assert counters["hits"] == 3 and counters["misses"] == counters["errors"] == 0, "Detailed counters were counted twice"
     qualified = {"source_sha": "a" * 40, "workflow_sha": "b" * 40, "run_id": 20, "run_attempt": 1, "request_id": "fixture"}
     provenance = {"CM_SOURCE_REPOSITORY": "source/repo", "CM_SOURCE_SHA": qualified["source_sha"],
         "GITHUB_REPOSITORY": "worker/repo", "GITHUB_WORKFLOW_SHA": qualified["workflow_sha"],
@@ -1530,7 +1537,7 @@ def self_check():
         "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
         "job": os.environ["GITHUB_JOB"], "checks": ["66 unique slots", "exact original sample reuse", "target and case dependency invalidation",
             "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
-            "exact S03 post-consumer qualification"]})
+            "exact S03 post-consumer qualification", "aggregate cache counters counted once"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
