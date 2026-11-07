@@ -1099,6 +1099,14 @@ def cache_counts(snapshot):
         "non_cacheable": {key: value for key, value in raw.items() if "not_cached" in key or "non_cacheable" in key}}
 
 
+def counter_delta(before, after):
+    left = cache_counts(before) if before else None
+    right = cache_counts(after) if after else None
+    if left is None or right is None:
+        return {"status": "unavailable", "reason": "before/after cache counters unavailable"}
+    return {"status": "available", "values": {name: right[name] - left[name] for name in ("hits", "misses", "errors")}}
+
+
 def cache_canaries():
     """Actual tiny compilations with fresh targets and independent compiler-object stores."""
     logs = Path(os.environ["CM_CI_LOG_DIR"])
@@ -1382,7 +1390,7 @@ def collect():
         cache_rows.append({"slot": item["slot"], "sample_id": item["sample_id"], "status": item["status"],
             "archive_restore": item.get("archive_restore", {"status": "skipped" if item.get("package_unchanged") else "unavailable", "reason": "See exact cache action outcomes and original evidence"}),
             "object_before": cache_counts(before) if before else None, "object_after": cache_counts(after) if after else None,
-            "raw_before": before, "raw_after": after, "delta": item.get("sccache_delta"),
+            "raw_before": before, "raw_after": after, "delta": counter_delta(before, after),
             "phases": item.get("phases"), "link_time": item.get("link_time", item.get("build_time")),
             "measurement_reused": item["measurement_reused"], "execution_origin": item["execution_origin"]})
     groups = {stage + "/" + role: distribution([item["elapsed_seconds"] for item in author if item["stage"] == stage
@@ -1391,7 +1399,8 @@ def collect():
         and row.get("sccache_after", {}).get("status") == "available" and row.get("phases") and row.get("link_time")) for row in author)
     reports.append(report(config()["reports"][1], metrics_complete, {"samples": cache_rows, "elapsed_seconds": groups,
         "actions_job_and_step_timings": timing, "historical_timing_is_not_current_execution": True,
-        "unavailable_metrics": ["pure linker duration is unavailable; Cargo build duration is never relabelled as link duration"],
+        "unavailable_metrics": ["pure linker duration is unavailable; Cargo build duration is never relabelled as link duration",
+            "cache sizes and configuration remain raw snapshots; no gauge delta or zero for a null gauge is inferred"],
         "compiler_observer": "direct child execs and typed sccache wrapper requests; daemon compiler processes are not counted as observed execs; object hits/misses use raw server statistics",
         "cost_boundary": "API job/step times include setup, restore/save and upload; phase wall/CPU/RSS retain their own boundaries"}))
     levels = []
@@ -1597,6 +1606,15 @@ def self_check():
         "cache_hits": {"counts": {"Rust": 3}, "adv_counts": {"rust": 3}},
         "cache_misses": {"counts": {}, "adv_counts": {}}, "cache_errors": {"counts": {}, "adv_counts": {}}}}})
     assert counters["hits"] == 3 and counters["misses"] == counters["errors"] == 0, "Detailed counters were counted twice"
+    before = {"status": "available", "raw": {"cache_size": None, "stats": {
+        name: {"counts": {}} for name in ("cache_hits", "cache_misses", "cache_errors")}}}
+    after = {"status": "available", "raw": {"cache_size": 1024, "stats": {
+        "cache_hits": {"counts": {"Rust": 3}, "adv_counts": {"rust": 3}},
+        "cache_misses": {"counts": {"Rust": 2}}, "cache_errors": {"counts": {}}}}}
+    assert counter_delta(before, after) == {"status": "available", "values": {"hits": 3, "misses": 2, "errors": 0}}
+    assert before["raw"]["cache_size"] is None and after["raw"]["cache_size"] == 1024
+    for missing in (None, {"status": "unavailable"}):
+        assert counter_delta(missing, after)["status"] == counter_delta(before, missing)["status"] == "unavailable"
     settled = runpy.run_path(str(root() / "fixtures/review-before-send/driver.py"))["turns_settled"]
     no_mods = [{"event": "ready", "detail": {"mod_count": 0, "plan": {"mods": {}}}}]
     assert settled(no_mods) and not settled([])
@@ -1715,13 +1733,14 @@ def self_check():
         assert {item for item in combinations if actual[item] != baseline[item]} == {("A", "mod-change")}
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", "collect")):
         assert all(method_fingerprint(*item, environment)["sha256"] == baseline[item] for item in combinations), "Report formatting invalidated a native measurement"
-    for name in ("cache_save_plan", "repair_cargo_seed"):
+    for name in ("cache_save_plan", "repair_cargo_seed", "counter_delta"):
         with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", name)):
             assert all(method_fingerprint(*item, environment)["sha256"] == baseline[item] for item in combinations), "Cache-only repair invalidated a native measurement"
     frozen_baseline = {"role": "H", "sample_id": "fixed-original", "package_sha256": "a" * 64, "executable_sha256": "b" * 64}
     frozen_method = frozen_fingerprint(frozen_baseline)
-    with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", "collect")):
-        assert frozen_fingerprint(frozen_baseline) == frozen_method, "Report formatting invalidated an unchanged package observation"
+    for name in ("collect", "counter_delta"):
+        with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", name)):
+            assert frozen_fingerprint(frozen_baseline) == frozen_method, "Report formatting invalidated an unchanged package observation"
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", "inventory")):
         assert frozen_fingerprint(frozen_baseline) != frozen_method, "Changed package hashing was omitted"
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/linux_ci.py", "execute")):
@@ -1741,7 +1760,7 @@ def self_check():
         assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Report formatting invalidated a runtime measurement"
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/worker_policy.py", "benchmark_capacity")):
         assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Author cache capacity invalidated a runtime measurement"
-    for name in ("cache_save_plan", "repair_cargo_seed"):
+    for name in ("cache_save_plan", "repair_cargo_seed", "counter_delta"):
         with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", name)):
             assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Cache-only repair invalidated a runtime measurement"
     runtime_consumer.benchmark_tui_binding_self_check()
@@ -1770,7 +1789,8 @@ def self_check():
             "digest-verified fixture state identity relocation", "fresh checkpoint parent before samples",
             "owner-confirmed free cache capacity and usage-only guard", "compiler identity outside its source checkout",
             "exact tracked publication inputs before native work", "actual pending cache bytes within the confirmed total ceiling",
-            "download-only repair of a verified reused H seed", "cache-only repair preserves author and runtime measurements"]})
+            "download-only repair of a verified reused H seed", "cache-only repair preserves author and runtime measurements",
+            "report counter deltas preserve unknown raw gauges without invalidating measurements"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
