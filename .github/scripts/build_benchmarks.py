@@ -1018,7 +1018,7 @@ def consume_runtime():
                 assert result.returncode == 0, "Frozen signature verification failed"
             audits[label]["driver_return_code"] = result.returncode
             assert not hits and runtime.inventory(isolated) == closure["files"]
-        assert all(row["driver_return_code"] == 0 for row in audits.values()), "Benchmark block failed; completed samples are retained"
+            assert result.returncode == 0, "Benchmark block failed; completed samples are retained before starting another block"
         write(logs / "runtime-audit.json", {"status": "pass", "origin": origin(), "steps": list(audits),
             "isolation": "fresh", "canary_hits": hits, "compiler_linker_jit_build_service_calls": 0,
             "toolchain_present": False, "cache_mode": "none", "manifest_sha256": closure["sha256"]})
