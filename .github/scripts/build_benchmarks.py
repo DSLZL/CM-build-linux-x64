@@ -1419,6 +1419,7 @@ def self_check():
     import worker_policy
     import runtime_consumer
     import linux_ci
+    import host
     from types import SimpleNamespace
     os.environ.setdefault("CM_SOURCE_DIR", os.environ["GITHUB_WORKSPACE"])
     assert len(STAGES) * len(ROLES) * len(config()["repetitions"]) == 36
@@ -1426,6 +1427,14 @@ def self_check():
     assert len(states) == 10 and len(states) * 3 == 30
     assert len({state["id"] for state in states}) == 10
     source = root().resolve()
+    published = host.cm_manifest(source)
+    with patch.object(host, "git", return_value="\n".join(row["path"] for row in published) + "\nunregistered.rs"):
+        try:
+            host.cm_manifest(source)
+        except RuntimeError as error:
+            assert "Host input list must cover exactly" in str(error)
+        else:
+            raise AssertionError("Unregistered publication inputs reached native preparation")
     expected_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
     check_output = subprocess.check_output
     def identity_command(arguments, **kwargs):
@@ -1638,7 +1647,8 @@ def self_check():
             "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
             "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier",
             "digest-verified fixture state identity relocation", "fresh checkpoint parent before samples",
-            "owner-confirmed free cache capacity and usage-only guard", "compiler identity outside its source checkout"]})
+            "owner-confirmed free cache capacity and usage-only guard", "compiler identity outside its source checkout",
+            "exact tracked publication inputs before native work"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
