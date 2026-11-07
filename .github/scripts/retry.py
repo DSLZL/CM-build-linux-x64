@@ -940,7 +940,8 @@ def native_key(closure, label):
     if phase == "s01":
         probes.extend(("fixture/s01-producer.json", "fixture/s01-bootstrap/identity.json"))
         probes.extend(entry["path"] for entry in closure["files"]
-            if entry["path"].startswith("fixture/s01-proofs/") and entry["path"] != "fixture/s01-proofs/authority.json")
+            if entry["path"].startswith("fixture/s01-proofs/") and entry["path"] != "fixture/s01-proofs/authority.json"
+            and not entry["path"].startswith("fixture/s01-proofs/index/"))
     if phase == "g06":
         mods, probes = runtime_cases.g06_native_dependencies(label.removeprefix("g06-"))
     if phase == "s02":
@@ -1478,6 +1479,20 @@ def native_self_check():
     changed = deepcopy(closure)
     changed["packages"]["libc6"] = "2"
     assert all(before[label] != native_key(changed, label) for label in labels)
+    labels = tuple("s01-" + case for case in runtime_cases.GROUPS["s01"])
+    paths = {
+        "fixture/s01-proofs/subjects/sdk-a.json": set(labels),
+        "fixture/s01-proofs/bundle.jsonl": set(labels),
+        "fixture/s01-bootstrap/identity.json": set(labels),
+        "fixture/s01-proofs/index/catalog.json": set(),
+        "fixture/s01-proofs/index/archives/sdk-a.cmod": set(),
+    }
+    closure = {"packages": {"libc6": "1"}, "files": [{"path": path, "sha256": "before"} for path in paths]}
+    before = {label: native_key(closure, label) for label in labels}
+    for path, expected in paths.items():
+        changed = deepcopy(closure)
+        next(row for row in changed["files"] if row["path"] == path)["sha256"] = "after"
+        assert {label for label in labels if before[label] != native_key(changed, label)} == expected, path
     import runtime_consumer
     import runtime_sdk
     assert runtime_cases.ENTRY_INVALID == runtime_consumer.ENTRY_INVALID
