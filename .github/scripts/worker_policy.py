@@ -326,13 +326,14 @@ def preflight():
     print(json.dumps(record, indent=2))
 
 
-def benchmark_capacity(cache):
+def benchmark_capacity(cache, pending_bytes=None):
     result = {"status": "unavailable", "save_allowed": False, "billing_expansion": False, "deletion": False}
     try:
         limit = cache["repository_limit_bytes"]
-        free, reserve = cache["free_limit_bytes"], cache["max_new_bytes"]
+        free, planned = cache["free_limit_bytes"], cache["planned_new_bytes"]
+        reserve = planned if pending_bytes is None else pending_bytes
         assert cache["repository_limit_source"] == "owner-confirmed-free-tier", "Repository limit needs owner confirmation"
-        assert all(type(value) is int and value > 0 for value in (limit, free, reserve)), "Invalid cache byte limits"
+        assert all(type(value) is int and value > 0 for value in (limit, free, planned, reserve)), "Invalid cache byte limits"
         maximum = min(limit, free)
         usage = api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/cache/usage")
         used = usage["active_caches_size_in_bytes"]

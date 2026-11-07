@@ -515,17 +515,28 @@ def cache_save_plan(role):
         assert os.environ["CM_CACHE_MODE"] == os.environ["ACTIONS_CACHE_MODE"] == "write"
         assert os.environ["CM_BENCHMARK_STAGE"] == "cold" and os.environ["CM_BENCHMARK_REPETITION"] == "1"
         sample = read(logs / "sample.json")
-        assert sample["status"] == "pass" and not sample["measurement_reused"]
+        assert sample["status"] == "pass"
+        if sample["measurement_reused"]:
+            prepared = read(logs / "prepared.json")
+            repair = read(logs / "cargo-seed-preparation.json")
+            assert role == "H" and repair["status"] == "pass" and repair["origin"] == origin()
+            assert repair["keys"] == prepared["keys"] and repair["environment"] == prepared["environment"]
+            assert repair["sample_id"] == sample["sample_id"] and repair["execution_origin"] == sample["execution_origin"]
+            assert sample["fingerprint"] == prepared["fingerprint"] and not paths(role)["CARGO_TARGET_DIR"].exists()
         cache = config()["cache"]
-        capacity = policy.benchmark_capacity(cache)
-        assert capacity["save_allowed"], capacity.get("reason")
         directories = [paths(role)["CARGO_HOME"] / part for part in ("registry/index", "registry/cache", "git/db")]
         if role != "H":
             directories.append(paths(role)["SCCACHE_DIR"])
         size = sum(path.stat().st_size for directory in directories for path in directory.rglob("*") if path.is_file())
         previous = Path(os.environ["RUNNER_TEMP"]) / "cm-s04-new-cache-budget.json"
         used = read(previous)["reserved_uncompressed_bytes"] if previous.exists() else 0
-        assert size > 0 and used + size + cache["canary_reserve_bytes"] <= cache["max_new_bytes"], "New cache budget insufficient"
+        assert size > 0 and type(used) is int and used >= 0, "Invalid pending cache size"
+        pending = used + size + cache["canary_reserve_bytes"]
+        result.update(estimated_uncompressed_bytes=size, previous_reserved_uncompressed_bytes=used,
+            planning_reserve_bytes=cache["planned_new_bytes"], reserved_new_bytes=pending)
+        capacity = policy.benchmark_capacity(cache, pending_bytes=pending)
+        result["capacity"] = capacity
+        assert capacity["save_allowed"], capacity.get("reason")
         assert shutil.disk_usage(Path(os.environ["RUNNER_TEMP"])).free > size + cache["minimum_disk_reserve_bytes"], "Insufficient cache archive disk space"
         policy.verify_checkout()
         write(previous, {"reserved_uncompressed_bytes": used + size})
@@ -533,10 +544,11 @@ def cache_save_plan(role):
             billing_expansion=False, eviction_or_deletion=False)
         write(Path(os.environ["RUNNER_TEMP"]) / ("cm-s04-" + role + "-seed.json"), {
             "schema_version": 1, "role": role, "origin": origin(), "environment": read(logs / "prepared.json")["environment"],
-            "keys": read(logs / "prepared.json")["keys"], "sample_id": sample["sample_id"], "sample_status": "pass"})
+            "keys": read(logs / "prepared.json")["keys"], "sample_id": sample["sample_id"], "sample_status": "pass",
+            "sample_execution_origin": sample["execution_origin"]})
     except (AssertionError, RuntimeError, OSError, KeyError, urllib.error.HTTPError) as error:
         result["reason"] = str(error) or type(error).__name__
-        result["http_status"] = error.code if isinstance(error, urllib.error.HTTPError) else None
+        result["http_status"] = error.code if isinstance(error, urllib.error.HTTPError) else result.get("capacity", {}).get("http_status")
     write(logs / "cache-save-plan.json", result)
     output({"save_allowed": str(result["save"]).lower()})
     print(json.dumps(result), flush=True)
@@ -645,6 +657,35 @@ def reuse_author(role):
         sample.update(measurement_reused=True, report_origin=origin(), reuse_reason="same reachable method, native inputs and exact environment")
         write(logs / "sample.json", sample)
     output({"reused": str(bool(sample)).lower()})
+
+
+def repair_cargo_seed(role):
+    import worker_policy as policy
+    from linux_ci import load_config
+    assert role == "H" and os.environ["CM_BENCHMARK_STAGE"] == "cold" and os.environ["CM_BENCHMARK_REPETITION"] == "1"
+    assert os.environ["CM_CACHE_MODE"] == os.environ["ACTIONS_CACHE_MODE"] == "write"
+    policy.verify_checkout()
+    logs = Path(os.environ["CM_CI_LOG_DIR"])
+    prepared, sample = read(logs / "prepared.json"), read(logs / "sample.json")
+    assert sample["measurement_reused"] and sample["status"] == "pass" and sample["slot"] == "author/cold/1/H"
+    original = select_sample(prior_samples(), sample["slot"], prepared["fingerprint"])
+    assert original and original["sample_id"] == sample["sample_id"] and original["execution_origin"] == sample["execution_origin"]
+    assert sample["fingerprint"] == prepared["fingerprint"]
+    key = prepared["keys"]["cargo_key"]
+    records = policy.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/caches?key=" + key + "&per_page=100")["actions_caches"]
+    exact = [row for row in records if row["key"] == key and row["ref"] == "refs/heads/main"]
+    assert len(exact) <= 1 and (not exact or type(exact[0]["size_in_bytes"]) is int and exact[0]["size_in_bytes"] > 0), "Ambiguous or empty Cargo seed"
+    if exact:
+        output({"seed_prepared": "false"})
+        return
+    prepare_host()
+    cfg = load_config(root())
+    command(logs, "H-seed-locked-downloads", ["cargo", "fetch", "--locked", "--manifest-path", cfg["units"][0]["manifest"], "--target", TARGET], trace=True)
+    assert not paths(role)["CARGO_TARGET_DIR"].exists(), "Download-only seed repair created a linked target"
+    write(logs / "cargo-seed-preparation.json", {"status": "pass", "role": role, "origin": origin(),
+        "keys": prepared["keys"], "environment": prepared["environment"], "sample_id": sample["sample_id"],
+        "execution_origin": sample["execution_origin"], "linked_target_present": False})
+    output({"seed_prepared": "true"})
 
 
 def frozen_fingerprint(baseline):
@@ -1414,7 +1455,7 @@ def self_check():
     from copy import deepcopy
     import runpy
     import tempfile
-    from unittest.mock import patch
+    from unittest.mock import Mock, patch
     import runtime_cases
     import worker_policy
     import runtime_consumer
@@ -1453,8 +1494,8 @@ def self_check():
     cache = config()["cache"]
     assert cache["repository_limit_bytes"] == cache["free_limit_bytes"] == 10 ** 10
     with patch.dict(os.environ, {"GITHUB_REPOSITORY": "DSLZL/CM-build-linux-x64"}):
-        for used, allowed in ((8836306629, True), (10 ** 10 - cache["max_new_bytes"], True),
-                              (10 ** 10 - cache["max_new_bytes"] + 1, False)):
+        for used, allowed in ((8836306629, True), (10 ** 10 - cache["planned_new_bytes"], True),
+                              (10 ** 10 - cache["planned_new_bytes"] + 1, False)):
             with patch.object(worker_policy, "api", return_value={"active_caches_size_in_bytes": used}) as fetch:
                 capacity = worker_policy.benchmark_capacity(cache)
                 fetch.assert_called_once_with("repos/DSLZL/CM-build-linux-x64/actions/cache/usage")
@@ -1464,7 +1505,7 @@ def self_check():
         for invalid in ({key: value for key, value in cache.items() if key != "repository_limit_bytes"},
                         {**cache, "repository_limit_source": "assumed-default"},
                         {**cache, "repository_limit_bytes": True}, {**cache, "free_limit_bytes": -1},
-                        {**cache, "max_new_bytes": "unknown"}):
+                        {**cache, "planned_new_bytes": "unknown"}):
             with patch.object(worker_policy, "api") as fetch:
                 capacity = worker_policy.benchmark_capacity(invalid)
                 assert capacity["status"] == "unavailable" and not capacity["save_allowed"]
@@ -1476,6 +1517,75 @@ def self_check():
         with patch.object(worker_policy, "api", side_effect=urllib.error.HTTPError("https://api.github.com/usage", 503, "unavailable", {}, None)):
             capacity = worker_policy.benchmark_capacity(cache)
             assert not capacity["save_allowed"] and capacity["http_status"] == 503
+        pending = 2 * cache["planned_new_bytes"]
+        for used, allowed in ((10 ** 10 - pending, True), (10 ** 10 - pending + 1, False)):
+            with patch.object(worker_policy, "api", return_value={"active_caches_size_in_bytes": used}):
+                capacity = worker_policy.benchmark_capacity(cache, pending_bytes=pending)
+                assert capacity["save_allowed"] is allowed and capacity["reserved_new_bytes"] == pending
+        for pending in (0, -1, True, "unknown"):
+            with patch.object(worker_policy, "api") as fetch:
+                assert not worker_policy.benchmark_capacity(cache, pending_bytes=pending)["save_allowed"]
+                fetch.assert_not_called()
+    with tempfile.TemporaryDirectory() as temporary:
+        logs = Path(temporary) / "logs"
+        current = {"run_id": 2, "source_sha": "b" * 40}
+        prepared = {"keys": {"cargo_key": "exact-H-seed"}, "environment": {"compiler": "fixed"}, "fingerprint": {"sha256": "a" * 64}}
+        original = {"slot": "author/cold/1/H", "sample_id": "original-pass", "status": "pass", "fingerprint": prepared["fingerprint"],
+            "execution_origin": {"run_id": 1}, "elapsed_seconds": 123, "measurement_reused": False}
+        write(logs / "prepared.json", prepared)
+        write(logs / "sample.json", {**original, "measurement_reused": True, "report_origin": current})
+        sample_bytes = (logs / "sample.json").read_bytes()
+        mocks = {"origin": Mock(return_value=current), "prior_samples": Mock(return_value=[original]),
+            "prepare_host": Mock(), "command": Mock(), "output": Mock()}
+        with patch.dict(os.environ, {"RUNNER_TEMP": temporary, "CM_CI_LOG_DIR": str(logs), "GITHUB_REPOSITORY": "worker/repo",
+                "CM_BENCHMARK_STAGE": "cold", "CM_BENCHMARK_REPETITION": "1", "CM_CACHE_MODE": "write", "ACTIONS_CACHE_MODE": "write"}), \
+                patch.dict(globals(), mocks), patch.object(worker_policy, "verify_checkout"), \
+                patch.object(worker_policy, "api") as fetch, patch.object(linux_ci, "load_config", return_value={"units": [{"manifest": "locked/Cargo.toml"}]}):
+            fetch.return_value = {"actions_caches": [{"key": "exact-H-seed", "ref": "refs/heads/main", "size_in_bytes": 1}]}
+            repair_cargo_seed("H")
+            mocks["prepare_host"].assert_not_called()
+            mocks["command"].assert_not_called()
+            mocks["output"].assert_called_once_with({"seed_prepared": "false"})
+            fetch.return_value = {"actions_caches": []}
+            repair_cargo_seed("H")
+            mocks["prepare_host"].assert_called_once_with()
+            mocks["command"].assert_called_once_with(logs, "H-seed-locked-downloads",
+                ["cargo", "fetch", "--locked", "--manifest-path", "locked/Cargo.toml", "--target", TARGET], trace=True)
+            repair = read(logs / "cargo-seed-preparation.json")
+            assert repair["sample_id"] == original["sample_id"] and repair["execution_origin"] == original["execution_origin"]
+            assert (logs / "sample.json").read_bytes() == sample_bytes and not paths("H")["CARGO_TARGET_DIR"].exists()
+            mocks["prepare_host"].reset_mock()
+            mocks["command"].reset_mock()
+            for rejected in ({**original, "status": "failed"}, {**original, "fingerprint": {"sha256": "c" * 64}},
+                             {**original, "execution_origin": {"run_id": 99}}):
+                mocks["prior_samples"].return_value = [rejected]
+                try:
+                    repair_cargo_seed("H")
+                except AssertionError:
+                    pass
+                else:
+                    raise AssertionError("Cargo seed repair accepted an unverified original measurement")
+            mocks["prepare_host"].assert_not_called()
+            mocks["command"].assert_not_called()
+            assert (logs / "sample.json").read_bytes() == sample_bytes
+            tiny = {**config(), "cache": {**cache, "planned_new_bytes": 8, "canary_reserve_bytes": 1, "minimum_disk_reserve_bytes": 0}}
+            cargo = paths("H")["CARGO_HOME"] / "registry/cache/locked.crate"
+            cargo.parent.mkdir(parents=True)
+            cargo.write_bytes(b"0123456789abcdef")
+            budget = Path(temporary) / "cm-s04-new-cache-budget.json"
+            with patch.dict(globals(), {"config": Mock(return_value=tiny)}):
+                for usage, allowed in ((10 ** 10 - 20, True), (10 ** 10 - 19, False)):
+                    write(budget, {"reserved_uncompressed_bytes": 3})
+                    fetch.return_value = {"active_caches_size_in_bytes": usage}
+                    cache_save_plan("H")
+                    plan = read(logs / "cache-save-plan.json")
+                    assert plan["save"] is allowed and plan["estimated_uncompressed_bytes"] == 16 and plan["reserved_new_bytes"] == 20
+                (logs / "cargo-seed-preparation.json").unlink()
+                fetch.reset_mock()
+                cache_save_plan("H")
+                assert not read(logs / "cache-save-plan.json")["save"]
+                fetch.assert_not_called()
+            assert (logs / "sample.json").read_bytes() == sample_bytes
     assert distribution([1, 2, 3])["median"] == 2
     assert distribution([])["status"] == "unavailable"
     counters = cache_counts({"status": "available", "raw": {"stats": {
@@ -1600,6 +1710,9 @@ def self_check():
         assert {item for item in combinations if actual[item] != baseline[item]} == {("A", "mod-change")}
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", "collect")):
         assert all(method_fingerprint(*item, environment)["sha256"] == baseline[item] for item in combinations), "Report formatting invalidated a native measurement"
+    for name in ("cache_save_plan", "repair_cargo_seed"):
+        with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", name)):
+            assert all(method_fingerprint(*item, environment)["sha256"] == baseline[item] for item in combinations), "Cache-only repair invalidated a native measurement"
     frozen_baseline = {"role": "H", "sample_id": "fixed-original", "package_sha256": "a" * 64, "executable_sha256": "b" * 64}
     frozen_method = frozen_fingerprint(frozen_baseline)
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", "collect")):
@@ -1623,6 +1736,9 @@ def self_check():
         assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Report formatting invalidated a runtime measurement"
     with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/worker_policy.py", "benchmark_capacity")):
         assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Author cache capacity invalidated a runtime measurement"
+    for name in ("cache_save_plan", "repair_cargo_seed"):
+        with patch.object(runtime_cases, "closure", side_effect=changed("ci/scripts/build_benchmarks.py", name)):
+            assert all(runtime_method(state, native)["sha256"] == methods[state["id"]] for state in states), "Cache-only repair invalidated a runtime measurement"
     runtime_consumer.benchmark_tui_binding_self_check()
     command = ["/inputs/host/bin/codex", "cm", "--home", "/profile/s04/block-1", "launch", "--"]
     record = {"command": command, "tui": True, "empty_launch_argv": True, "identity": {"pid": 7,
@@ -1648,7 +1764,8 @@ def self_check():
             "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier",
             "digest-verified fixture state identity relocation", "fresh checkpoint parent before samples",
             "owner-confirmed free cache capacity and usage-only guard", "compiler identity outside its source checkout",
-            "exact tracked publication inputs before native work"]})
+            "exact tracked publication inputs before native work", "actual pending cache bytes within the confirmed total ceiling",
+            "download-only repair of a verified reused H seed", "cache-only repair preserves author and runtime measurements"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
@@ -1677,7 +1794,8 @@ def main():
     thread.start()
     try:
         roles = {"prepare-role": prepare_role, "author": author_sample, "save-plan": cache_save_plan,
-            "verify-seed": verify_seed, "bind-product": bind_product, "reuse-author": reuse_author, "freeze": freeze_sample, "clean-role": clean_role}
+            "verify-seed": verify_seed, "bind-product": bind_product, "reuse-author": reuse_author, "repair-cargo-seed": repair_cargo_seed,
+            "freeze": freeze_sample, "clean-role": clean_role}
         commands = {"prepare-host": prepare_host, "runtime-prepare": prepare_runtime, "runtime-consume": consume_runtime,
             "canaries": cache_canaries, "author-finish": finish_author_job, "trust-prepare": trust_prepare,
             "trust-clear": trust_clear, "trust-finish": trust_finish, "collect": collect}

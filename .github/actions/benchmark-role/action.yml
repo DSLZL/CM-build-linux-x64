@@ -58,9 +58,14 @@ runs:
         CM_CARGO_CACHE_HIT: ${{ steps.cargo.outputs.cache-hit }}
         CM_COMPILER_CACHE_HIT: ${{ steps.compiler.outputs.cache-hit }}
       run: python3 -B "$CM_BENCHMARK_PROGRAM" author '${{ inputs.role }}'
-    - name: ${{ inputs.role }} / recheck live capacity before creating one small seed
+    - name: H / repair missing Cargo downloads from a verified cold pass
+      id: repair
+      if: inputs.role == 'H' && env.CM_BENCHMARK_STAGE == 'cold' && env.CM_BENCHMARK_REPETITION == '1' && steps.reuse.outputs.reused == 'true'
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" repair-cargo-seed '${{ inputs.role }}'
+    - name: ${{ inputs.role }} / recheck live capacity using actual pending seed bytes
       id: save
-      if: env.CM_BENCHMARK_STAGE == 'cold' && env.CM_BENCHMARK_REPETITION == '1' && steps.reuse.outputs.reused != 'true'
+      if: env.CM_BENCHMARK_STAGE == 'cold' && env.CM_BENCHMARK_REPETITION == '1' && (steps.reuse.outputs.reused != 'true' || steps.repair.outputs.seed_prepared == 'true')
       shell: bash
       run: python3 -B "$CM_BENCHMARK_PROGRAM" save-plan '${{ inputs.role }}'
     - name: ${{ inputs.role }} / save bounded Cargo downloads once
