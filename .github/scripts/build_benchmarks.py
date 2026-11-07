@@ -1417,6 +1417,7 @@ def self_check():
     import ast
     from copy import deepcopy
     import runpy
+    import tempfile
     from unittest.mock import patch
     import runtime_cases
     import worker_policy
@@ -1437,6 +1438,47 @@ def self_check():
     assert settled(no_mods) and not settled([])
     assert not settled([*no_mods, {"event": "runtime-request-released"}]), "A no-Mod plan accepted native callbacks"
     assert not settled([{"event": "ready", "detail": {"mod_count": 1, "plan": {"mods": {"mod": {}}}}}])
+    relocate = runpy.run_path(str(root() / "fixtures/build-benchmarks/driver.py"))["relocate_profile_identity"]
+    with tempfile.TemporaryDirectory() as temporary:
+        home = Path(temporary)
+        namespace = home / "state/cm-files-v1"
+        namespace.mkdir(parents=True, mode=0o700)
+        home.chmod(0o700)
+        lease = namespace / ".lease"
+        lease.touch(mode=0o600)
+        identity_path = namespace / "identity.json"
+        identity = {"schema_version": 1, "domain": "cm.state-home.v1", "home_id": "a" * 64,
+            **{kind + "_" + field: 0 for kind in ("home", "state", "lease") for field in ("device", "inode")}}
+        encoded = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        identity_path.write_bytes(encoded(identity))
+        identity_path.chmod(0o600)
+        retained = namespace / "retained.txt"
+        retained.write_bytes(b"preserve user data")
+        changed_identity = relocate(home)
+        assert changed_identity["before"] == identity
+        for kind, path in (("home", home), ("state", namespace), ("lease", lease)):
+            info = path.stat()
+            assert changed_identity["after"][kind + "_device"] == info.st_dev
+            assert changed_identity["after"][kind + "_inode"] == info.st_ino
+        assert changed_identity["after"]["home_id"] == identity["home_id"] and retained.read_bytes() == b"preserve user data"
+        assert relocate(home)["before_sha256"] == changed_identity["after_sha256"]
+        for poisoned in ({**identity, "domain": "other"}, {**identity, "home_id": "unknown"},
+                         {**identity, "lease_inode": True}, {**identity, "extra": 1}):
+            identity_path.write_bytes(encoded(poisoned))
+            try:
+                relocate(home)
+            except AssertionError:
+                assert identity_path.read_bytes() == encoded(poisoned)
+            else:
+                raise AssertionError("An unregistered state identity was relocated")
+        identity_path.write_bytes(encoded(identity))
+        lease.chmod(0o644)
+        try:
+            relocate(home)
+        except AssertionError:
+            assert identity_path.read_bytes() == encoded(identity)
+        else:
+            raise AssertionError("An unsafe state lease was relocated")
     qualified = {"source_sha": "a" * 40, "workflow_sha": "b" * 40, "run_id": 20, "run_attempt": 1, "request_id": "fixture"}
     provenance = {"CM_SOURCE_REPOSITORY": "source/repo", "CM_SOURCE_SHA": qualified["source_sha"],
         "GITHUB_REPOSITORY": "worker/repo", "GITHUB_WORKFLOW_SHA": qualified["workflow_sha"],
@@ -1543,7 +1585,8 @@ def self_check():
         "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
         "job": os.environ["GITHUB_JOB"], "checks": ["66 unique slots", "exact original sample reuse", "target and case dependency invalidation",
             "formatter independence", "imported builder dependencies", "unchanged default dependency routing", "unknown origin rejection", "PID/profile/hash binding",
-            "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier"]})
+            "exact S03 post-consumer qualification", "aggregate cache counters counted once", "no-Mod callback barrier",
+            "digest-verified fixture state identity relocation"]})
     print("CM-S04 self-check: 66 slots, exact reuse, target/case invalidation, formatter independence, unknown origins and PID/profile/hash binding passed", flush=True)
 
 
