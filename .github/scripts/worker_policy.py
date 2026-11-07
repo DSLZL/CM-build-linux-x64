@@ -326,6 +326,61 @@ def preflight():
     print(json.dumps(record, indent=2))
 
 
+def benchmark_preflight():
+    preflight()
+    source, worker, sha, workflow_sha, _ = identities()
+    record_path = Path(os.environ["RUNNER_TEMP"], "cm-worker-preflight.json")
+    record = json.loads(record_path.read_text())
+    assert record["cache_mode"] == "write", "Measurements require the current reviewed source default SHA"
+    definition = json.loads(base64.b64decode(api("repos/" + source + "/contents/ci/benchmarks/scenarios.json?ref=" + sha)["content"]))
+    assert definition["task_id"] == "CM-S04" and definition["required_checks"] == ["CM-S04-AC0" + str(i) for i in range(1, 7)]
+    number = checked(os.environ.get("CM_BENCHMARK_PR_NUMBER"), r"[1-9][0-9]*", "real source PR number")
+    pull = api("repos/" + source + "/pulls/" + number)
+    assert pull["state"] == "open" and pull["base"]["repo"]["full_name"] == source
+    assert pull["head"]["repo"]["full_name"] == source and pull["head"]["sha"] != sha
+    assert pull["base"]["ref"] == record["source_default_branch"] and pull["head"]["ref"] != pull["base"]["ref"]
+    pr_sha = checked(pull["head"]["sha"], r"[0-9a-f]{40}", "actual PR head SHA")
+    runtime = json.loads(base64.b64decode(api("repos/" + source + "/contents/ci/benchmarks/runtime-loading.json?ref=" + sha)["content"]))
+    qualified = parse_origin(runtime["qualification"]["origin"])
+    verify_origin(qualified, source, worker, workflow_sha)
+    record.update(task_id="CM-S04", pr_number=int(number), pr_sha=pr_sha, real_pr_url=pull["html_url"])
+    capacity = {"status": "unavailable", "save_allowed": False, "billing_expansion": False, "deletion": False}
+    try:
+        usage = api("repos/" + worker + "/actions/cache/usage")
+        limit = api("repos/" + worker + "/actions/cache/storage-limit")
+        maximum = min(limit["max_cache_size_gb"] * 1000 ** 3, definition["cache"]["free_limit_bytes"])
+        assert type(limit["max_cache_size_gb"]) is int and maximum > 0
+        allowed = usage["active_caches_size_in_bytes"] + definition["cache"]["max_new_bytes"] <= maximum
+        capacity.update(status="available", save_allowed=allowed, usage=usage, limit=limit,
+            reason=None if allowed else "Insufficient confirmed headroom; no eviction or paid expansion")
+    except (urllib.error.URLError, KeyError, AssertionError, TypeError) as error:
+        capacity.update(reason=str(error), http_status=error.code if isinstance(error, urllib.error.HTTPError) else None)
+    record["cache_capacity"] = capacity
+    seed = definition["host_seed"]
+    seed_status = {"status": "unavailable", "usable": False}
+    try:
+        assert seed["repository"] == worker and seed["save"] is False
+        assert seed["image_os"] == os.environ["ImageOS"] and seed["image_version"] == os.environ["ImageVersion"], "Pinned H seed runner image drifted"
+        rows = api("repos/" + worker + "/actions/caches?key=" + seed["key"] + "&per_page=100")["actions_caches"]
+        exact = [row for row in rows if row["key"] == seed["key"] and row["ref"] == "refs/heads/main"]
+        assert len(exact) == 1 and exact[0]["size_in_bytes"] > 0, "Exact H compiler seed is unavailable"
+        run_path = "repos/" + worker + "/actions/runs/" + str(seed["run_id"])
+        run = api(run_path)
+        assert run["head_sha"] == seed["worker_sha"] and run["event"] == "workflow_dispatch"
+        assert run["path"] == ".github/workflows/build.yml" and run["run_attempt"] == seed["run_attempt"]
+        jobs = api(run_path + "/attempts/" + str(seed["run_attempt"]) + "/jobs?per_page=100")["jobs"]
+        producer = successful_job(jobs, "build-write / linux-x64")
+        seed_status.update(status="available", usable=True, cache=exact[0], producer=producer)
+    except (urllib.error.URLError, KeyError, AssertionError, TypeError, RuntimeError) as error:
+        seed_status.update(reason=str(error) or type(error).__name__)
+    record["host_seed_preflight"] = seed_status
+    record["author_allowed"] = capacity["save_allowed"] and seed_status["usable"]
+    record_path.write_text(json.dumps(record, indent=2) + "\n")
+    output({"pr_sha": pr_sha, "pr_number": number, "capacity_allowed": str(capacity["save_allowed"]).lower(),
+        "author_allowed": str(record["author_allowed"]).lower()})
+    print(json.dumps(record, indent=2), flush=True)
+
+
 def verify_checkout():
     source, worker, sha, workflow_sha, request = identities()
     build_request()
@@ -863,7 +918,8 @@ def receipt():
 
 if __name__ == "__main__":
     try:
-        {"self-check": self_check, "preflight": preflight, "verify-checkout": verify_checkout, "verify-consumer": verify_consumer,
+        {"self-check": self_check, "preflight": preflight, "benchmark-preflight": benchmark_preflight,
+         "verify-checkout": verify_checkout, "verify-consumer": verify_consumer,
          "extract-consumer": extract_consumer, "restore-origin": restore_origin, "receipt": receipt}[sys.argv[1]]()
     except (RuntimeError, KeyError, IndexError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print("CM worker blocked/failed: " + str(exc), file=sys.stderr)

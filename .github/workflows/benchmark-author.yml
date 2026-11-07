@@ -1,0 +1,144 @@
+name: CM-S04 author measurements
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      request_id:
+        required: true
+        type: string
+      seed_id:
+        required: true
+        type: string
+      stage:
+        required: true
+        type: string
+      repetition:
+        required: true
+        type: number
+      reuse_run_id:
+        required: false
+        type: string
+permissions:
+  contents: read
+  actions: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  author:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
+      CM_SOURCE_REPOSITORY: DSLZL/CM
+      CM_BUILDER_REPOSITORY: DSLZL/CM-build-linux-x64
+      CM_SOURCE_SHA: ${{ inputs.source_sha }}
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_EXECUTION_ROLE: platform_builder
+      CM_CACHE_MODE: write
+      CM_CACHE_EPOCH: v1
+      CM_BENCHMARK_STAGE: ${{ inputs.stage }}
+      CM_BENCHMARK_REPETITION: ${{ inputs.repetition }}
+      CM_BENCHMARK_SEED_ID: ${{ inputs.seed_id }}
+      CM_BENCHMARK_REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+      CM_BENCHMARK_PROGRAM: ${{ github.workspace }}/.cm-worker/.github/scripts/build_benchmarks.py
+      CM_POLICY_TOKEN: ${{ github.token }}
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUSTUP_TOOLCHAIN: 1.95.0
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "false"
+      SCCACHE_CACHE_SIZE: 8G
+      SCCACHE_IDLE_TIMEOUT: "0"
+      SCCACHE_BASEDIRS: ${{ github.workspace }}/cm-source
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Checkout exact default-branch measurement source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DSLZL/CM
+          ref: ${{ inputs.source_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set measurement paths
+        run: |
+          {
+            echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-s04-job-evidence"
+            echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-s04-author-artifacts"
+          } >> "$GITHUB_ENV"
+      - name: Verify runner-injected write authority and current source trust
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Record exact source and worker identities
+        run: python3 -B .cm-worker/.github/scripts/record_run.py "$CM_CI_LOG_DIR"
+      - name: Check measurement dependency and identity guards before native work
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" self-check
+      - name: Install pinned author toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy --target x86_64-unknown-linux-gnu
+      - name: Prepare native author dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev libasound2-dev libssl-dev bubblewrap strace
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          df -h "$RUNNER_TEMP"
+      - name: Install pinned compiler cache without a remote compiler backend
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+          disable_annotations: true
+      - name: Stop installer server before per-role isolation
+        run: sccache --stop-server || true
+      - name: Fetch only cold baseline text receipts
+        if: inputs.stage != 'cold'
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: cm-s04-author-evidence-cold-1-*-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-cold-evidence
+      - name: H
+        continue-on-error: true
+        uses: ./.cm-worker/.github/actions/benchmark-role
+        with:
+          role: H
+      - name: A
+        continue-on-error: true
+        uses: ./.cm-worker/.github/actions/benchmark-role
+        with:
+          role: A
+      - name: B
+        continue-on-error: true
+        uses: ./.cm-worker/.github/actions/benchmark-role
+        with:
+          role: B
+      - name: C
+        continue-on-error: true
+        uses: ./.cm-worker/.github/actions/benchmark-role
+        with:
+          role: C
+      - name: Require all four independent sample results
+        if: always()
+        run: python3 -B "$CM_BENCHMARK_PROGRAM" author-finish
+      - name: Record final job identity and status
+        if: always()
+        env:
+          CM_CI_LOG_DIR: ${{ runner.temp }}/cm-s04-job-evidence
+          CM_JOB_STATUS: ${{ job.status }}
+        run: python3 -B .cm-worker/.github/scripts/record_run.py "$CM_CI_LOG_DIR"
+      - name: Retain current job status and timings
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-job-evidence-${{ inputs.stage }}-${{ inputs.repetition }}-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-job-evidence
+          if-no-files-found: warn
+          retention-days: 14

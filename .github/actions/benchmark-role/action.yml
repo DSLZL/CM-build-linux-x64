@@ -1,0 +1,112 @@
+name: Measure one independent author target
+description: Exact compiler/download seeds; no linked target restoration
+inputs:
+  role:
+    required: true
+    description: H, A, B or C
+runs:
+  using: composite
+  steps:
+    - name: ${{ inputs.role }} / prepare empty role directories
+      id: prepare
+      if: env.CM_BENCHMARK_STAGE != 'mod-change' || inputs.role == 'A'
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" prepare-role '${{ inputs.role }}'
+    - name: ${{ inputs.role }} / reuse only an exact successful measurement
+      id: reuse
+      if: env.CM_BENCHMARK_STAGE != 'mod-change' || inputs.role == 'A'
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" reuse-author '${{ inputs.role }}'
+    - name: ${{ inputs.role }} / bind unchanged original package without compilation
+      if: env.CM_BENCHMARK_STAGE == 'mod-change' && inputs.role != 'A'
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" freeze '${{ inputs.role }}'
+    - name: H / materialize source and native inputs after reuse decision
+      if: inputs.role == 'H' && env.CM_BENCHMARK_STAGE != 'mod-change' && steps.reuse.outputs.reused != 'true'
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" prepare-host
+    - name: ${{ inputs.role }} / restore exact Cargo downloads
+      id: cargo
+      if: (env.CM_BENCHMARK_STAGE == 'warm' || (env.CM_BENCHMARK_STAGE == 'mod-change' && inputs.role == 'A')) && steps.reuse.outputs.reused != 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ steps.prepare.outputs.cargo_home }}/registry/index
+          ${{ steps.prepare.outputs.cargo_home }}/registry/cache
+          ${{ steps.prepare.outputs.cargo_home }}/git/db
+          ${{ runner.temp }}/cm-s04-${{ inputs.role }}-seed.json
+        key: ${{ steps.prepare.outputs.cargo_key }}
+        fail-on-cache-miss: true
+        enableCrossOsArchive: false
+    - name: ${{ inputs.role }} / restore exact compiler objects
+      id: compiler
+      if: (env.CM_BENCHMARK_STAGE == 'warm' || (env.CM_BENCHMARK_STAGE == 'mod-change' && inputs.role == 'A')) && steps.reuse.outputs.reused != 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.prepare.outputs.sccache_dir }}
+        key: ${{ steps.prepare.outputs.compiler_key }}
+        fail-on-cache-miss: true
+        enableCrossOsArchive: false
+    - name: ${{ inputs.role }} / verify exact worker-owned seed provenance
+      if: (env.CM_BENCHMARK_STAGE == 'warm' || (env.CM_BENCHMARK_STAGE == 'mod-change' && inputs.role == 'A')) && steps.reuse.outputs.reused != 'true'
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" verify-seed '${{ inputs.role }}'
+    - name: ${{ inputs.role }} / measure actual fmt clippy test build and package
+      if: (env.CM_BENCHMARK_STAGE != 'mod-change' || inputs.role == 'A') && steps.reuse.outputs.reused != 'true'
+      shell: bash
+      env:
+        CM_CARGO_CACHE_HIT: ${{ steps.cargo.outputs.cache-hit }}
+        CM_COMPILER_CACHE_HIT: ${{ steps.compiler.outputs.cache-hit }}
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" author '${{ inputs.role }}'
+    - name: ${{ inputs.role }} / recheck live capacity before creating one small seed
+      id: save
+      if: env.CM_BENCHMARK_STAGE == 'cold' && env.CM_BENCHMARK_REPETITION == '1' && steps.reuse.outputs.reused != 'true'
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" save-plan '${{ inputs.role }}'
+    - name: ${{ inputs.role }} / save bounded Cargo downloads once
+      if: steps.save.outputs.save_allowed == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ steps.prepare.outputs.cargo_home }}/registry/index
+          ${{ steps.prepare.outputs.cargo_home }}/registry/cache
+          ${{ steps.prepare.outputs.cargo_home }}/git/db
+          ${{ runner.temp }}/cm-s04-${{ inputs.role }}-seed.json
+        key: ${{ steps.prepare.outputs.cargo_key }}
+        enableCrossOsArchive: false
+    - name: ${{ inputs.role }} / save bounded Mod compiler objects once
+      if: steps.save.outputs.save_allowed == 'true' && inputs.role != 'H'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.prepare.outputs.sccache_dir }}
+        key: ${{ steps.prepare.outputs.compiler_key }}
+        enableCrossOsArchive: false
+    - name: ${{ inputs.role }} / retain one original native package
+      id: product
+      if: env.CM_BENCHMARK_STAGE == 'cold' && env.CM_BENCHMARK_REPETITION == '1' && steps.reuse.outputs.reused != 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: cm-s04-product-${{ inputs.role }}-${{ env.CM_REQUEST_ID }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/cm-s04-products/${{ inputs.role }}.tar.gz
+        compression-level: 0
+        retention-days: 14
+        if-no-files-found: error
+    - name: ${{ inputs.role }} / bind package API identity to the original sample
+      if: steps.product.outputs.artifact-id != ''
+      shell: bash
+      env:
+        CM_BENCHMARK_PRODUCT_ID: ${{ steps.product.outputs.artifact-id }}
+        CM_BENCHMARK_PRODUCT_DIGEST: ${{ steps.product.outputs.artifact-digest }}
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" bind-product '${{ inputs.role }}'
+    - name: ${{ inputs.role }} / retain successful and failed measurement evidence
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: cm-s04-author-evidence-${{ env.CM_BENCHMARK_STAGE }}-${{ env.CM_BENCHMARK_REPETITION }}-${{ inputs.role }}-${{ env.CM_REQUEST_ID }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/cm-s04-evidence/${{ inputs.role }}
+        retention-days: 14
+        if-no-files-found: warn
+    - name: ${{ inputs.role }} / release measured temporary targets
+      if: always()
+      shell: bash
+      run: python3 -B "$CM_BENCHMARK_PROGRAM" clean-role '${{ inputs.role }}'

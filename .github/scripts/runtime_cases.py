@@ -263,14 +263,15 @@ def bindings(module):
     return result
 
 
-def closure(texts, entries, dispatch=None):
+def closure(texts, entries, dispatch=None, modules=None):
     return deepcopy(_closure(tuple(sorted(texts.items())), tuple(entries),
-        tuple(sorted((dispatch or {}).items()))))
+        tuple(sorted((dispatch or {}).items())), tuple(sorted((modules or {}).items()))))
 
 
 @lru_cache(maxsize=512)
-def _closure(texts, entries, dispatch):
+def _closure(texts, entries, dispatch, extra_modules):
     texts, dispatch = dict(texts), dict(dispatch)
+    module_paths = {**MODULES, **dict(extra_modules)}
     class Dispatch(ast.NodeTransformer):
         def __init__(self, function):
             self.function = function
@@ -302,7 +303,7 @@ def _closure(texts, entries, dispatch):
                     return path, expression.id
                 if isinstance(value, ast.Assign):
                     return target(value.value)
-                return MODULES.get(expression.id) or DYNAMIC.get(expression.id)
+                return module_paths.get(expression.id) or DYNAMIC.get(expression.id)
             if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name):
                 if expression.func.id == "sdk_module":
                     return DRIVERS["m02"]
@@ -344,20 +345,20 @@ def _closure(texts, entries, dispatch):
                 decorator_list=node.decorator_list, body=[item for item in node.body if not isinstance(item,
                     (ast.FunctionDef, ast.AsyncFunctionDef))])
         dependencies[path + ":" + name] = digest(ast.dump(node, include_attributes=False))
-        aliases = dict(MODULES)
+        aliases = dict(module_paths)
         aliases.update(DYNAMIC)
         for imported in [*modules[path].body, *ast.walk(node)]:
             if isinstance(imported, ast.Import):
                 for item in imported.names:
-                    target = MODULES.get(item.name)
+                    target = module_paths.get(item.name)
                     if target:
                         aliases[item.asname or item.name] = target
-            elif isinstance(imported, ast.ImportFrom) and imported.module in MODULES:
+            elif isinstance(imported, ast.ImportFrom) and imported.module in module_paths:
                 for item in imported.names:
                     if item.name == "*":
                         fallback(path, "wildcard import")
                     else:
-                        aliases[item.asname or item.name] = (MODULES[imported.module], item.name)
+                        aliases[item.asname or item.name] = (module_paths[imported.module], item.name)
         classes = {key: (path, key) for key, value in table.items() if isinstance(value, ast.ClassDef)}
         for variable in ("client", "test", "running", "restarted"):
             classes[variable] = (DRIVERS["m02"], "Client")
@@ -394,7 +395,7 @@ def _closure(texts, entries, dispatch):
                     if isinstance(member, (ast.Import, ast.ImportFrom)):
                         for item in member.names:
                             if (item.asname or item.name) == expression.attr:
-                                return MODULES.get(item.name)
+                                return module_paths.get(item.name)
                     if isinstance(member, ast.ClassDef):
                         return (target, expression.attr)
                 if isinstance(target, tuple):

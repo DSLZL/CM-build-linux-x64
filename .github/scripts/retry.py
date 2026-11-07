@@ -265,7 +265,9 @@ def product_inputs(root, revision):
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
                       "ci/scripts/runtime_cases.py", "ci/scripts/acceptance_cache.py",
                       ".github/cm-build-routing.json", *SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES,
-                      "fixtures/compatibility-policy/acceptance.sh", "fixtures/binary-index/acceptance.sh"}
+                      "fixtures/compatibility-policy/acceptance.sh", "fixtures/binary-index/acceptance.sh",
+                      "ci/scripts/build_benchmarks.py", "ci/benchmarks/scenarios.json",
+                      "ci/benchmarks/runtime-loading.json", "fixtures/build-benchmarks/acceptance.sh"}
     for row in filter(None, tree):
         metadata, name = row.split(b"\t", 1)
         path = name.decode()

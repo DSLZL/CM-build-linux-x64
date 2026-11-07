@@ -1,0 +1,451 @@
+# Install in DSLZL/CM-build-linux-x64; the ordinary build workflow stays separate.
+name: CM-S04 build and runtime benchmarks
+run-name: CM-S04 / ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact reviewed CM default-branch source SHA
+        required: true
+        type: string
+      request_id:
+        description: Unique campaign ID, at most 80 letters digits dots underscores or hyphens
+        required: true
+        type: string
+      pr_number:
+        description: Actual open CM PR for the read-authority probe; its code is never executed
+        required: true
+        type: string
+      seed_id:
+        description: Optional explicit seed namespace; defaults to request_id
+        required: false
+        type: string
+      reuse_run_id:
+        description: Completed benchmark run whose successful original samples may be reused
+        required: false
+        type: string
+permissions:
+  contents: read
+  actions: read
+cache-mode: none
+concurrency:
+  group: cm-s04-benchmark-capacity
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
+  CM_SOURCE_REPOSITORY: DSLZL/CM
+  CM_BUILDER_REPOSITORY: DSLZL/CM-build-linux-x64
+  CM_SOURCE_SHA: ${{ inputs.source_sha }}
+  CM_REQUEST_ID: ${{ inputs.request_id }}
+  CM_BENCHMARK_SEED_ID: ${{ inputs.seed_id || inputs.request_id }}
+  CM_BENCHMARK_REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+  CM_BENCHMARK_PR_NUMBER: ${{ inputs.pr_number }}
+  CM_BENCHMARK_MEASUREMENT_SHA: ${{ inputs.source_sha }}
+  CM_BENCHMARK_PROGRAM: ${{ github.workspace }}/.cm-worker/.github/scripts/build_benchmarks.py
+  CM_POLICY_TOKEN: ${{ github.token }}
+  PYTHONDONTWRITEBYTECODE: "1"
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    cache-mode: none
+    env:
+      CM_CACHE_MODE: none
+    outputs:
+      pr_sha: ${{ steps.policy.outputs.pr_sha }}
+      capacity_allowed: ${{ steps.policy.outputs.capacity_allowed }}
+      author_allowed: ${{ steps.policy.outputs.author_allowed }}
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Set evidence path
+        run: echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-s04-preflight-evidence" >> "$GITHUB_ENV"
+      - name: Verify runner-injected cache authority
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Verify actual source worker PR and frozen qualification authority
+        id: policy
+        run: |
+          /usr/bin/python3 -B .cm-worker/.github/scripts/worker_policy.py self-check
+          /usr/bin/python3 -B .cm-worker/.github/scripts/worker_policy.py benchmark-preflight
+      - name: Retain preflight evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-preflight-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-worker-preflight.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  cold:
+    needs: preflight
+    if: needs.preflight.outputs.author_allowed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        repetition: [1, 2, 3]
+    cache-mode: write
+    uses: ./.github/workflows/benchmark-author.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      request_id: ${{ inputs.request_id }}
+      seed_id: ${{ inputs.seed_id || inputs.request_id }}
+      reuse_run_id: ${{ inputs.reuse_run_id }}
+      stage: cold
+      repetition: ${{ matrix.repetition }}
+
+  warm:
+    needs: [preflight, cold]
+    if: needs.preflight.outputs.author_allowed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        repetition: [1, 2, 3]
+    cache-mode: write
+    uses: ./.github/workflows/benchmark-author.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      request_id: ${{ inputs.request_id }}
+      seed_id: ${{ inputs.seed_id || inputs.request_id }}
+      reuse_run_id: ${{ inputs.reuse_run_id }}
+      stage: warm
+      repetition: ${{ matrix.repetition }}
+
+  mod-change:
+    needs: [preflight, warm]
+    if: needs.preflight.outputs.author_allowed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        repetition: [1, 2, 3]
+    cache-mode: write
+    uses: ./.github/workflows/benchmark-author.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      request_id: ${{ inputs.request_id }}
+      seed_id: ${{ inputs.seed_id || inputs.request_id }}
+      reuse_run_id: ${{ inputs.reuse_run_id }}
+      stage: mod-change
+      repetition: ${{ matrix.repetition }}
+
+  cache-canaries:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    cache-mode: none
+    env:
+      CM_CACHE_MODE: none
+      CM_EXECUTION_ROLE: platform_builder
+      RUSTUP_TOOLCHAIN: 1.95.0
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "false"
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Checkout exact requested CM revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DSLZL/CM
+          ref: ${{ inputs.source_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set evidence path
+        run: echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-s04-canary-evidence" >> "$GITHUB_ENV"
+      - name: Verify runner-injected cache authority
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Record exact source and worker identities
+        run: /usr/bin/python3 -B .cm-worker/.github/scripts/record_run.py "$CM_CI_LOG_DIR"
+      - name: Check exact sample dependencies and unknown-origin rejection
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" self-check
+      - name: Install primary tiny-canary compiler
+        run: rustup toolchain install 1.95.0 --profile minimal --target x86_64-unknown-linux-gnu
+      - name: Install syscall observer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends strace
+      - name: Install pinned compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+          disable_annotations: true
+      - name: Stop installer server before isolated canaries
+        run: sccache --stop-server || true
+      - name: Measure actual input invalidation unchanged dependencies and corrupt objects
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" canaries
+      - name: Retain canary evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-canary-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-canary-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  trust-write:
+    needs: preflight
+    if: needs.preflight.outputs.capacity_allowed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    cache-mode: write
+    env:
+      CM_CACHE_MODE: write
+      CM_EXECUTION_ROLE: platform_builder
+      CM_BENCHMARK_TRUST_ROLE: write
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Checkout exact requested CM revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DSLZL/CM
+          ref: ${{ inputs.source_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set evidence path
+        run: echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-s04-trust-write-evidence" >> "$GITHUB_ENV"
+      - name: Verify runner-injected cache authority
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Recheck actual capacity and prepare a tiny trusted seed
+        id: prepare
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" trust-prepare
+      - name: Actually save the bounded default-branch trust seed
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.prepare.outputs.trust_path }}
+          key: ${{ steps.prepare.outputs.trust_key }}
+          enableCrossOsArchive: false
+      - name: Clear the source fixture before restoring
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" trust-clear
+      - name: Actually restore the exact trusted seed
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.prepare.outputs.trust_path }}
+          key: ${{ steps.prepare.outputs.trust_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: false
+      - name: Observe a clean server-side miss
+        id: miss
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.prepare.outputs.trust_path }}
+          key: ${{ steps.prepare.outputs.trust_key }}-missing
+          lookup-only: true
+          enableCrossOsArchive: false
+      - name: Observe an actual isolated cache-service transport failure
+        id: service
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        env:
+          ACTIONS_RESULTS_URL: http://127.0.0.1:9/
+          ACTIONS_CACHE_URL: http://127.0.0.1:9/
+        with:
+          path: ${{ steps.prepare.outputs.trust_path }}
+          key: ${{ steps.prepare.outputs.trust_key }}-service-fault
+          fail-on-cache-miss: true
+          lookup-only: true
+          enableCrossOsArchive: false
+      - name: Bind actual restore miss failure and repository cache records
+        env:
+          CM_TRUST_RESTORE_HIT: ${{ steps.restore.outputs.cache-hit }}
+          CM_TRUST_MISS_HIT: ${{ steps.miss.outputs.cache-hit }}
+          CM_TRUST_SERVICE_OUTCOME: ${{ steps.service.outcome }}
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" trust-finish
+      - name: Retain trust-write evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-trust-write-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-trust-write-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  trust-read:
+    needs: [preflight, trust-write]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    cache-mode: read
+    env:
+      CM_CACHE_MODE: read
+      CM_EXECUTION_ROLE: platform_builder
+      CM_SOURCE_SHA: ${{ needs.preflight.outputs.pr_sha }}
+      CM_BENCHMARK_TRUST_ROLE: read
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Checkout exact requested CM revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DSLZL/CM
+          ref: ${{ needs.preflight.outputs.pr_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set evidence path
+        run: echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-s04-trust-read-evidence" >> "$GITHUB_ENV"
+      - name: Verify runner-injected cache authority
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Prepare exact cache probe using only reviewed worker code
+        id: prepare
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" trust-prepare
+      - name: Actually restore the trusted default-branch seed under PR read authority
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.prepare.outputs.trust_path }}
+          key: ${{ steps.prepare.outputs.trust_key }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: false
+      - name: Attempt a real cache save under runner-enforced read authority
+        id: denied
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.prepare.outputs.trust_path }}
+          key: ${{ steps.prepare.outputs.trust_key }}-denied-pr-save
+          enableCrossOsArchive: false
+      - name: Verify exact fixture and absence of the attempted unauthorized cache
+        env:
+          CM_TRUST_RESTORE_HIT: ${{ steps.restore.outputs.cache-hit }}
+          CM_TRUST_DENIED_SAVE_OUTCOME: ${{ steps.denied.outcome }}
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" trust-finish
+      - name: Retain trust-read evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-trust-read-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-trust-read-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  runtime:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    cache-mode: none
+    env:
+      CM_CACHE_MODE: none
+      CM_EXECUTION_ROLE: runtime_consumer
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Set runtime-only input and evidence paths
+        run: |
+          {
+            echo "CM_SOURCE_DIR=$RUNNER_TEMP/cm-s04-current-fixture-source"
+            echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-s04-runtime-inputs"
+            echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-s04-runtime-evidence"
+          } >> "$GITHUB_ENV"
+      - name: Verify actual cache-none authority
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Record consumer identity without a source checkout
+        run: /usr/bin/python3 -B .cm-worker/.github/scripts/record_run.py "$CM_CI_LOG_DIR"
+      - name: Install outer isolation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap strace
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Fetch exact qualified native bytes and current minimal text fixtures
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" runtime-prepare
+      - name: Measure thirty offline starts with current isolation and outer audit
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" runtime-consume
+      - name: Record final consumer identity and status
+        if: always()
+        env:
+          CM_JOB_STATUS: ${{ job.status }}
+        run: /usr/bin/python3 -B .cm-worker/.github/scripts/record_run.py "$CM_CI_LOG_DIR"
+      - name: Retain runtime evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-runtime-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-runtime-evidence
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Retain original profile checkpoints for precise failed-sample retries
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-runtime-checkpoints-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-runtime-checkpoints
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 14
+
+  collect:
+    needs: [preflight, cold, warm, mod-change, cache-canaries, trust-write, trust-read, runtime]
+    if: always() && needs.preflight.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    cache-mode: none
+    env:
+      CM_CACHE_MODE: none
+      CM_EXECUTION_ROLE: platform_builder
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Checkout exact requested CM revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: DSLZL/CM
+          ref: ${{ inputs.source_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set evidence path
+        run: echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-s04-collect-evidence" >> "$GITHUB_ENV"
+      - name: Verify runner-injected cache authority
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Set report paths
+        run: |
+          {
+            echo "CM_BENCHMARK_EVIDENCE_DIR=$RUNNER_TEMP/cm-s04-collected"
+            echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-s04-reports"
+          } >> "$GITHUB_ENV"
+      - name: Fetch only current small text evidence
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          pattern: cm-s04-*-evidence-*${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-collected
+      - name: Produce six reports with failures missing samples and actual Actions costs
+        run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" collect
+      - name: Retain all reports even when an AC fails
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-s04-reports-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-s04-reports
+          if-no-files-found: error
+          retention-days: 14
