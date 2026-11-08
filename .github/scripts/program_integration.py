@@ -383,11 +383,17 @@ def self_check():
         else:
             raise AssertionError("Invalid checkpoint accepted: " + field)
     reference = read(root / definition["frozen_reference"])
-    native_inputs(root, reference["production"]["source_sha"])
     original_native = retry.product_inputs
+    reviewed_native = original_native(root, definition["benchmarks"]["source_sha"])
+    # Exercise frozen-product reuse against its reviewed source, not future product changes.
+    with patch.object(retry, "product_inputs", side_effect=lambda directory, revision:
+            reviewed_native if revision == "HEAD" else original_native(directory, revision)):
+        assert (native_inputs(root, reference["production"]["source_sha"])["projection_sha256"]
+                == retry.digest(reviewed_native))
     for field, path in (("files", "crates/cm/src/lib.rs"), ("files", "crates/cm/Cargo.toml"),
-            ("files", "crates/cm-abi/LICENSE"), ("compiler_recipes", "compiler_environment")):
-        altered = deepcopy(original_native(root, "HEAD"))
+            ("files", "crates/cm/src/index.rs"), ("files", "crates/cm-abi/LICENSE"),
+            ("compiler_recipes", "compiler_environment")):
+        altered = deepcopy(reviewed_native)
         altered[field][path] = "unreviewed mutation"
         with patch.object(retry, "product_inputs", side_effect=lambda directory, revision:
                 altered if revision == "HEAD" else original_native(directory, revision)):
