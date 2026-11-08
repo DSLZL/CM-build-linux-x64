@@ -1868,6 +1868,7 @@ def refresh_self_check():
 
 
 def validation_self_check():
+    import zipfile
     value = {"checkpoint_origins": [{"steps": [{"command": ["/usr/bin/env", "--", "payload"]}] * 12000}] * 12}
     assert len(json.dumps(value, indent=2).encode("utf-8")) > 16 * 1024 ** 2
     with tempfile.TemporaryDirectory() as directory:
