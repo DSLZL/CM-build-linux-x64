@@ -1019,7 +1019,14 @@ def consume_proofs():
     artifact_download(policy, record, destination)
     assert read(destination / "authority.json")["production_origin"] == worker.production_origin()
     assert (destination / "bundle.jsonl").is_file()
-    bootstrap = Path(os.environ["CM_CONSUMER_INPUT_DIR"]) / "fixture/s01-bootstrap"
+    prepare_bootstrap(Path(os.environ["CM_CONSUMER_INPUT_DIR"]))
+    write(Path(os.environ["CM_CI_LOG_DIR"]) / "distribution-artifact.json", {"artifact": record, "jobs": jobs,
+        "signature_gate": "offline consumer must still verify"})
+
+
+def prepare_bootstrap(inputs):
+    policy = read(Path(__file__).resolve().parent / "distribution-policy.json")
+    bootstrap = inputs / "fixture/s01-bootstrap"
     bootstrap.mkdir()
     pin = policy["verifier"]
     archive = fetch(pin["url"], 128 * 1024 * 1024)
@@ -1032,11 +1039,8 @@ def consume_proofs():
     shutil.copyfile(Path(__file__).resolve().parent / "distribution-root.jsonl", bootstrap / "distribution-root.jsonl")
     write(bootstrap / "identity.json", {"archive_sha256": pin["archive_sha256"], "binary_sha256": sha(bootstrap / "gh"),
         "source": "independent reviewed worker pin; no candidate Host execution"})
-    write(Path(os.environ["CM_CI_LOG_DIR"]) / "distribution-artifact.json", {"artifact": record, "jobs": jobs,
-        "signature_gate": "offline consumer must still verify"})
     # Separate from the immutable producer manifest and from native dependency keys.
     import runtime_consumer as runtime
-    inputs = Path(os.environ["CM_CONSUMER_INPUT_DIR"])
     entries = [row for row in runtime.inventory(inputs) if row["path"] != "input-manifest.json"]
     write(inputs / "input-manifest.json", {"files": entries, "sha256": runtime.digest(entries)})
 

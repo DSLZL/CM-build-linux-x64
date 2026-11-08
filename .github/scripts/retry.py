@@ -38,8 +38,11 @@ RUNTIME_DATA = ("ci/g05-baseline.json", "crates/cm/src/distribution-policy.json"
     "fixtures/compatibility-policy/policy.json", "schemas/support-matrix.schema.json")
 SUPPORT_RUNTIME_FILES = ("ci/scripts/support_policy.py", "fixtures/compatibility-policy/driver.py")
 INDEX_RUNTIME_FILES = ("ci/scripts/binary_index.py", "fixtures/binary-index/driver.py")
-RUNTIME_FILES += SUPPORT_RUNTIME_FILES + INDEX_RUNTIME_FILES
+PROGRAM_RUNTIME_FILES = ("fixtures/program-integration/driver.py",)
+RUNTIME_FILES += SUPPORT_RUNTIME_FILES + INDEX_RUNTIME_FILES + PROGRAM_RUNTIME_FILES
 RUNTIME_DATA += ("fixtures/binary-index/cases.json", "schemas/mod-index.schema.json", "schemas/mod-index-qualification.schema.json")
+PROGRAM_DATA = ("ci/program/acceptance.json", "ci/program/coverage.json", "ci/program/cases.json")
+RUNTIME_DATA += PROGRAM_DATA
 PHASES = {
     "consumer-matrix": (("fixtures/runtime-consumer/driver.py", "matrix"),),
     "consumer-missing-library": (("fixtures/runtime-consumer/driver.py", "missing_library"),),
@@ -168,11 +171,13 @@ def projection(text, entries=None, exclude=(), production=False):
 
 def test_inputs(root, revision):
     texts = {path: source(root, revision, path) for path in RUNTIME_FILES
-             if not path.endswith("ci_progress.py") and path not in (*SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES)}
+             if not path.endswith("ci_progress.py") and path not in (*SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES, *PROGRAM_RUNTIME_FILES)}
     available = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", *SUPPORT_RUNTIME_FILES).decode().splitlines())
     support = {path: source(root, revision, path) for path in SUPPORT_RUNTIME_FILES if path in available}
     index_available = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", *INDEX_RUNTIME_FILES).decode().splitlines())
     index_texts = {path: source(root, revision, path) for path in INDEX_RUNTIME_FILES if path in index_available}
+    program_available = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", *PROGRAM_RUNTIME_FILES).decode().splitlines())
+    program_texts = {path: source(root, revision, path) for path in PROGRAM_RUNTIME_FILES if path in program_available}
     audit = projection(source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
     observer = projection(source(root, revision, "ci/scripts/runtime_composition.py"),
         ("audit_executions", "audit_network", "bound_bwrap_executions", "bound_sandbox_aliases",
@@ -184,6 +189,8 @@ def test_inputs(root, revision):
             continue
         if selected and selected[0] == "s03" and len(index_texts) != len(INDEX_RUNTIME_FILES):
             continue
+        if selected and selected[0] == "program" and len(program_texts) != len(PROGRAM_RUNTIME_FILES):
+            continue
         dispatch = {runtime_cases.DRIVERS[selected[0]]: runtime_cases.function(selected[1], selected[0])} if selected else {}
         if selected:
             wrapper = {"m02": ("ci/scripts/runtime_sdk.py", "matrix"),
@@ -194,7 +201,7 @@ def test_inputs(root, revision):
             cli = wrapper[0] if wrapper else runtime_cases.DRIVERS[selected[0]]
         else:
             cli = entries[0][0]
-        if selected == ("s02", "abc"):
+        if selected == ("s02", "abc") or selected and selected[0] == "program":
             # shortcut: Terminal stores modules on self; keep explicit entries until closure resolves instance attributes.
             entries = (*entries, *(("fixtures/runtime-sdk/driver.py", name) for name in
                 ("Provider", "command", "environment", "rows")),
@@ -207,6 +214,10 @@ def test_inputs(root, revision):
             if selected[1] == "refresh-running":
                 entries = (*entries, *(("fixtures/sdk-seams/driver.py", name) for name in
                     ("real", "release_native", "Provider", "environment", "settled")))
+        if selected and selected[0] == "program":
+            case_texts = {**texts, **program_texts}
+            entries = (*entries, ("fixtures/tool-concurrency/driver.py", "program_matrix"))
+            cli = "fixtures/tool-concurrency/driver.py"
         value = runtime_cases.closure(case_texts, entries, dispatch=dispatch)
         module = runtime_cases.business_module(case_texts[cli])
         value["dependencies"][cli + ":<entrypoint>"] = digest([ast.dump(node, include_attributes=False)
@@ -236,6 +247,11 @@ def test_inputs(root, revision):
             if selected[1] in ("index-envelope", "support-exact", "support-forgery"):
                 for path in ("schemas/mod-index.schema.json", "schemas/mod-index-qualification.schema.json"):
                     value["qualification_data"][path] = digest(source(root, revision, path))
+        if selected and selected[0] == "program":
+            path = "ci/program/cases.json"
+            data = json.loads(source(root, revision, path))
+            value["qualification_data"] = {path: digest({"schema_version": data["schema_version"],
+                "case": data["cases"][selected[1]]})}
         result[label] = value
     return result
 
@@ -259,14 +275,14 @@ def product_inputs(root, revision):
     runtime_modules["ci/scripts/runtime_upgrade.py"] = {"reports", "self_check", "driver", "restore_reference", "baseline_file", "mount_reference"}
     runtime_modules["ci/scripts/sdk_seams.py"] = {"reports", "self_check"}
     runtime_modules["ci/scripts/distribution_provenance.py"] = {
-        "reports", "self_check", "attest_prepare", "consume_proofs", "source_check", "artifact_download", "extract_materials"}
+        "reports", "self_check", "attest_prepare", "consume_proofs", "prepare_bootstrap", "source_check", "artifact_download", "extract_materials"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
                       "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
                       "ci/scripts/runtime_cases.py", "ci/scripts/acceptance_cache.py",
                       ".github/cm-build-routing.json", *SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES,
                       "fixtures/compatibility-policy/acceptance.sh", "fixtures/binary-index/acceptance.sh",
-                      "ci/scripts/build_benchmarks.py", "ci/benchmarks/scenarios.json",
+                      "ci/scripts/program_integration.py", "ci/scripts/build_benchmarks.py", "ci/benchmarks/scenarios.json",
                       "ci/benchmarks/runtime-loading.json", "fixtures/build-benchmarks/acceptance.sh"}
     for row in filter(None, tree):
         metadata, name = row.split(b"\t", 1)
@@ -917,7 +933,7 @@ def native_key(closure, label):
         "g04": ("inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/"),
         "g01": ("inputs/mods/g01/a/normal/",),
         "g05": (),
-        "g06": (), "s01": ("inputs/mods/s01/", "inputs/distribution/"), "s02": (), "s03": (),
+        "g06": (), "s01": ("inputs/mods/s01/", "inputs/distribution/"), "s02": (), "s03": (), "program": (),
         "m05": ("inputs/mods/m05/", "inputs/mods/m02/"),
         "g02a": ("inputs/mods/g02a/", "inputs/mods/m02/"),
         "review": ("inputs/mods/g02b/", "inputs/mods/m02/"),
@@ -948,6 +964,8 @@ def native_key(closure, label):
         mods, probes = runtime_cases.g06_native_dependencies(label.removeprefix("g06-"))
     if phase == "s02":
         mods = runtime_cases.s02_native_dependencies(label.removeprefix("s02-"))
+    if phase == "program":
+        mods = runtime_cases.program_native_dependencies(label.removeprefix("program-"))
     if label == "s03-http-tls":
         probes.extend(("fixture/binary-index-tls/cert.pem", "fixture/binary-index-tls/key.pem"))
     if phase == "g05":
@@ -1182,6 +1200,10 @@ class Checkpoints:
             result = self.restore(label)
             if result is None:
                 decision = self.decision(label)
+                program = self.validation.get("program")
+                if program and label not in program["allowed_executions"]:
+                    raise RuntimeError("Unchanged program baseline checkpoint is unavailable; refusing full replay: "
+                        + label + " " + json.dumps(decision["comparisons"], sort_keys=True))
                 print("CM runtime execute:", label, json.dumps(decision["comparisons"], separators=(",", ":")), flush=True)
                 completed = ci_progress.run(logs, label, command, timeout)
                 assert completed.returncode == 0, "Runtime step failed: " + label

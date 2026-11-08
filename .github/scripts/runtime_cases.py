@@ -80,6 +80,9 @@ GROUPS = {
         "archive-byte-limit", "archive-checksum", "plan-exact", "plan-order", "plan-dependency",
         "plan-exclusive", "plan-drift", "transaction-fault", "support-forgery", "support-exact",
         "support-update", "offline-complete", "offline-missing", "refresh-running", "revoked-record"),
+    "program": ("empty", "a", "b", "c", "abc-input", "abc-budget", "abc-tool-leaves",
+        "abc-cancel-queued", "abc-cancel-running", "abc-provider-error", "wrong-backend", "exclusive-conflict",
+        "disable-b", "disable-all", "remove-a", "remove-b", "remove-c", "reenable-abc"),
 }
 GROUPS["s01"] = ("identity", "independent", "inventory", "materials", "source", "install-boundary",
     "proof", "stale", "digests", "compatibility", "no-op", "transaction", "legacy", "bootstrap", "offline", "failure-boundary")
@@ -89,7 +92,8 @@ DRIVERS = {"p04": "fixtures/runtime-consumer/driver.py", "m01": "ci/scripts/mod_
            "g04": "fixtures/runtime-qualification/driver.py", "g01": "fixtures/runtime-hooks/driver.py",
            "g05": "fixtures/compatibility/driver.py", "g06": "fixtures/sdk-seams/driver.py",
            "s01": "fixtures/distribution-provenance/driver.py",
-           "s02": "fixtures/compatibility-policy/driver.py", "s03": "fixtures/binary-index/driver.py"}
+           "s02": "fixtures/compatibility-policy/driver.py", "s03": "fixtures/binary-index/driver.py",
+           "program": "fixtures/program-integration/driver.py"}
 MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
     ("mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
      "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases", "sdk_seams", "distribution_provenance", "support_policy", "binary_index")},
@@ -158,6 +162,14 @@ def s02_native_dependencies(case):
 
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def program_native_dependencies(case):
+    assert case in GROUPS["program"]
+    selected = {"empty": "", "a": "a", "b": "b", "c": "c"}.get(case, "abc")
+    packages = {"a": "g02a/turn-budget", "b": "g02b/review-before-send", "c": "g03/tool-concurrency"}
+    return tuple("inputs/mods/" + packages[owner] + "/" for owner in selected) + ((
+        "inputs/mods/m02/lifecycle-audit/normal/", "inputs/mods/m02/example-tool/normal/") if selected else ())
 
 
 def labels():

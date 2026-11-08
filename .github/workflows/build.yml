@@ -19,11 +19,11 @@ on:
         default: v1
         type: string
       build_kind:
-        description: Full Host qualification or only the independent target Mod
+        description: Host qualification, independent Mod, or runtime-only final validation
         required: true
         default: qualification
         type: choice
-        options: [qualification, mod-only]
+        options: [qualification, mod-only, program]
       host_origin:
         description: Exact successful qualification origin JSON for mod-only
         required: false
@@ -208,13 +208,83 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+
+  program-prepare:
+    needs: preflight
+    if: needs.preflight.outputs.build_kind == 'program'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    cache-mode: none
+    outputs:
+      input_artifact_id: ${{ steps.prepare.outputs.input_artifact_id }}
+      input_artifact_digest: ${{ steps.prepare.outputs.input_artifact_digest }}
+      production_origin: ${{ steps.prepare.outputs.production_origin }}
+      validation_artifact_id: ${{ steps.overlay.outputs.artifact-id }}
+      validation_artifact_digest: ${{ steps.overlay.outputs.artifact-digest }}
+    env:
+      CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
+      CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+      CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_BUILD_KIND: program
+      CM_EXECUTION_ROLE: runtime_validation
+      CM_CACHE_MODE: none
+      CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
+      CM_WORKER_POLICY_DIR: ${{ github.workspace }}/.cm-worker/.github/scripts
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Checkout reviewed worker infrastructure
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .cm-worker
+          persist-credentials: false
+      - name: Read exact source and its history for per-case dependency keys
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ needs.preflight.outputs.source_repository }}
+          ref: ${{ inputs.source_sha }}
+          path: cm-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set validation paths
+        run: |
+          echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-program-evidence" >> "$GITHUB_ENV"
+          echo "CM_VALIDATION_INPUT_DIR=$RUNNER_TEMP/cm-validation-inputs" >> "$GITHUB_ENV"
+      - name: Enforce actual cache-none authority
+        uses: ./.cm-worker/.github/actions/cache-authority
+      - name: Record validation preparation separately from native production
+        run: /usr/bin/python3 -B "$CM_WORKER_POLICY_DIR/record_run.py" "$CM_CI_LOG_DIR"
+      - name: Verify frozen qualification and prepare only the small current overlay
+        id: prepare
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ env.CM_SOURCE_DIR }}/ci/scripts
+        run: /usr/bin/python3 -B "$CM_WORKER_POLICY_DIR/program_integration.py" prepare
+      - name: Upload current validation files without native products
+        id: overlay
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-linux-x64-validation-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_VALIDATION_INPUT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain explicit reuse decisions and rejected preconditions
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-program-preparation-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ env.CM_CI_LOG_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+
   runtime-consumer:
-    needs: [preflight, build-read, build-write, attest-distribution]
+    needs: [preflight, build-read, build-write, attest-distribution, program-prepare]
     if: >-
       ${{ always() && needs.preflight.result == 'success' &&
       needs.preflight.outputs.consumer_required == 'true' &&
       (needs.preflight.outputs.distribution_required != 'true' || needs.attest-distribution.result == 'success') &&
-      (needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
+      (needs.program-prepare.result == 'success' || needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     cache-mode: none
@@ -233,9 +303,9 @@ jobs:
       CM_REQUEST_ID: ${{ inputs.request_id }}
       CM_EXECUTION_ROLE: runtime_consumer
       CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
-      CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
-      CM_VALIDATION_ARTIFACT_ID: ${{ needs.build-read.outputs.validation_artifact_id || needs.build-write.outputs.validation_artifact_id }}
-      CM_VALIDATION_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.validation_artifact_digest || needs.build-write.outputs.validation_artifact_digest }}
+      CM_PRODUCTION_ORIGIN: ${{ needs.program-prepare.outputs.production_origin || needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
+      CM_VALIDATION_ARTIFACT_ID: ${{ needs.program-prepare.outputs.validation_artifact_id || needs.build-read.outputs.validation_artifact_id || needs.build-write.outputs.validation_artifact_id }}
+      CM_VALIDATION_ARTIFACT_DIGEST: ${{ needs.program-prepare.outputs.validation_artifact_digest || needs.build-read.outputs.validation_artifact_digest || needs.build-write.outputs.validation_artifact_digest }}
       CM_DISTRIBUTION_ARTIFACT_ID: ${{ needs.attest-distribution.outputs.artifact_id }}
       CM_DISTRIBUTION_ARTIFACT_DIGEST: ${{ needs.attest-distribution.outputs.artifact_digest }}
       CM_CACHE_MODE: none
@@ -262,8 +332,8 @@ jobs:
       - name: Verify exact producer artifact and actual cache-none authority
         id: input
         env:
-          CM_INPUT_ARTIFACT_ID: ${{ needs.build-read.outputs.input_artifact_id || needs.build-write.outputs.input_artifact_id }}
-          CM_INPUT_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.input_artifact_digest || needs.build-write.outputs.input_artifact_digest }}
+          CM_INPUT_ARTIFACT_ID: ${{ needs.program-prepare.outputs.input_artifact_id || needs.build-read.outputs.input_artifact_id || needs.build-write.outputs.input_artifact_id }}
+          CM_INPUT_ARTIFACT_DIGEST: ${{ needs.program-prepare.outputs.input_artifact_digest || needs.build-read.outputs.input_artifact_digest || needs.build-write.outputs.input_artifact_digest }}
           CM_POLICY_TOKEN: ${{ github.token }}
         run: /usr/bin/python3 -B .github/scripts/worker_policy.py verify-consumer
       - name: Record independent consumer without a product source checkout
@@ -280,6 +350,12 @@ jobs:
           /usr/bin/python3 -B .github/scripts/worker_policy.py extract-consumer
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_VALIDATION_ARTIFACT_NAME" --dir "$CM_VALIDATION_INPUT_DIR"
           /usr/bin/python3 -B "$CM_VALIDATION_INPUT_DIR/retry.py" refresh
+      - name: Bind existing qualified proofs for runtime-only program validation
+        if: needs.preflight.outputs.build_kind == 'program'
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ env.CM_WORKER_POLICY_DIR }}:${{ env.CM_CONSUMER_INPUT_DIR }}
+        run: /usr/bin/python3 -B .github/scripts/program_integration.py bind-proofs
       - name: Fetch API-bound proofs and independent pinned bootstrap verifier
         if: needs.preflight.outputs.distribution_required == 'true'
         env:
@@ -305,6 +381,7 @@ jobs:
       - name: Consume runtime inputs in a strict minimal rootfs
         env:
           CM_POLICY_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ env.CM_WORKER_POLICY_DIR }}:${{ env.CM_CONSUMER_INPUT_DIR }}
         run: /usr/bin/python3 -B "$CM_CONSUMER_INPUT_DIR/runtime_consumer.py" consume
       - name: Upload small data inputs for the isolated qualification signer
         if: success() && needs.preflight.outputs.index_required == 'true'
@@ -594,5 +671,44 @@ jobs:
         with:
           name: cm-build-receipt-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cm-worker-receipt
+          if-no-files-found: error
+          retention-days: 14
+  program-receipt:
+    needs: [preflight, program-prepare, runtime-consumer]
+    if: >-
+      ${{ always() && needs.preflight.result == 'success' &&
+      needs.preflight.outputs.build_kind == 'program' &&
+      needs.program-prepare.result == 'success' && needs.runtime-consumer.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    cache-mode: none
+    env:
+      CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
+      CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+      CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
+      CM_REQUEST_ID: ${{ inputs.request_id }}
+      CM_BUILD_KIND: program
+      CM_CACHE_MODE: none
+      CM_PRODUCTION_ORIGIN: ${{ needs.program-prepare.outputs.production_origin }}
+      CM_VALIDATION_ARTIFACT_ID: ${{ needs.program-prepare.outputs.validation_artifact_id }}
+      CM_VALIDATION_ARTIFACT_DIGEST: ${{ needs.program-prepare.outputs.validation_artifact_digest }}
+      CM_CONSUMER_ARTIFACT_ID: ${{ needs.runtime-consumer.outputs.artifact_id }}
+      CM_CONSUMER_ARTIFACT_DIGEST: ${{ needs.runtime-consumer.outputs.artifact_digest }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Verify actual cache-none authority
+        uses: ./.github/actions/cache-authority
+      - name: Bind final reports to actual validation jobs and original production
+        env:
+          CM_POLICY_TOKEN: ${{ github.token }}
+        run: /usr/bin/python3 -B .github/scripts/program_integration.py receipt
+      - name: Retain runtime-only program receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cm-program-receipt-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cm-program-receipt
           if-no-files-found: error
           retention-days: 14

@@ -89,9 +89,9 @@ def parse_origin(value):
 def build_request():
     kind = os.environ.get("CM_BUILD_KIND", "qualification")
     raw = os.environ.get("CM_HOST_ORIGIN", "")
-    if kind not in ("qualification", "mod-only") or (kind == "qualification" and raw):
+    if kind not in ("qualification", "mod-only", "program") or (kind in ("qualification", "program") and raw):
         raise RuntimeError("Unsupported build kind or unexpected Host origin")
-    if kind == "qualification":
+    if kind in ("qualification", "program"):
         return kind, None
     if not raw or len(raw) > 4096:
         raise RuntimeError("Mod-only requires an explicit bounded qualification origin")
@@ -311,6 +311,10 @@ def preflight():
     config_record = api("repos/" + source + "/contents/.github/cm-ci.json?ref=" + sha)
     config = json.loads(base64.b64decode(config_record["content"]))
     consumer_required = "true" if config.get("task_id") in ("CM-P04", "CM-M01", "CM-M02", "CM-M03", "CM-M04", "CM-M05", "CM-G02A", "CM-G02B", "CM-G03", "CM-G04", "CM-G01", "CM-G05", "CM-G06", "CM-S01", "CM-S02", "CM-S03") else "false"
+    if kind == "program":
+        if config.get("task_id") != "CM-S03":
+            raise RuntimeError("Program validation requires the frozen S03 product mapping")
+        mode = "none"
     if kind == "mod-only":
         if config.get("task_id") != "CM-M05":
             raise RuntimeError("Mod-only requires the reviewed M05 mapping")
@@ -319,8 +323,8 @@ def preflight():
               "observed_source_default_sha": source_head, "builder_repository": worker,
               "workflow_sha": workflow_sha, "worker_default_branch": worker_branch,
               "request_id": request, "target": TARGET, "cache_mode": mode, "consumer_required": consumer_required,
-              "build_kind": kind, "distribution_required": "true" if config.get("task_id") in ("CM-S01", "CM-S02", "CM-S03") else "false",
-              "index_required": "true" if config.get("task_id") == "CM-S03" else "false"}
+              "build_kind": kind, "distribution_required": "true" if kind != "program" and config.get("task_id") in ("CM-S01", "CM-S02", "CM-S03") else "false",
+              "index_required": "true" if kind != "program" and config.get("task_id") == "CM-S03" else "false"}
     Path(os.environ["RUNNER_TEMP"], "cm-worker-preflight.json").write_text(json.dumps(record, indent=2) + "\n")
     output({**record, "source_default_sha_verified": "true" if mode == "write" else "false"})
     print(json.dumps(record, indent=2))
