@@ -313,7 +313,6 @@ def reports(inputs, artifact, evidence, validation, steps, audit, common, accept
 
 
 def receipt():
-    import retry
     source, worker, sha, workflow, request = policy.identities()
     assert policy.build_request() == ("program", None)
     cache = cache_capacity()
@@ -329,7 +328,8 @@ def receipt():
             os.environ["CM_" + role + "_ARTIFACT_DIGEST"].removeprefix("sha256:"), int(os.environ["GITHUB_RUN_ID"]))
         records[role.lower()] = record
     with tempfile.TemporaryDirectory(dir=os.environ["RUNNER_TEMP"]) as directory:
-        with retry.small_archive(worker, records["consumer"], Path(directory) / "reports.zip") as archive:
+        with policy.download_origin_archive(worker, records["consumer"], Path(directory) / "reports.zip",
+                maximum=128 * 1024 ** 2) as archive:
             accepted = policy.archive_json(archive, "acceptance.json")
             binding = policy.archive_json(archive, "evidence/program-binding.json")
             assert set(binding["reports"]) == {"final-coverage.md", "milestone-mvp.md",
