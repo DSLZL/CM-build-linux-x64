@@ -53,6 +53,16 @@ def checkpoint_contract(index, provenance, count, environment):
     assert all(row["status"] == "pass" and row.get("inputs") and row.get("files") for row in index["steps"].values())
 
 
+def native_inputs(root, revision):
+    import retry
+    before, after = retry.product_inputs(root, revision), retry.product_inputs(root, "HEAD")
+    differences = {name: sorted(path for path in before[name].keys() | after[name].keys()
+        if before[name].get(path) != after[name].get(path)) for name in after}
+    print("CM program native input differences:", json.dumps(differences), flush=True)
+    assert before == after, "Native product inputs changed; program mode cannot rebuild"
+    return retry.digest(after)
+
+
 def prepare():
     import retry
     import build_benchmarks as benchmarks
@@ -127,8 +137,7 @@ def prepare():
                 benchmark_reports[name] = {"status": value["status"], "sha256": hashlib.sha256(raw).hexdigest(),
                     **{key: value[key] for key in ("elapsed_seconds", "distributions", "unavailable_metrics",
                         "measurement_limitations", "judgment", "expected_slots", "missing_slots") if key in value}}
-    current_native = retry.digest(retry.product_inputs(root, "HEAD"))
-    assert current_native == retry.digest(retry.product_inputs(root, production["source_sha"])), "Native product inputs changed; program mode cannot rebuild"
+    current_native = native_inputs(root, production["source_sha"])
     probes = retry.probe_inputs(root, "HEAD")
     assert probes == baseline["probe_inputs"], "Private native probe inputs changed; program mode cannot compile"
     current = retry.test_inputs(root, "HEAD")
@@ -362,8 +371,9 @@ def self_check():
             pass
         else:
             raise AssertionError("Invalid checkpoint accepted: " + field)
-    base = retry.test_inputs(root, "HEAD")
     reference = read(root / definition["frozen_reference"])
+    native_inputs(root, reference["production"]["source_sha"])
+    base = retry.test_inputs(root, "HEAD")
     previous = retry.test_inputs(root, reference["qualification"]["origin"]["source_sha"])
     assert len(previous) == definition["checkpoints"]["case_count"] == 393
     assert set(previous) <= set(base) and len(set(base) - set(previous)) == 18
