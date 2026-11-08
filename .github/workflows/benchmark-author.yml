@@ -30,6 +30,10 @@ jobs:
   author:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    concurrency:
+      group: ${{ inputs.stage == 'cold' && inputs.repetition == 1 && 'cm-repository-cache-writer' || format('cm-benchmark-reader-{0}-{1}-{2}-{3}', github.run_id, github.run_attempt, inputs.stage, inputs.repetition) }}
+      cancel-in-progress: false
+      queue: max
     env:
       CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
       CM_SOURCE_REPOSITORY: DSLZL/CM

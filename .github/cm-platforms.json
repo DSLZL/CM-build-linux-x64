@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "source_repository": "DSLZL/CM",
+  "default_platform": "linux-x64",
+  "cache_limit_bytes": 10000000000,
+  "platforms": {
+    "linux-x64": {
+      "repository": "DSLZL/CM-build-linux-x64",
+      "runner": "ubuntu-24.04",
+      "runner_os": "Linux",
+      "runner_arch": "X64",
+      "target": "x86_64-unknown-linux-gnu",
+      "format": "elf",
+      "library_suffix": ".so",
+      "exe_suffix": "",
+      "recipe": "linux-recipe.yml",
+      "enabled": true
+    },
+    "linux-arm64": {
+      "repository": "DSLZL/CM-build-linux-arm64",
+      "runner": "ubuntu-24.04-arm",
+      "runner_os": "Linux",
+      "runner_arch": "ARM64",
+      "target": "aarch64-unknown-linux-gnu",
+      "format": "elf",
+      "library_suffix": ".so",
+      "exe_suffix": "",
+      "recipe": "linux-recipe.yml",
+      "enabled": false
+    },
+    "macos-arm64": {
+      "repository": "DSLZL/CM-build-macos-arm64",
+      "runner": "macos-26",
+      "runner_os": "macOS",
+      "runner_arch": "ARM64",
+      "target": "aarch64-apple-darwin",
+      "format": "macho",
+      "library_suffix": ".dylib",
+      "exe_suffix": "",
+      "recipe": "macos-recipe.yml",
+      "enabled": false
+    },
+    "macos-x64": {
+      "repository": "DSLZL/CM-build-macos-x64",
+      "runner": "macos-26-intel",
+      "runner_os": "macOS",
+      "runner_arch": "X64",
+      "target": "x86_64-apple-darwin",
+      "format": "macho",
+      "library_suffix": ".dylib",
+      "exe_suffix": "",
+      "recipe": "macos-recipe.yml",
+      "enabled": false
+    },
+    "windows-x64": {
+      "repository": "DSLZL/CM-build-windows-x64",
+      "runner": "windows-2025",
+      "runner_os": "Windows",
+      "runner_arch": "X64",
+      "target": "x86_64-pc-windows-msvc",
+      "format": "pe",
+      "library_suffix": ".dll",
+      "exe_suffix": ".exe",
+      "recipe": "windows-recipe.yml",
+      "enabled": false
+    },
+    "windows-arm64": {
+      "repository": "DSLZL/CM-build-windows-arm64",
+      "runner": "windows-11-arm",
+      "runner_os": "Windows",
+      "runner_arch": "ARM64",
+      "target": "aarch64-pc-windows-msvc",
+      "format": "pe",
+      "library_suffix": ".dll",
+      "exe_suffix": ".exe",
+      "recipe": "windows-recipe.yml",
+      "enabled": false
+    }
+  }
+}

@@ -70,7 +70,7 @@ runs:
       run: python3 -B "$CM_BENCHMARK_PROGRAM" save-plan '${{ inputs.role }}'
     - name: ${{ inputs.role }} / save bounded Cargo downloads once
       if: steps.save.outputs.save_allowed == 'true'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: ./.cm-worker/.github/actions/cache-save
       with:
         path: |
           ${{ steps.prepare.outputs.cargo_home }}/registry/index
@@ -78,14 +78,12 @@ runs:
           ${{ steps.prepare.outputs.cargo_home }}/git/db
           ${{ runner.temp }}/cm-s04-${{ inputs.role }}-seed.json
         key: ${{ steps.prepare.outputs.cargo_key }}
-        enableCrossOsArchive: false
     - name: ${{ inputs.role }} / save bounded Mod compiler objects once
       if: steps.save.outputs.save_allowed == 'true' && inputs.role != 'H'
-      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: ./.cm-worker/.github/actions/cache-save
       with:
         path: ${{ steps.prepare.outputs.sccache_dir }}
         key: ${{ steps.prepare.outputs.compiler_key }}
-        enableCrossOsArchive: false
     - name: ${{ inputs.role }} / retain one original native package
       id: product
       if: env.CM_BENCHMARK_STAGE == 'cold' && env.CM_BENCHMARK_REPETITION == '1' && steps.reuse.outputs.reused != 'true'

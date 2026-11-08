@@ -199,6 +199,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     cache-mode: write
+    concurrency:
+      group: cm-repository-cache-writer
+      cancel-in-progress: false
+      queue: max
     env:
       CM_CACHE_MODE: write
       CM_EXECUTION_ROLE: platform_builder
@@ -226,11 +230,10 @@ jobs:
         id: prepare
         run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" trust-prepare
       - name: Actually save the bounded default-branch trust seed
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ steps.prepare.outputs.trust_path }}
           key: ${{ steps.prepare.outputs.trust_key }}
-          enableCrossOsArchive: false
       - name: Clear the source fixture before restoring
         run: /usr/bin/python3 -B "$CM_BENCHMARK_PROGRAM" trust-clear
       - name: Actually restore the exact trusted seed

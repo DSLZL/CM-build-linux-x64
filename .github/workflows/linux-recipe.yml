@@ -69,6 +69,10 @@ jobs:
   linux-x64:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    concurrency:
+      group: ${{ inputs.cache_mode == 'write' && 'cm-repository-cache-writer' || format('cm-cache-reader-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.request_id) }}
+      cancel-in-progress: false
+      queue: max
     outputs:
       artifact_id: ${{ steps.reuse.outputs.artifact_id || steps.payload.outputs.artifact-id }}
       artifact_digest: ${{ steps.reuse.outputs.artifact_digest || steps.payload.outputs.artifact-digest }}
@@ -626,126 +630,109 @@ jobs:
           retention-days: 14
       - name: Save successful trusted source Cargo downloads
         if: ${{ success() && (steps.reuse.outputs.reused != 'true' || steps.reuse.outputs.probe_build_required == 'true') && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cargo-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: |
             ${{ env.CARGO_HOME }}/registry/index
             ${{ env.CARGO_HOME }}/registry/cache
             ${{ env.CARGO_HOME }}/git/db
           key: ${{ steps.cache-identity.outputs.cargo_key }}
-          enableCrossOsArchive: false
       - name: Save new successful compiler entries from this trusted source
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.cache-stop.outcome == 'success' && steps.cache-stop.outputs.has_new_entries == 'true' && steps.sccache-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: ${{ steps.cache-identity.outputs.sccache_key }}
-          enableCrossOsArchive: false
       - name: Save successful trusted source Host binaries and original build checks
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-cache-prepare.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
           key: ${{ steps.host-identity.outputs.host_key }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target host-core-baseline-build
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_host_core_baseline_build == 'true' && steps.acceptance-host-core-baseline-build.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/host-core-baseline-build
           key: ${{ steps.acceptance-identity.outputs.host_core_baseline_build }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target mod-adapter-clippy
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_adapter_clippy == 'true' && steps.acceptance-mod-adapter-clippy.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-adapter-clippy
           key: ${{ steps.acceptance-identity.outputs.mod_adapter_clippy }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target mod-host-abi-probe-build
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_host_abi_probe_build == 'true' && steps.acceptance-mod-host-abi-probe-build.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-host-abi-probe-build
           key: ${{ steps.acceptance-identity.outputs.mod_host_abi_probe_build }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target mod-pinned-snapshot-build
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_mod_pinned_snapshot_build == 'true' && steps.acceptance-mod-pinned-snapshot-build.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/mod-pinned-snapshot-build
           key: ${{ steps.acceptance-identity.outputs.mod_pinned_snapshot_build }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target m02-native-probe-build
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_m02_native_probe_build == 'true' && steps.acceptance-m02-native-probe-build.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/m02-native-probe-build
           key: ${{ steps.acceptance-identity.outputs.m02_native_probe_build }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target review-tui-probe-build
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_review_tui_probe_build == 'true' && steps.acceptance-review-tui-probe-build.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/review-tui-probe-build
           key: ${{ steps.acceptance-identity.outputs.review_tui_probe_build }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g03-local-backend-contract
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g03_local_backend_contract == 'true' && steps.acceptance-g03-local-backend-contract.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g03-local-backend-contract
           key: ${{ steps.acceptance-identity.outputs.g03_local_backend_contract }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g06-sdk-a-v1
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_v1 == 'true' && steps.acceptance-g06-sdk-a-v1.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v1
           key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v1 }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g06-sdk-a-v2
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_v2 == 'true' && steps.acceptance-g06-sdk-a-v2.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-v2
           key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_v2 }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g06-sdk-a-replacement
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_a_replacement == 'true' && steps.acceptance-g06-sdk-a-replacement.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-a-replacement
           key: ${{ steps.acceptance-identity.outputs.g06_sdk_a_replacement }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g06-sdk-b-v1
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_v1 == 'true' && steps.acceptance-g06-sdk-b-v1.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v1
           key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v1 }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g06-sdk-b-v2
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_v2 == 'true' && steps.acceptance-g06-sdk-b-v2.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-v2
           key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_v2 }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g06-sdk-b-replacement
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_sdk_b_replacement == 'true' && steps.acceptance-g06-sdk-b-replacement.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-sdk-b-replacement
           key: ${{ steps.acceptance-identity.outputs.g06_sdk_b_replacement }}
-          enableCrossOsArchive: false
       - name: Save successful compiled target g06-c-abi
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_g06_c_abi == 'true' && steps.acceptance-g06-c-abi.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: ./.cm-worker/.github/actions/cache-save
         with:
           path: ${{ env.CM_ACCEPTANCE_BUILD_CACHE_DIR }}/g06-c-abi
           key: ${{ steps.acceptance-identity.outputs.g06_c_abi }}
-          enableCrossOsArchive: false
       - name: Upload logs compiler statistics and source/worker identities
         if: ${{ always() && steps.policy.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -15,7 +15,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from record_run import require_hosted_linux
+from record_run import require_hosted_linux, require_hosted_worker
+import cm_platforms
+import stat
 
 TARGET = "x86_64-unknown-linux-gnu"
 
@@ -56,13 +58,13 @@ def output(values):
 
 
 def identities():
-    require_hosted_linux()
+    entry = require_hosted_worker()
     source = checked(os.environ.get("CM_SOURCE_REPOSITORY"), r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", "fixed source repository")
     worker = checked(os.environ.get("CM_BUILDER_REPOSITORY"), r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", "fixed builder repository")
     sha = checked(os.environ.get("CM_SOURCE_SHA"), r"[0-9a-f]{40}", "source SHA")
     workflow_sha = checked(os.environ.get("GITHUB_WORKFLOW_SHA"), r"[0-9a-f]{40}", "worker workflow SHA")
     request = checked(os.environ.get("CM_REQUEST_ID"), r"[A-Za-z0-9_.-]{1,128}", "request ID")
-    if worker != os.environ.get("GITHUB_REPOSITORY") or worker == source:
+    if source != "DSLZL/CM" or worker != entry["repository"] or worker == source:
         raise RuntimeError("Build must be an actual run in the distinct fixed builder repository")
     if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
         raise RuntimeError("Only an actual worker workflow_dispatch is enabled")
@@ -288,6 +290,7 @@ def restore_origin():
 
 def preflight():
     source, worker, sha, workflow_sha, request = identities()
+    entry = cm_platforms.worker()
     kind, origin = build_request()
     # These APIs run before any requested CM source is checked out or executed.
     source_info = api("repos/" + source)
@@ -322,7 +325,7 @@ def preflight():
     record = {"source_repository": source, "source_sha": sha, "source_default_branch": branch,
               "observed_source_default_sha": source_head, "builder_repository": worker,
               "workflow_sha": workflow_sha, "worker_default_branch": worker_branch,
-              "request_id": request, "target": TARGET, "cache_mode": mode, "consumer_required": consumer_required,
+              "request_id": request, "platform": entry["key"], "target": entry["target"], "cache_mode": mode, "consumer_required": consumer_required,
               "build_kind": kind, "distribution_required": "true" if kind != "program" and config.get("task_id") in ("CM-S01", "CM-S02", "CM-S03") else "false",
               "index_required": "true" if kind != "program" and config.get("task_id") == "CM-S03" else "false"}
     Path(os.environ["RUNNER_TEMP"], "cm-worker-preflight.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -330,7 +333,7 @@ def preflight():
     print(json.dumps(record, indent=2))
 
 
-def benchmark_capacity(cache, pending_bytes=None):
+def benchmark_capacity(cache, pending_bytes=None, *, usage_floor=0):
     result = {"status": "unavailable", "save_allowed": False, "billing_expansion": False, "deletion": False}
     try:
         limit = cache["repository_limit_bytes"]
@@ -338,19 +341,211 @@ def benchmark_capacity(cache, pending_bytes=None):
         reserve = planned if pending_bytes is None else pending_bytes
         assert cache["repository_limit_source"] == "owner-confirmed-free-tier", "Repository limit needs owner confirmation"
         assert all(type(value) is int and value > 0 for value in (limit, free, planned, reserve)), "Invalid cache byte limits"
+        assert type(usage_floor) is int and usage_floor >= 0, "Invalid reserved cache usage"
         maximum = min(limit, free)
         usage = api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/cache/usage")
         used = usage["active_caches_size_in_bytes"]
         assert type(used) is int and used >= 0, "Invalid live cache usage"
+        used = max(used, usage_floor)
         allowed = used + reserve <= maximum
         result.update(status="available", save_allowed=allowed, usage=usage,
             limit={"max_cache_size_bytes": limit, "source": cache["repository_limit_source"]},
-            maximum_bytes=maximum, reserved_new_bytes=reserve,
+            maximum_bytes=maximum, reserved_new_bytes=reserve, effective_usage_bytes=used,
             reason=None if allowed else "Insufficient confirmed headroom; no eviction or paid expansion")
-    except (urllib.error.URLError, KeyError, AssertionError, TypeError, ValueError) as error:
+    except (urllib.error.URLError, ConnectionError, TimeoutError, KeyError, AssertionError, TypeError, ValueError) as error:
         result.update(reason=str(error) or type(error).__name__,
             http_status=error.code if isinstance(error, urllib.error.HTTPError) else None)
     return result
+
+
+def cache_archive_bound(paths, temporary):
+    """Conservative tar/PAX + gzip/zstd allowance; inspect metadata, never archive twice."""
+    temporary = temporary.resolve(strict=True)
+    total, entries = 1024 * 1024, 0
+    heartbeat = time.monotonic()
+    for raw in paths:
+        if not raw or any(char in raw for char in "*?[]!\r\n"):
+            raise RuntimeError("Cache paths must be explicit runner-temporary paths without globbing")
+        root = Path(raw)
+        if not root.is_absolute() or root.is_symlink() or not root.resolve().is_relative_to(temporary) or root.resolve() == temporary:
+            raise RuntimeError("Cache root must stay inside its runner temporary directory")
+        if not root.exists():
+            continue
+        pending = [root]
+        while pending:
+            path = pending.pop()
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                pending.extend(path.iterdir())
+            elif stat.S_ISLNK(info.st_mode):
+                if not path.resolve().is_relative_to(root.resolve()):
+                    raise RuntimeError("Cache symlink escapes its explicit root")
+            elif not stat.S_ISREG(info.st_mode):
+                raise RuntimeError("Cache candidate contains a special file")
+            size = info.st_size if stat.S_ISREG(info.st_mode) else 0
+            total += (size + 511) // 512 * 512 + 8192 + 8 * len(str(path).encode("utf-8"))
+            entries += 1
+            if time.monotonic() - heartbeat >= 5:
+                print("Cache capacity inventory:", entries, "entries", total, "reserved tar bytes", flush=True)
+                heartbeat = time.monotonic()
+    if not entries:
+        raise RuntimeError("No existing cache candidate paths")
+    return {"entries": entries, "archive_upper_bound_bytes": total + total // 16 + 1024 * 1024}
+
+
+def live_cache_bytes():
+    # The aggregate usage endpoint can lag; also enumerate every currently visible cache.
+    seen, total, page = set(), 0, 1
+    while True:
+        result = api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/caches?per_page=100&page=" + str(page))
+        rows = result["actions_caches"]
+        count = result["total_count"]
+        if not isinstance(rows, list) or type(count) is not int or count < 0:
+            raise RuntimeError("Live cache listing is unavailable or malformed")
+        for row in rows:
+            cache_id, size = row["id"], row["size_in_bytes"]
+            if type(cache_id) is not int or cache_id <= 0 or cache_id in seen or type(size) is not int or size < 0:
+                raise RuntimeError("Ambiguous live cache inventory")
+            seen.add(cache_id)
+            total += size
+        if len(rows) < 100:
+            if len(seen) != count:
+                raise RuntimeError("Cache inventory changed during pagination; skip saving")
+            return total
+        page += 1
+        if page > 1000:
+            raise RuntimeError("Cache inventory exceeds the reviewed bounded listing")
+
+
+def cache_save_plan():
+    key = os.environ.get("CM_CACHE_SAVE_KEY", "")
+    result = {"schema_version": 1, "save_allowed": False, "billing_expansion": False, "deletion": False,
+        "repository": os.environ.get("GITHUB_REPOSITORY"), "cache_key": key}
+    try:
+        if os.environ.get("CM_CACHE_MODE") != "write" or os.environ.get("ACTIONS_CACHE_MODE") != "write":
+            raise RuntimeError("Cache save requires actual reviewed write authority")
+        verify_checkout()
+        checked(key, r"[A-Za-z0-9_.-]{1,512}", "cache save key")
+        limit = cm_platforms.load()["cache_limit_bytes"]
+        temporary = Path(os.environ["RUNNER_TEMP"])
+        context = {name: os.environ[name] for name in
+            ("GITHUB_REPOSITORY", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB")}
+        journal_path = temporary / "cm-repository-cache-reservation.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8")) if journal_path.exists() else {
+            "context": context, "usage_floor": 0}
+        if not isinstance(journal, dict) or journal.get("context") != context or type(journal.get("usage_floor")) is not int or journal["usage_floor"] < 0:
+            raise RuntimeError("Cache reservation journal has a different or invalid job identity")
+        result.update(cache_archive_bound(os.environ["CM_CACHE_SAVE_PATHS"].splitlines(), temporary))
+        listed = live_cache_bytes()
+        capacity = benchmark_capacity({"repository_limit_bytes": limit, "free_limit_bytes": limit,
+            "planned_new_bytes": result["archive_upper_bound_bytes"],
+            "repository_limit_source": "owner-confirmed-free-tier"},
+            usage_floor=max(listed, journal["usage_floor"]))
+        result.update(capacity, listed_cache_bytes=listed, previous_usage_floor=journal["usage_floor"])
+        if result["save_allowed"]:
+            # Reserve before upload and retain the reservation even when that upload fails.
+            journal["usage_floor"] = result["effective_usage_bytes"] + result["reserved_new_bytes"]
+            journal_path.write_text(json.dumps(journal) + "\n", encoding="utf-8")
+    except (RuntimeError, KeyError, OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+        result.update(save_allowed=False, reason=str(error) or type(error).__name__)
+    directory = Path(os.environ["CM_CI_LOG_DIR"])
+    directory.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(key.encode()).hexdigest()[:20]
+    (directory / ("cache-save-plan-" + name + ".json")).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(result, indent=2), flush=True)
+    output({"save_allowed": str(result["save_allowed"]).lower()})
+
+
+def cache_budget_self_check():
+    from unittest.mock import patch
+    cache = {"repository_limit_bytes": 100, "free_limit_bytes": 100, "planned_new_bytes": 10,
+        "repository_limit_source": "owner-confirmed-free-tier"}
+    for used, allowed in ((89, True), (90, True), (91, False)):
+        with patch(__name__ + ".api", return_value={"active_caches_size_in_bytes": used}):
+            assert benchmark_capacity(cache)["save_allowed"] is allowed
+            assert not benchmark_capacity(cache, usage_floor=91)["save_allowed"]
+    for usage in ({}, {"active_caches_size_in_bytes": -1}, {"active_caches_size_in_bytes": True}):
+        with patch(__name__ + ".api", return_value=usage):
+            assert not benchmark_capacity(cache)["save_allowed"]
+    with patch(__name__ + ".api", side_effect=TimeoutError("controlled unavailable")):
+        assert not benchmark_capacity(cache)["save_allowed"]
+    first_page = [{"id": number, "size_in_bytes": 2} for number in range(1, 101)]
+    with patch(__name__ + ".api", side_effect=[{"actions_caches": first_page, "total_count": 101},
+            {"actions_caches": [{"id": 101, "size_in_bytes": 3}], "total_count": 101}]) as transport:
+        assert live_cache_bytes() == 203 and transport.call_count == 2
+    for rows in ({"actions_caches": [], "total_count": 1},
+            {"actions_caches": [{"id": 1, "size_in_bytes": -1}], "total_count": 1},
+            {"actions_caches": [{"id": 1, "size_in_bytes": 1}] * 2, "total_count": 2}):
+        with patch(__name__ + ".api", return_value=rows):
+            try:
+                live_cache_bytes()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("An ambiguous cache listing was accepted")
+    with tempfile.TemporaryDirectory() as directory:
+        temporary = Path(directory).resolve()
+        candidate = temporary / "candidate"
+        candidate.mkdir()
+        (candidate / "object").write_bytes(b"bounded compiler object")
+        bound = cache_archive_bound([str(candidate)], temporary)["archive_upper_bound_bytes"]
+        assert bound > (candidate / "object").stat().st_size
+        invalid = (temporary, temporary.parent, temporary / "candidate/*")
+        for path in invalid:
+            try:
+                cache_archive_bound([str(path)], temporary)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("An unbounded cache path was accepted")
+        (candidate / "escape").symlink_to(temporary.parent, target_is_directory=True)
+        try:
+            cache_archive_bound([str(candidate)], temporary)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("An escaping cache symlink was accepted")
+        (candidate / "escape").unlink()
+        os.mkfifo(candidate / "pipe")
+        try:
+            cache_archive_bound([str(candidate)], temporary)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("A cache special file was accepted")
+        (candidate / "pipe").unlink()
+        limit = cm_platforms.load()["cache_limit_bytes"]
+        used = limit - bound * 2
+        listing = {"total_count": 2, "actions_caches": [
+            {"id": 1, "key": "unrelated-cargo-cache", "size_in_bytes": used - 1},
+            {"id": 2, "key": "other-namespace", "size_in_bytes": 1}]}
+        def fetch(path):
+            return listing if "/actions/caches?" in path else {"active_caches_size_in_bytes": 0}
+        env = {"RUNNER_TEMP": str(temporary), "CM_CI_LOG_DIR": str(temporary / "evidence"),
+            "CM_CACHE_MODE": "write", "ACTIONS_CACHE_MODE": "write", "CM_CACHE_SAVE_PATHS": str(candidate),
+            "CM_CACHE_SAVE_KEY": "cm-budget-fixture", "GITHUB_REPOSITORY": "DSLZL/CM-build-linux-x64",
+            "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "fixture"}
+        outputs = []
+        with patch.dict(os.environ, env, clear=True), patch(__name__ + ".verify_checkout"), \
+                patch(__name__ + ".api", side_effect=fetch), patch(__name__ + ".output", side_effect=outputs.append), \
+                patch("builtins.print"):
+            for _ in range(3):
+                cache_save_plan()
+            assert [row["save_allowed"] for row in outputs] == ["true", "true", "false"]
+            journal = temporary / "cm-repository-cache-reservation.json"
+            assert json.loads(journal.read_text())["usage_floor"] == limit
+            value = json.loads(journal.read_text())
+            value["context"]["GITHUB_RUN_ATTEMPT"] = "2"
+            journal.write_text(json.dumps(value))
+            cache_save_plan()
+            assert outputs[-1]["save_allowed"] == "false"
+            journal.unlink()
+            with patch(__name__ + ".api", side_effect=urllib.error.URLError("controlled unknown capacity")):
+                cache_save_plan()
+                assert outputs[-1]["save_allowed"] == "false" and not journal.exists()
+            with patch.dict(os.environ, {"CM_CACHE_MODE": "read"}), patch(__name__ + ".api") as transport:
+                cache_save_plan()
+                assert outputs[-1]["save_allowed"] == "false" and transport.call_count == 0
 
 
 def benchmark_preflight():
@@ -415,7 +610,7 @@ def verify_checkout():
             raise RuntimeError("Source default branch changed; retry the dispatch to recalculate cache authority")
     print(json.dumps({"source_repository": source, "source_sha": actual, "repository": worker,
                       "workflow_sha": workflow_sha, "cache_repository": worker, "cache_mode": mode,
-                      "request_id": request, "target": TARGET}, indent=2))
+                      "request_id": request, "target": cm_platforms.worker()["target"]}, indent=2))
 
 
 def verify_consumer():
@@ -528,6 +723,10 @@ def extract_consumer():
 
 def self_check():
     require_hosted_linux()
+    cm_platforms.self_check()
+    from record_run import self_check as record_self_check
+    record_self_check()
+    cache_budget_self_check()
     import io
     from unittest.mock import patch
 
@@ -936,7 +1135,7 @@ def receipt():
 if __name__ == "__main__":
     try:
         {"self-check": self_check, "preflight": preflight, "benchmark-preflight": benchmark_preflight,
-         "verify-checkout": verify_checkout, "verify-consumer": verify_consumer,
+         "verify-checkout": verify_checkout, "cache-save-plan": cache_save_plan, "verify-consumer": verify_consumer,
          "extract-consumer": extract_consumer, "restore-origin": restore_origin, "receipt": receipt}[sys.argv[1]]()
     except (RuntimeError, KeyError, IndexError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print("CM worker blocked/failed: " + str(exc), file=sys.stderr)

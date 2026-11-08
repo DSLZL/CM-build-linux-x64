@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Record a GitHub-hosted Linux x64 run; this is not a local test entry point."""
+"""Record an exact reviewed GitHub-hosted native run; never a local test entry point."""
 import datetime
 import json
 import os
 from pathlib import Path
+import platform
+import struct
 import subprocess
 import sys
+import sysconfig
+import cm_platforms
 
 
 def require_hosted_linux():
@@ -20,11 +24,30 @@ def require_hosted_linux():
         raise RuntimeError("CM compilation and tests require a GitHub-hosted Linux x64 job; missing/mismatched: " + ", ".join(wrong))
 
 
+def require_hosted_worker():
+    entry = cm_platforms.worker()
+    required = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+        "RUNNER_OS": entry["runner_os"], "RUNNER_ARCH": entry["runner_arch"]}
+    machine = platform.machine().lower()
+    native_arch = "ARM64" if machine in ("aarch64", "arm64") else "X64" if machine in ("x86_64", "amd64") else None
+    if (any(os.environ.get(key) != value for key, value in required.items())
+            or platform.system() != {"macOS": "Darwin"}.get(entry["runner_os"], entry["runner_os"])
+            or native_arch != entry["runner_arch"] or struct.calcsize("P") != 8
+            or entry["runner_os"] == "Windows" and sysconfig.get_platform() !=
+                {"X64": "win-amd64", "ARM64": "win-arm64"}[entry["runner_arch"]]):
+        raise RuntimeError("Product work requires the exact GitHub-hosted native OS/architecture for " + entry["key"])
+    return entry
+
+
 def record(output):
-    require_hosted_linux()
+    role = os.environ.get("CM_EXECUTION_ROLE", "source_checks")
+    if role == "source_checks":
+        require_hosted_linux()
+        entry = cm_platforms.select()
+    else:
+        entry = require_hosted_worker()
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    role = os.environ.get("CM_EXECUTION_ROLE", "source_checks")
     source_root = os.environ.get("CM_SOURCE_DIR", os.environ["GITHUB_WORKSPACE"])
     head = (os.environ["CM_SOURCE_SHA"] if role == "runtime_consumer" else
             subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source_root, text=True).strip())
@@ -35,6 +58,8 @@ def record(output):
         raise RuntimeError("Requested source SHA does not match the checked-out CM source")
     if role not in {"source_checks", "platform_builder", "runtime_consumer", "runtime_validation"}:
         raise RuntimeError("Unknown execution role")
+    if source_repository != "DSLZL/CM":
+        raise RuntimeError("Execution must bind the sole reviewed CM source repository")
     if role == "source_checks" and source_repository != repository:
         raise RuntimeError("Source checks must run in their source repository")
     if role in {"platform_builder", "runtime_consumer", "runtime_validation"} and (source_repository == repository or os.environ.get("CM_BUILDER_REPOSITORY") != repository):
@@ -49,12 +74,12 @@ def record(output):
                 "request_id": os.environ.get("CM_REQUEST_ID"),
                 "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
                 "workflow": os.environ["GITHUB_WORKFLOW_REF"], "job": os.environ["GITHUB_JOB"],
-                "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": "X64",
-                "target": "x86_64-unknown-linux-gnu", "conclusion": None}
+                "runner_environment": "github-hosted", "runner_os": entry["runner_os"], "runner_arch": entry["runner_arch"],
+                "target": entry["target"], "conclusion": None}
     fields = ["GITHUB_REPOSITORY", "GITHUB_WORKFLOW", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA",
               "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB", "GITHUB_EVENT_NAME", "GITHUB_REF",
               "GITHUB_SHA", "RUNNER_ENVIRONMENT", "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion"]
-    fields += ["CM_CACHE_MODE", "ACTIONS_CACHE_MODE", "CM_SOURCE_REPOSITORY", "CM_SOURCE_SHA", "CM_BUILDER_REPOSITORY", "CM_REQUEST_ID", "CM_CARGO_CACHE_HIT", "CM_CARGO_CACHE_MATCH", "CM_SCCACHE_ARCHIVE_HIT", "CM_SCCACHE_ARCHIVE_MATCH"]
+    fields += ["CM_PLATFORM", "CM_TARGET", "CM_CACHE_MODE", "ACTIONS_CACHE_MODE", "CM_SOURCE_REPOSITORY", "CM_SOURCE_SHA", "CM_BUILDER_REPOSITORY", "CM_REQUEST_ID", "CM_CARGO_CACHE_HIT", "CM_CARGO_CACHE_MATCH", "CM_SCCACHE_ARCHIVE_HIT", "CM_SCCACHE_ARCHIVE_MATCH"]
     previous = output / "run-metadata.json"
     observed = datetime.datetime.now(datetime.timezone.utc)
     first_observed = json.loads(previous.read_text(encoding="utf-8"))["first_observed_at_utc"] if previous.is_file() else observed.isoformat()
@@ -66,6 +91,49 @@ def record(output):
             "run_url": os.environ.get("GITHUB_SERVER_URL", "https://github.com") + "/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"]}
     identity["run_url"] = data["run_url"]
     (output / "run-metadata.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def self_check():
+    from unittest.mock import patch
+    for key in cm_platforms.load()["platforms"]:
+        entry = cm_platforms.select(key)
+        system = {"macOS": "Darwin"}.get(entry["runner_os"], entry["runner_os"])
+        machine = "arm64" if entry["runner_arch"] == "ARM64" else "AMD64"
+        python_platform = "win-arm64" if entry["runner_arch"] == "ARM64" else "win-amd64"
+        env = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+            "RUNNER_OS": entry["runner_os"], "RUNNER_ARCH": entry["runner_arch"]}
+        with patch("cm_platforms.worker", return_value=entry), patch.dict(os.environ, env, clear=True), \
+                patch("platform.system", return_value=system), patch("platform.machine", return_value=machine), \
+                patch("struct.calcsize", return_value=8), patch("sysconfig.get_platform", return_value=python_platform):
+            assert require_hosted_worker() == entry
+            for field, bad in (("GITHUB_ACTIONS", "false"), ("RUNNER_ENVIRONMENT", "self-hosted"),
+                    ("RUNNER_OS", "other"), ("RUNNER_ARCH", "other")):
+                with patch.dict(os.environ, {field: bad}):
+                    try:
+                        require_hosted_worker()
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError("A mismatched native worker was accepted")
+            for target, bad in (("platform.machine", "i386"), ("platform.system", "other"),
+                    ("struct.calcsize", 4)):
+                with patch(target, return_value=bad):
+                    try:
+                        require_hosted_worker()
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError("A non-native process was accepted")
+            if entry["runner_os"] == "Windows":
+                other = "win-amd64" if entry["runner_arch"] == "ARM64" else "win-arm64"
+                for wrong in ("win32", other):
+                    with patch("sysconfig.get_platform", return_value=wrong):
+                        try:
+                            require_hosted_worker()
+                        except RuntimeError:
+                            pass
+                        else:
+                            raise AssertionError("An emulated Windows Python was accepted")
 
 
 if __name__ == "__main__":

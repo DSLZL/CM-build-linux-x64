@@ -1,0 +1,34 @@
+name: Save within the reviewed repository cache budget
+description: Keep the original write authority and skip unavailable or over-budget saves
+inputs:
+  path:
+    description: Explicit runner-temporary cache paths
+    required: true
+  key:
+    description: Exact cache key
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Recheck total capacity and reserve this archive before saving
+      id: capacity
+      if: ${{ !cancelled() }}
+      shell: python
+      env:
+        CM_CACHE_SAVE_PATHS: ${{ inputs.path }}
+        CM_CACHE_SAVE_KEY: ${{ inputs.key }}
+        CM_POLICY_TOKEN: ${{ github.token }}
+      run: |
+        import os
+        from pathlib import Path
+        import subprocess
+        import sys
+        policy = Path(os.environ["GITHUB_ACTION_PATH"]).resolve().parents[1] / "scripts/worker_policy.py"
+        subprocess.run([sys.executable, "-B", str(policy), "cache-save-plan"], check=True)
+    - name: Save only the approved bounded archive
+      if: ${{ !cancelled() && steps.capacity.outputs.save_allowed == 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}
+        enableCrossOsArchive: false
