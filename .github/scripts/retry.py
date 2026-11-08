@@ -107,6 +107,13 @@ def read(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def write_validation(path, value):
+    text = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    if len(text.encode("utf-8")) > 16 * 1024 ** 2:
+        raise RuntimeError("Validation JSON exceeds the qualification reader limit")
+    path.write_text(text, encoding="utf-8")
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -884,7 +891,7 @@ def overlay(root, logs):
                 "target": label, "artifact": artifact_ref(record),
                 "inputs": {path: value for path, value in plan["probe_inputs"].items() if label in PRIVATE_PROBES[path]}}
     baseline = plan.get("checkpoint_origin")
-    write(destination / "validation.json", {"schema_version": 2, "provenance": runtime_consumer.provenance(),
+    write_validation(destination / "validation.json", {"schema_version": 2, "provenance": runtime_consumer.provenance(),
         "task_id": read(root / ".github/cm-ci.json")["task_id"],
         "environment": environment(), "production_inputs_sha256": plan["production_inputs_sha256"],
         "build_request": plan["build_request"],
@@ -920,7 +927,7 @@ def refresh():
     refresh_probes(inputs, validation)
     validation["original_input_manifest_sha256"] = original["sha256"]
     validation["consumer_environment"] = current_environment
-    write(inputs / "validation.json", validation)
+    write_validation(inputs / "validation.json", validation)
     entries = [e for e in runtime.inventory(inputs) if e["path"] != "input-manifest.json"]
     write(inputs / "input-manifest.json", {"files": entries, "sha256": runtime.digest(entries)})
 
@@ -1298,6 +1305,7 @@ def self_check():
     assert rootfs_key(base) != rootfs_key(changed)
     with patch.dict(os.environ, {"CM_SOURCE_REPOSITORY": os.environ.get("CM_SOURCE_REPOSITORY", os.environ["GITHUB_REPOSITORY"]),
             "CM_SOURCE_SHA": git(root, "rev-parse", "HEAD").decode().strip(), "CM_REQUEST_ID": "retry-self-check"}):
+        validation_self_check()
         checkpoint_self_check()
         refresh_self_check()
         history_self_check()
@@ -1857,6 +1865,28 @@ def refresh_self_check():
                 else:
                     raise AssertionError("Unbound overlay environment or provenance accepted")
                 assert runtime.inventory(inputs) == before
+
+
+def validation_self_check():
+    value = {"checkpoint_origins": [{"steps": [{"command": ["/usr/bin/env", "--", "payload"]}] * 12000}] * 12}
+    assert len(json.dumps(value, indent=2).encode("utf-8")) > 16 * 1024 ** 2
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "validation.json"
+        write_validation(path, value)
+        original = path.read_bytes()
+        archive_path = Path(directory) / "validation.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("validation.json", original)
+        with zipfile.ZipFile(archive_path) as archive:
+            assert policy().archive_json(archive, "validation.json") == value
+        try:
+            write_validation(path, {"payload": "x" * (16 * 1024 ** 2)})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Oversized validation metadata was written")
+        assert path.read_bytes() == original
+    print("CM bounded validation metadata roundtrip and rejection passed", flush=True)
 
 
 def checkpoint_self_check():

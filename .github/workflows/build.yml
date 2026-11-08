@@ -286,7 +286,7 @@ jobs:
       (needs.preflight.outputs.distribution_required != 'true' || needs.attest-distribution.result == 'success') &&
       (needs.program-prepare.result == 'success' || needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     cache-mode: none
     permissions:
       contents: read
