@@ -59,8 +59,16 @@ def native_inputs(root, revision):
     differences = {name: sorted(path for path in before[name].keys() | after[name].keys()
         if before[name].get(path) != after[name].get(path)) for name in after}
     print("CM program native input differences:", json.dumps(differences), flush=True)
-    assert before == after, "Native product inputs changed; program mode cannot rebuild"
-    return retry.digest(after)
+    reviewed = revision
+    if before != after:
+        reviewed = read(root / CONFIG)["benchmarks"]["source_sha"]
+        # S04 added source licenses and corrected only the cwd of the source-HEAD metadata query.
+        assert differences == {"compiler_recipes": [], "files": sorted(("ci/scripts/linux_ci.py",
+            "crates/cm-abi/LICENSE", "crates/cm-sdk/LICENSE", "examples/mods/review-before-send/LICENSE",
+            "examples/mods/tool-concurrency/LICENSE", "examples/mods/turn-budget/LICENSE"))}, "Unreviewed native input changes"
+        assert after == retry.product_inputs(root, reviewed), "Native inputs differ from the exact reviewed S04 source"
+    return {"projection_sha256": retry.digest(after), "production_source_sha": revision,
+        "reviewed_source_sha": reviewed, "non_compiler_differences": differences}
 
 
 def prepare():
@@ -137,7 +145,8 @@ def prepare():
                 benchmark_reports[name] = {"status": value["status"], "sha256": hashlib.sha256(raw).hexdigest(),
                     **{key: value[key] for key in ("elapsed_seconds", "distributions", "unavailable_metrics",
                         "measurement_limitations", "judgment", "expected_slots", "missing_slots") if key in value}}
-    current_native = native_inputs(root, production["source_sha"])
+    native = native_inputs(root, production["source_sha"])
+    current_native = native["projection_sha256"]
     probes = retry.probe_inputs(root, "HEAD")
     assert probes == baseline["probe_inputs"], "Private native probe inputs changed; program mode cannot compile"
     current = retry.test_inputs(root, "HEAD")
@@ -161,6 +170,7 @@ def prepare():
     validation["program"] = {"task_id": "CM-PROGRAM", "production": reference["production"],
         "qualification": qualified, "qualified_acceptance": accepted, "qualification_receipt": receipt,
         "original_run_conclusion": original_run["conclusion"], "capacity": capacity,
+        "native_inputs": native,
         "ordinary_audit": {"observed_sha256": retry.projection(
             retry.source(root, "HEAD", "ci/scripts/runtime_consumer.py"), ("observe",)),
             "checkpoint_sha256": retry.ordinary_audit(retry.source(root, "HEAD", "ci/scripts/runtime_consumer.py")),
@@ -246,6 +256,7 @@ def reports(inputs, artifact, evidence, validation, steps, audit, common, accept
         "qualification": program["qualification"], "validation": common["provenance"],
         "consumer_environment": validation["consumer_environment"], "capacity": program["capacity"],
         "ordinary_audit": program["ordinary_audit"],
+        "native_inputs": program["native_inputs"],
         "case_origins": {label: {key: row[key] for key in ("status", "kind", "origin")} for label, row in steps.items()},
         "case_counts": counts, "native_product_compilations": 0, "native_product_uploads": 0,
         "fresh_checks": ["API identities", "signed distribution/index materials", "rootfs", "namespace probes", "network canary", "read-only inventories"],
@@ -373,6 +384,19 @@ def self_check():
             raise AssertionError("Invalid checkpoint accepted: " + field)
     reference = read(root / definition["frozen_reference"])
     native_inputs(root, reference["production"]["source_sha"])
+    original_native = retry.product_inputs
+    for field, path in (("files", "crates/cm/src/lib.rs"), ("files", "crates/cm/Cargo.toml"),
+            ("files", "crates/cm-abi/LICENSE"), ("compiler_recipes", "compiler_environment")):
+        altered = deepcopy(original_native(root, "HEAD"))
+        altered[field][path] = "unreviewed mutation"
+        with patch.object(retry, "product_inputs", side_effect=lambda directory, revision:
+                altered if revision == "HEAD" else original_native(directory, revision)):
+            try:
+                native_inputs(root, reference["production"]["source_sha"])
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("Unreviewed native change accepted: " + path)
     base = retry.test_inputs(root, "HEAD")
     previous = retry.test_inputs(root, reference["qualification"]["origin"]["source_sha"])
     assert len(previous) == definition["checkpoints"]["case_count"] == 393
