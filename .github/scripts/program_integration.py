@@ -363,6 +363,12 @@ def self_check():
     assert len(previous) == definition["checkpoints"]["case_count"] == 393
     assert set(previous) <= set(base) and len(set(base) - set(previous)) == 18
     changed_legacy = sorted(label for label in previous if previous[label] != base[label])
+    fields = {key for value in previous.values() for key in value}
+    print("CM program historical changed fields:", json.dumps({key: sum(
+        previous[label].get(key) != base[label].get(key) for label in previous) for key in sorted(fields)}), flush=True)
+    print("CM program historical outer audit:", json.dumps({revision: retry.projection(
+        retry.source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
+        for revision in (reference["qualification"]["origin"]["source_sha"], "HEAD")}), flush=True)
     assert len(changed_legacy) < len(previous), "New registration invalidated every historical case"
     print("CM program historical dependency changes:", json.dumps(changed_legacy), flush=True)
     original_source = retry.source
