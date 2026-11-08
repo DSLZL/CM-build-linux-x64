@@ -100,7 +100,10 @@ def fetch(url, maximum=LIMIT):
     else:
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(url, timeout=90) as response:
+                # A transient gateway response can persist under the release URL's CDN cache key.
+                download = url + "?download=1" if attempt and url.startswith(
+                    "https://github.com/cli/cli/releases/download/") and "?" not in url else url
+                with urllib.request.urlopen(download, timeout=90) as response:
                     value = response.read(maximum + 1)
                 break
             except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
@@ -1063,6 +1066,11 @@ def self_check():
     runtime_consumer.check_distribution_verifier_binding(Path(os.environ["CM_SOURCE_DIR"]))
     from types import SimpleNamespace
     from unittest import mock
+    url = read(Path(os.environ["CM_SOURCE_DIR"]) / POLICY_PATH)["verifier"]["url"]
+    error = urllib.error.HTTPError(url, 504, "gateway timeout", {}, None)
+    with mock.patch("urllib.request.urlopen", side_effect=[error, io.BytesIO(b"pinned")]) as request, mock.patch("time.sleep"):
+        assert fetch(url) == b"pinned"
+        assert request.call_args_list == [mock.call(url, timeout=90), mock.call(url + "?download=1", timeout=90)]
     for error in (urllib.error.URLError(ConnectionResetError("reset")), TimeoutError("deadline"),
                   urllib.error.HTTPError("https://example.invalid/pinned", 503, "unavailable", {}, None)):
         with mock.patch("urllib.request.urlopen", side_effect=[error, io.BytesIO(b"pinned")]) as request, mock.patch("time.sleep") as pause:
