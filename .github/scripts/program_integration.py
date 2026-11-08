@@ -152,6 +152,10 @@ def prepare():
     validation["program"] = {"task_id": "CM-PROGRAM", "production": reference["production"],
         "qualification": qualified, "qualified_acceptance": accepted, "qualification_receipt": receipt,
         "original_run_conclusion": original_run["conclusion"], "capacity": capacity,
+        "ordinary_audit": {"observed_sha256": retry.projection(
+            retry.source(root, "HEAD", "ci/scripts/runtime_consumer.py"), ("observe",)),
+            "checkpoint_sha256": retry.ordinary_audit(retry.source(root, "HEAD", "ci/scripts/runtime_consumer.py")),
+            "scope": "Exact reviewed S04-only extension; retained case audits keep their original origin"},
         "benchmark": {"artifact": definition["benchmarks"], "acceptance": measured, "reports": benchmark_reports},
         "legacy_case_count": len(old), "changed_legacy_cases": changed,
         "allowed_executions": sorted((set(current) - set(old)) | set(changed)),
@@ -232,6 +236,7 @@ def reports(inputs, artifact, evidence, validation, steps, audit, common, accept
     chain = {"production_origin": common["production_origin"], "original_run_conclusion": program["original_run_conclusion"],
         "qualification": program["qualification"], "validation": common["provenance"],
         "consumer_environment": validation["consumer_environment"], "capacity": program["capacity"],
+        "ordinary_audit": program["ordinary_audit"],
         "case_origins": {label: {key: row[key] for key in ("status", "kind", "origin")} for label, row in steps.items()},
         "case_counts": counts, "native_product_compilations": 0, "native_product_uploads": 0,
         "fresh_checks": ["API identities", "signed distribution/index materials", "rootfs", "namespace probes", "network canary", "read-only inventories"],
@@ -372,6 +377,19 @@ def self_check():
     assert len(changed_legacy) < len(previous), "New registration invalidated every historical case"
     print("CM program historical dependency changes:", json.dumps(changed_legacy), flush=True)
     original_source = retry.source
+    audit_path = "ci/scripts/runtime_consumer.py"
+    qualified_audit = original_source(root, reference["qualification"]["origin"]["source_sha"], audit_path)
+    extended_audit = original_source(root, definition["benchmarks"]["source_sha"], audit_path)
+    assert retry.projection(qualified_audit, ("observe",)) != retry.projection(extended_audit, ("observe",))
+    assert retry.ordinary_audit(qualified_audit) == retry.ordinary_audit(extended_audit)
+    changed_audit = ast.parse(original_source(root, "HEAD", audit_path))
+    next(row for row in changed_audit.body if isinstance(row, ast.FunctionDef) and row.name == "observe").body.append(
+        ast.Assert(test=ast.Constant(False), msg=ast.Constant("changed ordinary audit rule")))
+    changed_audit = ast.unparse(ast.fix_missing_locations(changed_audit))
+    with patch.object(retry, "source", side_effect=lambda directory, revision, name:
+            changed_audit if name == audit_path else original_source(directory, revision, name)):
+        after = retry.test_inputs(root, "HEAD")
+    assert all(value["audit"] != after[label]["audit"] for label, value in base.items()), "Unknown audit policy reused old passes"
     def changed(path, function):
         module = ast.parse(original_source(root, "HEAD", path))
         node = next(row for row in module.body if isinstance(row, ast.FunctionDef) and row.name == function)

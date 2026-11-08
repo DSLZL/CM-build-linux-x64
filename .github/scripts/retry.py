@@ -169,6 +169,13 @@ def projection(text, entries=None, exclude=(), production=False):
     return digest({name: ast.dump(table[name], include_attributes=False) for name in sorted(wanted)})
 
 
+def ordinary_audit(text):
+    value = projection(text, ("observe",))
+    # shortcut: only the reviewed S04 benchmark extension is equivalent; review each future audit policy explicitly.
+    return {"47328f1b612ba418f19b32d647d1634cc6238084d4ee77ab720fbdbc3eea4557":
+            "e750d82559f46e79f8c4eb2634aa6d77d59b041c8588371efc00474098e792f2"}.get(value, value)
+
+
 def test_inputs(root, revision):
     texts = {path: source(root, revision, path) for path in RUNTIME_FILES
              if not path.endswith("ci_progress.py") and path not in (*SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES, *PROGRAM_RUNTIME_FILES)}
@@ -178,7 +185,7 @@ def test_inputs(root, revision):
     index_texts = {path: source(root, revision, path) for path in INDEX_RUNTIME_FILES if path in index_available}
     program_available = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", *PROGRAM_RUNTIME_FILES).decode().splitlines())
     program_texts = {path: source(root, revision, path) for path in PROGRAM_RUNTIME_FILES if path in program_available}
-    audit = projection(source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
+    audit = ordinary_audit(source(root, revision, "ci/scripts/runtime_consumer.py"))
     observer = projection(source(root, revision, "ci/scripts/runtime_composition.py"),
         ("audit_executions", "audit_network", "bound_bwrap_executions", "bound_sandbox_aliases",
          "complete_syscalls", "check_network_audit", "kernel_route_sockets", "provider_tcp_connections"))
