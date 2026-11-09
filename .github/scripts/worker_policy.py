@@ -786,7 +786,10 @@ def extract_consumer():
 
 
 def self_check():
-    require_hosted_linux()
+    if os.environ.get("GITHUB_REPOSITORY") == "DSLZL/CM":
+        require_hosted_linux()
+    else:
+        require_hosted_worker()
     cm_platforms.self_check()
     from record_run import self_check as record_self_check
     record_self_check()
