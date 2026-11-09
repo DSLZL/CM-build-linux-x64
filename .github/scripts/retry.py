@@ -1514,7 +1514,7 @@ def index_self_check(root, current):
         assert legacy == {label: value for label, value in current.items() if not label.startswith("s03-")}
         tree = original_git(root, "ls-tree", "-rz", "HEAD")
         for path in ("crates/cm/src/index.rs", "adapters/codex-e4568a3/cli-index.rs",
-                "adapters/codex-e4568a3/index.patch", "adapters/codex-e4568a3/source.json"):
+                "adapters/codex-e4568a3/index.patch"):
             rows = tree.split(b"\0")
             found = False
             for index, row in enumerate(rows):
@@ -1528,6 +1528,12 @@ def index_self_check(root, current):
             with patch.object(module, "git", side_effect=lambda directory, *args:
                     b"\0".join(rows) if args == ("ls-tree", "-rz", "HEAD") else original_git(directory, *args)):
                 assert product_inputs(root, "HEAD") != production, path
+        path = "adapters/codex-e4568a3/source.json"
+        pin = json.loads(snapshot(root, "HEAD", path))
+        pin["commit"] = "f" * 40
+        with patch.object(module, "source", side_effect=lambda directory, revision, name:
+                json.dumps(pin) if name == path else snapshot(directory, revision, name)):
+            assert product_inputs(root, "HEAD") != production, "Upstream commit did not invalidate production"
     closure = {"packages": {}, "files": [{"path": "inputs/host/bin/codex", "sha256": "a"},
         {"path": "fixture/binary-index-tls/cert.pem", "sha256": "certificate"},
         {"path": "fixture/binary-index-tls/key.pem", "sha256": "test-key"}],
