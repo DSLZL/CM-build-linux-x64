@@ -30,7 +30,7 @@ def require_hosted_linux():
 
 
 def require_hosted_worker(*, enabled=True):
-    entry = cm_platforms.worker(enabled=enabled)
+    entry = cm_platforms.worker(root=Path(__file__).resolve().parents[2], enabled=enabled)
     required = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
         "RUNNER_OS": entry["runner_os"], "RUNNER_ARCH": entry["runner_arch"]}
     machine = platform.machine().lower()
@@ -152,6 +152,13 @@ def self_check():
                             pass
                         else:
                             raise AssertionError("An emulated Windows Python was accepted")
+    env = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
+        "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64", "GITHUB_REPOSITORY": "DSLZL/CM-build-linux-x64",
+        "CM_PLATFORM": "linux-x64", "CM_TARGET": "x86_64-unknown-linux-gnu"}
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, env, clear=True), \
+            patch("cm_platforms.__file__", str(Path(directory) / "runtime-inputs/cm_platforms.py")), \
+            patch("platform.system", return_value="Linux"), patch("platform.machine", return_value="x86_64"):
+        assert require_hosted_worker()["key"] == "linux-x64"
     entry = cm_platforms.select("linux-arm64")
     env = {"CM_EXECUTION_ROLE": "platform_preflight", "GITHUB_JOB": "native-preflight",
         "GITHUB_REPOSITORY": entry["repository"], "CM_BUILDER_REPOSITORY": entry["repository"],
