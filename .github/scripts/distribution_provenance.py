@@ -14,10 +14,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from cm_platforms import linux_native
 
 REPORTS = ("binary-provenance.json", "distribution-sbom-license.json",
     "source-closure-no-install-build.json", "artifact-identity-boundaries.json", "release-runtime-trace.json")
-POLICY_PATH = "crates/cm/src/distribution-policy.json"
+POLICY_PATH = "crates/cm/src/" + ("distribution-policy-arm64.json"
+    if linux_native()["machine"] == 183 else "distribution-policy.json")
 ROOT_PATH = "crates/cm/src/distribution-root.jsonl"
 LIMIT = 32 * 1024 * 1024
 CARGO_BINDING_SOURCE_PIN = ("denoland/rusty_v8", "v8", "152.2.0",
@@ -160,7 +162,7 @@ def verifier(root, logs):
     directory.mkdir()
     archive = fetch(pin["url"], 128 * 1024 * 1024)
     assert hashlib.sha256(archive).hexdigest() == pin["archive_sha256"], "Verifier archive pin mismatch"
-    name = "gh_" + pin["version"] + "_linux_amd64/bin/gh"
+    name = pin["archive"].removesuffix(".tar.gz") + "/bin/gh"
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as stream:
         member = stream.getmember(name)
         assert member.isfile() and 0 < member.size <= 128 * 1024 * 1024
@@ -563,7 +565,7 @@ def cargo_audit():
     root = Path(os.environ["CM_SOURCE_DIR"])
     if host.load_config(root)["task_id"] not in ("CM-S01", "CM-S02", "CM-S03"):
         return
-    assert os.environ["GITHUB_REPOSITORY"] == "DSLZL/CM-build-linux-x64"
+    assert os.environ["GITHUB_REPOSITORY"] == "DSLZL/CM-build-" + linux_native()["key"]
     metadata = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", host.TARGET],
         cwd=root / host.HOST / "codex-rs", text=True))
@@ -796,7 +798,7 @@ def prepare(root, inputs, frozen, logs, authors):
         write(material / "sbom.spdx.json", sbom(directory, name, cargo, rows, production))
         write(material / "assets.json", rows)
         draft = {"schema_version": 1, "domain": "cm.release-receipt.v1", "role": "host" if role == "host" else "mod",
-            "name": name, "version": version, "target": "x86_64-unknown-linux-gnu",
+            "name": name, "version": version, "target": linux_native()["target"],
             "source": {"repository": policy["source_repository"], "repository_id": policy["source_repository_id"],
                 "sha": os.environ["CM_SOURCE_SHA"]},
             "production_origin": production, "artifact": {"archive_sha256": sha(archive), "archive_size": archive.stat().st_size,
@@ -840,7 +842,7 @@ def validate_materials(directory, policy):
             "production_origin", "artifact", "contracts", "materials", "policy_sha256"}
         assert draft["schema_version"] == 1 and draft["domain"] == "cm.release-receipt.v1"
         assert draft["role"] == ("host" if name == "cm-host" else "mod")
-        assert draft["target"] == "x86_64-unknown-linux-gnu" and 0 < len(draft["version"]) <= 128
+        assert draft["target"] == linux_native()["target"] and 0 < len(draft["version"]) <= 128
         assert re.fullmatch(r"[0-9a-f]{40}", draft["source"]["sha"])
         assert draft["production_origin"] == value["production_origin"] and draft["contracts"]
         assert set(draft["materials"]) == {"sbom", "notice", "source"}
@@ -956,7 +958,7 @@ def attest_prepare():
         "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100", ["preflight", os.environ["CM_BUILD_JOB"]])
     worker.build_request()
     run = worker.api("repos/" + repository + "/actions/runs/" + str(origin["run_id"]))
-    name = "cm-linux-x64-distribution-materials-" + origin["request_id"] + "-" + str(origin["run_attempt"])
+    name = f"cm-{linux_native()['key']}-distribution-materials-" + origin["request_id"] + "-" + str(origin["run_attempt"])
     records = worker.api("repos/" + repository + "/actions/runs/" + str(origin["run_id"]) + "/artifacts?per_page=100")["artifacts"]
     matches = [row for row in records if row["name"] == name and not row["expired"]]
     assert len(matches) == 1, "Missing/ambiguous original distribution materials"
@@ -972,7 +974,7 @@ def attest_prepare():
     assert value["production_origin"]["workflow_sha"] == origin["workflow_sha"]
     output = Path(os.environ["RUNNER_TEMP"]) / "cm-distribution-proofs"
     output.mkdir()
-    previous_name = "cm-linux-x64-distribution-proofs-" + origin["request_id"] + "-" + str(origin["run_attempt"])
+    previous_name = f"cm-{linux_native()['key']}-distribution-proofs-" + origin["request_id"] + "-" + str(origin["run_attempt"])
     previous = [row for row in records if row["name"] == previous_name and not row["expired"]]
     reuse = origin["run_id"] != int(os.environ["GITHUB_RUN_ID"]) and len(previous) == 1
     if reuse:
@@ -1011,7 +1013,7 @@ def consume_proofs():
     worker.identities()
     artifact_id = int(os.environ["CM_DISTRIBUTION_ARTIFACT_ID"])
     record = worker.api("repos/" + policy["builder_repository"] + "/actions/artifacts/" + str(artifact_id))
-    worker.artifact_binding(record, artifact_id, "cm-linux-x64-distribution-proofs-" + os.environ["CM_REQUEST_ID"] +
+    worker.artifact_binding(record, artifact_id, f"cm-{linux_native()['key']}-distribution-proofs-" + os.environ["CM_REQUEST_ID"] +
         "-" + os.environ["GITHUB_RUN_ATTEMPT"], os.environ["CM_DISTRIBUTION_ARTIFACT_DIGEST"].removeprefix("sha256:"), int(os.environ["GITHUB_RUN_ID"]))
     jobs = worker.receipt_jobs("repos/" + policy["builder_repository"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] +
         "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100", ["attest-distribution"])
@@ -1040,7 +1042,7 @@ def prepare_bootstrap(inputs):
         archive = fetch(pin["url"] + "?download=1", 128 * 1024 * 1024)
     assert hashlib.sha256(archive).hexdigest() == pin["archive_sha256"]
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as stream:
-        member = stream.getmember("gh_" + pin["version"] + "_linux_amd64/bin/gh")
+        member = stream.getmember(pin["archive"].removesuffix(".tar.gz") + "/bin/gh")
         assert member.isfile() and member.size <= 128 * 1024 * 1024
         (bootstrap / "gh").write_bytes(stream.extractfile(member).read())
     (bootstrap / "gh").chmod(0o755)
@@ -1224,7 +1226,7 @@ def self_check():
             write(material / "assets.json", [asset])
             draft = {"schema_version": 1, "domain": "cm.release-receipt.v1",
                 "role": "host" if name == "cm-host" else "mod", "name": name, "version": "1.0.0",
-                "target": "x86_64-unknown-linux-gnu", "source": {**asset["source"], "repository_id": 1430833890},
+                "target": linux_native()["target"], "source": {**asset["source"], "repository_id": 1430833890},
                 "production_origin": origin, "contracts": {"self_check": True}, "policy_sha256": checksum,
                 "artifact": {**{key: checksum for key in ("archive_sha256", "manifest_sha256", "payload_sha256")},
                     "archive_size": 3, "object_sha256": hashlib.sha256(canonical({"sbom-file.txt": [3, checksum]})).hexdigest()},

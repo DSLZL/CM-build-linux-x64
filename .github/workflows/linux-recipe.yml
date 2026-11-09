@@ -1,7 +1,7 @@
 # Initialize runner temporary paths after the exact source checkout.
 # Called only by this builder repository's reviewed build.yml.
 # Omitting cache-mode here inherits the caller's explicit platform-enforced cap.
-name: CM native Linux x64 recipe
+name: CM native GNU Linux recipe
 
 on:
   workflow_call:
@@ -67,7 +67,8 @@ defaults:
 
 jobs:
   linux-x64:
-    runs-on: ubuntu-24.04
+    name: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64' }}
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 90
     concurrency:
       group: ${{ inputs.cache_mode == 'write' && 'cm-repository-cache-writer' || format('cm-cache-reader-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.request_id) }}
@@ -82,6 +83,8 @@ jobs:
       validation_artifact_id: ${{ steps.validation-upload.outputs.artifact-id }}
       validation_artifact_digest: ${{ steps.validation-upload.outputs.artifact-digest }}
     env:
+      CM_PLATFORM: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64' }}
+      CM_TARGET: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
       CM_SOURCE_DIR: ${{ github.workspace }}/cm-source
       CM_SOURCE_REPOSITORY: ${{ inputs.source_repository }}
       CM_SOURCE_SHA: ${{ inputs.source_sha }}
@@ -125,8 +128,8 @@ jobs:
             echo "SCCACHE_DIR=$RUNNER_TEMP/cm-sccache"
             echo "CM_HOST_BUILD_CACHE_DIR=$RUNNER_TEMP/cm-host-build-cache"
             echo "CM_ACCEPTANCE_BUILD_CACHE_DIR=$RUNNER_TEMP/cm-acceptance-build-cache"
-            echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-linux-x64-evidence"
-            echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-linux-x64-artifacts"
+            echo "CM_CI_LOG_DIR=$RUNNER_TEMP/cm-${CM_PLATFORM}-evidence"
+            echo "CM_CI_ARTIFACT_DIR=$RUNNER_TEMP/cm-${CM_PLATFORM}-artifacts"
             echo "CM_CONSUMER_INPUT_DIR=$RUNNER_TEMP/cm-runtime-inputs"
             echo "CM_CONSUMER_TRANSFER_DIR=$RUNNER_TEMP/cm-runtime-transfer"
             echo "CM_TEST_BUILD_DIR=$RUNNER_TEMP/cm-test-builds"
@@ -509,7 +512,7 @@ jobs:
         if: ${{ success() && steps.reuse.outputs.reused != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-task-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-task-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_ARTIFACT_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -517,7 +520,7 @@ jobs:
         if: ${{ success() && inputs.distribution_required && steps.reuse.outputs.reused != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-distribution-materials-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-distribution-materials-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_ARTIFACT_DIR }}/distribution
           if-no-files-found: error
           retention-days: 14
@@ -526,7 +529,7 @@ jobs:
         if: ${{ success() && inputs.consumer_required && steps.reuse.outputs.reused != 'true' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-runtime-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-runtime-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CONSUMER_TRANSFER_DIR }}
           compression-level: 0
           if-no-files-found: error
@@ -536,7 +539,7 @@ jobs:
         if: steps.probe-build.outputs.core_probe == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-m02-native-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-m02-native-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/m02-native-probe-build
           if-no-files-found: error
           retention-days: 14
@@ -545,7 +548,7 @@ jobs:
         if: steps.probe-build.outputs.tui_probe == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-review-tui-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-review-tui-probe-build-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/review-tui-probe-build
           if-no-files-found: error
           retention-days: 14
@@ -554,7 +557,7 @@ jobs:
         if: steps.probe-build.outputs.g06_sdk_a_v1 == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-g06-sdk-a-v1-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-a-v1-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-a-v1
           if-no-files-found: error
           retention-days: 14
@@ -563,7 +566,7 @@ jobs:
         if: steps.probe-build.outputs.g06_sdk_a_v2 == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-g06-sdk-a-v2-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-a-v2-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-a-v2
           if-no-files-found: error
           retention-days: 14
@@ -572,7 +575,7 @@ jobs:
         if: steps.probe-build.outputs.g06_sdk_a_replacement == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-g06-sdk-a-replacement-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-a-replacement-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-a-replacement
           if-no-files-found: error
           retention-days: 14
@@ -581,7 +584,7 @@ jobs:
         if: steps.probe-build.outputs.g06_sdk_b_v1 == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-g06-sdk-b-v1-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-b-v1-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-b-v1
           if-no-files-found: error
           retention-days: 14
@@ -590,7 +593,7 @@ jobs:
         if: steps.probe-build.outputs.g06_sdk_b_v2 == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-g06-sdk-b-v2-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-b-v2-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-b-v2
           if-no-files-found: error
           retention-days: 14
@@ -599,7 +602,7 @@ jobs:
         if: steps.probe-build.outputs.g06_sdk_b_replacement == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-test-build-g06-sdk-b-replacement-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-test-build-g06-sdk-b-replacement-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_TEST_BUILD_DIR }}/g06-sdk-b-replacement
           if-no-files-found: error
           retention-days: 14
@@ -624,7 +627,7 @@ jobs:
         id: validation-upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-validation-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-validation-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_VALIDATION_INPUT_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -737,7 +740,7 @@ jobs:
         if: ${{ always() && steps.policy.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_LOG_DIR }}
           if-no-files-found: error
           retention-days: 14

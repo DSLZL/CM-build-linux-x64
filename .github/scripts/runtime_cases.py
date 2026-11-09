@@ -5,6 +5,7 @@ from functools import lru_cache
 import hashlib
 import json
 from pathlib import Path
+from cm_platforms import linux_native
 
 ENTRY_INVALID = ("short-prefix", "short-tail", "future-minor", "stride", "count", "null-array",
     "misaligned-array", "reserved", "descriptor-size", "descriptor-minor", "descriptor-reserved",
@@ -95,7 +96,7 @@ DRIVERS = {"p04": "fixtures/runtime-consumer/driver.py", "m01": "ci/scripts/mod_
            "s02": "fixtures/compatibility-policy/driver.py", "s03": "fixtures/binary-index/driver.py",
            "program": "fixtures/program-integration/driver.py"}
 MODULES = {**{name: "ci/scripts/" + name + ".py" for name in
-    ("mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
+    ("cm_platforms", "mod_manifest", "runtime_sdk", "managed_package", "runtime_state", "mod_author",
      "turn_budget", "review_before_send", "tool_concurrency", "runtime_qualification", "runtime_hooks", "runtime_upgrade", "runtime_cases", "sdk_seams", "distribution_provenance", "support_policy", "binary_index")},
     "core": "fixtures/native-loader/core_acceptance.py", "core_acceptance": "fixtures/native-loader/core_acceptance.py",
     "tool_barrier": "fixtures/native-loader/tool_barrier.py"}
@@ -176,6 +177,33 @@ def labels():
     return {phase + "-" + case: (phase, case) for phase, cases in GROUPS.items() for case in cases}
 
 
+def historical_hosts(target=None):
+    return linux_native(target)["key"] == "linux-x64"
+
+
+def cases(phase, target=None):
+    if historical_hosts(target):
+        return GROUPS[phase]
+    return tuple(case for case in GROUPS[phase] if phase != "g05" and
+        (phase, case) not in (("g01", "binding-other-host"), ("g06", "old-host-reject")))
+
+
+def deferred_check(check, target=None):
+    assert not historical_hosts(target), "Historical checks remain required on Linux x64"
+    return {"status": "not_run", "check": check, "target": linux_native(target)["target"],
+        "reason": "New-platform first release: historical native Host upgrade and rejection checks deferred by user decision; no historical CLI built."}
+
+
+def qualification_scope(target=None):
+    deferred = [phase + "-" + case for phase in GROUPS for case in GROUPS[phase]
+        if case not in cases(phase, target)]
+    return {"target": linux_native(target)["target"], "not_run_cases": deferred,
+        "not_run_checks": [deferred_check(check, target) for check in (
+            "g02a-plug-and-play/legacy-host", "review-plug-and-play/legacy-host",
+            "s01-compatibility/legacy-host", "s02-boundaries/legacy-upgrade")]
+            if not historical_hosts(target) else [], "release_ready": False}
+
+
 def function(case, phase=None):
     if phase in ("g01", "g05", "g06", "s01", "s03"):
         return "case_" + case.replace("-", "_")
@@ -185,7 +213,7 @@ def function(case, phase=None):
 
 
 def enter(namespace, phase, case):
-    assert case in GROUPS[phase]
+    assert case in cases(phase), "Case outside this platform's qualification scope"
     originals = namespace.setdefault("_case_roots", {key: namespace[key] for key in
         ("WORK", "PROFILE", "EVIDENCE", "OFFICIAL_PROFILE", "COPY") if key in namespace})
     for key, base in originals.items():
@@ -220,7 +248,7 @@ def merge(left, right):
 
 def aggregate(evidence, phase, report_names):
     reports = {name: {} for name in report_names}
-    for case in GROUPS[phase]:
+    for case in cases(phase):
         directory = evidence / phase / case
         assert json.loads((directory / "suite.json").read_text())["status"] == "pass"
         row = json.loads((directory / "reports.json").read_text())
@@ -232,7 +260,7 @@ def aggregate(evidence, phase, report_names):
     directory = evidence if phase == "p04" else evidence / phase
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "suite.json").write_text(json.dumps({"status": "pass", "reports": list(report_names),
-        "cases": list(GROUPS[phase]), "release_ready": False}) + "\n")
+        "cases": list(cases(phase)), "release_ready": False}) + "\n")
 
 
 class Business(ast.NodeTransformer):
@@ -448,6 +476,14 @@ def _closure(texts, entries, dispatch, extra_modules):
 
 def self_check():
     root = Path(__file__).resolve().parents[2]
+    x64, arm = "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"
+    assert all(cases(phase, x64) == values for phase, values in GROUPS.items())
+    assert not cases("g05", arm) and "binding-other-host" not in cases("g01", arm)
+    assert "old-host-reject" not in cases("g06", arm)
+    assert cases("s01", arm) == GROUPS["s01"] and cases("s02", arm) == GROUPS["s02"]
+    assert not qualification_scope(x64)["not_run_cases"]
+    assert len(qualification_scope(arm)["not_run_cases"]) == len(GROUPS["g05"]) + 2
+    assert len(qualification_scope(arm)["not_run_checks"]) == 4
     for phase, path in DRIVERS.items():
         missing = {"WORK", "PROFILE", "EVIDENCE"} - bindings(ast.parse((root / path).read_text())).keys()
         assert not missing, ("Missing case roots", phase, sorted(missing))

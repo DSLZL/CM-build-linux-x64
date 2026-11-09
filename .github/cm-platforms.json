@@ -26,7 +26,7 @@
       "library_suffix": ".so",
       "exe_suffix": "",
       "recipe": "linux-recipe.yml",
-      "enabled": false
+      "enabled": true
     },
     "macos-arm64": {
       "repository": "DSLZL/CM-build-macos-arm64",

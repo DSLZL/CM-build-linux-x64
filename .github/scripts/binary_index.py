@@ -17,10 +17,11 @@ import tomllib
 import zipfile
 
 import distribution_provenance as distribution
+from cm_platforms import foreign_linux_target, linux_native
 
 REPORTS = ("binary-index-identity.json", "binary-discovery-read-only.json", "binary-extraction-boundary.json",
     "binary-index-to-runtime-plan.json", "binary-index-support-display.json", "binary-index-offline-install.json")
-TARGET = "x86_64-unknown-linux-gnu"
+TARGET = linux_native()["target"]
 NAMESPACE = "github:1430833890"
 ARCHIVE_CASES = ("traversal", "absolute", "symlink", "duplicate", "case-collision", "entry-limit", "byte-limit")
 INDEX_DATA = "fixtures/binary-index/cases.json"
@@ -204,6 +205,7 @@ def toml_document(fields):
 def elf_needed(data):
     """Read only ELF64 dynamic tables; no subprocess or native loading in the privileged signer."""
     assert data[:6] == b"\x7fELF\x02\x01" and 64 <= len(data) <= 64 * 1024 * 1024
+    assert struct.unpack_from("<H", data, 18)[0] == linux_native()["machine"], "Foreign ELF in signing inputs"
     offset, size, count = struct.unpack_from("<Q", data, 32)[0], *struct.unpack_from("<HH", data, 54)
     assert size == 56 and 0 < count <= 128 and offset + size * count <= len(data)
     segments = [struct.unpack_from("<IIQQQQQQ", data, offset + index * size) for index in range(count)]
@@ -252,7 +254,8 @@ def prepare_indexes():
     variants["exclusive"] = [records["exclusive-a"], records["exclusive-b"]]
     variants["revoked"] = [dict(records["sdk-a"], status="revoked")]
     missing = copy.deepcopy(records["sdk-a"])
-    missing["target"] = missing["declarations"]["binary"]["target"] = "aarch64-unknown-linux-gnu"
+    missing["target"] = missing["declarations"]["binary"]["target"] = foreign_linux_target()
+    missing["declarations"]["binary"]["cpu"] = linux_native(missing["target"])["cpu"]
     variants["missing-target"] = [missing]
     namespace = dict(records["sdk-a"], namespace="github:1")
     variants["namespace"] = [namespace]
@@ -313,7 +316,7 @@ def bound_artifact(prefix, role):
     policy = distribution.read(Path(__file__).parent / "distribution-policy.json")
     artifact_id = int(os.environ["CM_" + role + "_ARTIFACT_ID"])
     record = worker.api("repos/" + policy["builder_repository"] + "/actions/artifacts/" + str(artifact_id))
-    worker.artifact_binding(record, artifact_id, "cm-linux-x64-" + prefix + "-" + os.environ["CM_REQUEST_ID"]
+    worker.artifact_binding(record, artifact_id, f"cm-{linux_native()['key']}-" + prefix + "-" + os.environ["CM_REQUEST_ID"]
         + "-" + os.environ["GITHUB_RUN_ATTEMPT"], os.environ["CM_" + role + "_ARTIFACT_DIGEST"].removeprefix("sha256:"),
         int(os.environ["GITHUB_RUN_ID"]))
     return policy, record
@@ -491,6 +494,7 @@ def self_check(root):
     from unittest.mock import patch
     data = distribution.read(root / INDEX_DATA)
     assert set(data["cases"]) == set(runtime_cases.GROUPS["s03"])
+    assert all(value["target"] == "native" for value in data["cases"].values())
     sample = {"mod.toml": b"data", "payload.so": b"native"}
     assert zip_files(archive_bytes(sample)) == sample
     with patch("zipfile.time.localtime", return_value=(2026, 11, 6, 12, 0, 0, 4, 310, 0)):

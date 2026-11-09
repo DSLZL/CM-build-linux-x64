@@ -17,9 +17,10 @@ import urllib.request
 import zipfile
 from record_run import require_hosted_linux, require_hosted_worker
 import cm_platforms
+from cm_platforms import linux_native
 import stat
 
-TARGET = "x86_64-unknown-linux-gnu"
+TARGET = cm_platforms.linux_native()["target"]
 
 
 def checked(value, pattern, label):
@@ -113,22 +114,22 @@ def verify_origin(origin, source, worker, workflow_sha):
         or run.get("head_sha") != origin["workflow_sha"] or run.get("event") != "workflow_dispatch"
         or run.get("repository", {}).get("full_name") != worker
         or run.get("path") != ".github/workflows/build.yml"
-        or run.get("display_title") != "CM Linux x64 / " + origin["request_id"]):
+        or run.get("display_title") != f"CM {linux_native()['label']} / " + origin["request_id"]):
         raise RuntimeError("Host origin is not the exact successful qualification run/attempt")
     for repository, base, head in ((worker, origin["workflow_sha"], workflow_sha),
                                    (source, origin["source_sha"], os.environ["CM_SOURCE_SHA"])):
         if api("repos/" + repository + "/compare/" + base + "..." + head).get("status") not in ("ahead", "identical"):
             raise RuntimeError("Qualification origin must belong to the reviewed source/worker ancestry")
     jobs = api(path + "/attempts/" + str(origin["run_attempt"]) + "/jobs?per_page=100")["jobs"]
-    producers = [row for row in jobs if row.get("name") in ("build-read / linux-x64", "build-write / linux-x64")
+    producers = [row for row in jobs if row.get("name") in ("build-read / " + linux_native()["key"], "build-write / " + linux_native()["key"])
         and row.get("conclusion") == "success"]
     if len(producers) != 1:
         raise RuntimeError("Qualification requires one successful actual producer")
     for name in ("preflight", producers[0]["name"], "runtime-consumer", "receipt"):
         successful_job(jobs, name)
     artifacts = {}
-    for prefix, name in (("input", "cm-linux-x64-runtime-inputs-"),
-                         ("consumer", "cm-linux-x64-consumer-artifacts-"), ("receipt", "cm-build-receipt-")):
+    for prefix, name in (("input", f"cm-{linux_native()['key']}-runtime-inputs-"),
+                         ("consumer", f"cm-{linux_native()['key']}-consumer-artifacts-"), ("receipt", "cm-build-receipt-")):
         record = api("repos/" + worker + "/actions/artifacts/" + str(origin[prefix + "_artifact_id"]))
         # A reused input is bound to its original producer after the exact qualification receipt is verified.
         if prefix != "input" or record.get("workflow_run", {}).get("id") == origin["run_id"]:
@@ -179,14 +180,14 @@ def archive_json(archive, name):
 
 def qualification_receipt(receipt, origin, jobs, source, worker):
     ci = receipt["ci"]
-    if ci.get("job") not in ("build-read / linux-x64", "build-write / linux-x64"):
+    if ci.get("job") not in ("build-read / " + linux_native()["key"], "build-write / " + linux_native()["key"]):
         raise RuntimeError("Qualification receipt has no actual producer job")
     expected = {"provider": "github_actions", "source_repository": source, "repository": worker,
         "head_sha": origin["source_sha"], "source_sha": origin["source_sha"],
         "workflow_sha": origin["workflow_sha"], "run_id": origin["run_id"], "run_attempt": origin["run_attempt"],
         "request_id": origin["request_id"], "build_kind": "qualification", "execution_role": "platform_builder",
         "cache_repository": worker, "workflow": ".github/workflows/build.yml", "target": TARGET,
-        "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": "X64",
+        "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": linux_native()["runner_arch"],
         **successful_job(jobs, ci["job"])}
     if any(ci.get(key) != value for key, value in expected.items()):
         raise RuntimeError("Qualification receipt differs from exact origin or actual producer")
@@ -212,12 +213,12 @@ def qualification_receipt(receipt, origin, jobs, source, worker):
             raise RuntimeError("Qualification receipt has a different original producer")
         validation = consumer.get("validation_artifact") or {}
         artifact_binding(api("repos/" + worker + "/actions/artifacts/" + str(validation["artifact_id"])),
-            validation["artifact_id"], "cm-linux-x64-validation-inputs-" + origin["request_id"] + "-" + str(origin["run_attempt"]),
+            validation["artifact_id"], f"cm-{linux_native()['key']}-validation-inputs-" + origin["request_id"] + "-" + str(origin["run_attempt"]),
             validation["artifact_sha256"], origin["run_id"])
         assert records["input_artifact"]["id"] == origin["input_artifact_id"]
     else:
         record = api("repos/" + worker + "/actions/artifacts/" + str(origin["input_artifact_id"]))
-        artifact_binding(record, origin["input_artifact_id"], "cm-linux-x64-runtime-inputs-" + origin["request_id"] + "-" + str(origin["run_attempt"]),
+        artifact_binding(record, origin["input_artifact_id"], f"cm-{linux_native()['key']}-runtime-inputs-" + origin["request_id"] + "-" + str(origin["run_attempt"]),
                          origin["input_artifact_sha256"], origin["run_id"])
     if receipt.get("index") is not None:
         verify_index_receipt(receipt["index"], jobs=jobs, ci=ci, consumer=consumer)
@@ -393,7 +394,7 @@ def native_preflight_self_check():
                 pass
             else:
                 raise AssertionError("Mechanism exception escaped its reviewed ARM64 target")
-    print("CM ARM64 mechanism authority self-check passed; normal disabled product routing remains closed", flush=True)
+    print("CM ARM64 mechanism authority self-check passed; product routing requires an enabled exact native worker", flush=True)
 
 
 def benchmark_capacity(cache, pending_bytes=None, *, usage_floor=0):
@@ -586,7 +587,7 @@ def cache_budget_self_check():
             return listing if "/actions/caches?" in path else {"active_caches_size_in_bytes": 0}
         env = {"RUNNER_TEMP": str(temporary), "CM_CI_LOG_DIR": str(temporary / "evidence"),
             "CM_CACHE_MODE": "write", "ACTIONS_CACHE_MODE": "write", "CM_CACHE_SAVE_PATHS": str(candidate),
-            "CM_CACHE_SAVE_KEY": "cm-budget-fixture", "GITHUB_REPOSITORY": "DSLZL/CM-build-linux-x64",
+            "CM_CACHE_SAVE_KEY": "cm-budget-fixture", "GITHUB_REPOSITORY": "DSLZL/CM-build-" + linux_native()["key"],
             "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_JOB": "fixture"}
         outputs = []
         with patch.dict(os.environ, env, clear=True), patch(__name__ + ".verify_checkout"), \
@@ -644,7 +645,7 @@ def benchmark_preflight():
         assert run["head_sha"] == seed["worker_sha"] and run["event"] == "workflow_dispatch"
         assert run["path"] == ".github/workflows/build.yml" and run["run_attempt"] == seed["run_attempt"]
         jobs = api(run_path + "/attempts/" + str(seed["run_attempt"]) + "/jobs?per_page=100")["jobs"]
-        producer = successful_job(jobs, "build-write / linux-x64")
+        producer = successful_job(jobs, "build-write / " + linux_native()["key"])
         seed_status.update(status="available", usable=True, cache=exact[0], producer=producer)
     except (urllib.error.URLError, KeyError, AssertionError, TypeError, RuntimeError) as error:
         seed_status.update(reason=str(error) or type(error).__name__)
@@ -685,7 +686,7 @@ def verify_consumer():
     artifact = api("repos/" + worker + "/actions/artifacts/" + str(artifact_id))
     origin = production_origin()
     input_run = origin["run_id"] if origin else int(os.environ["GITHUB_RUN_ID"])
-    expected_name = origin["input_artifact"]["name"] if origin else "cm-linux-x64-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    expected_name = origin["input_artifact"]["name"] if origin else f"cm-{linux_native()['key']}-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     artifact_binding(artifact, artifact_id, expected_name, digest, input_run)
     if origin and (artifact_id != origin["input_artifact"]["id"] or "sha256:" + digest != origin["input_artifact"]["digest"]):
         raise RuntimeError("Consumer input differs from the verified producer origin")
@@ -713,7 +714,7 @@ def validation_artifact():
     _, worker, _, _, request = identities()
     artifact_id = int(os.environ["CM_VALIDATION_ARTIFACT_ID"])
     digest = os.environ["CM_VALIDATION_ARTIFACT_DIGEST"].removeprefix("sha256:")
-    name = "cm-linux-x64-validation-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    name = f"cm-{linux_native()['key']}-validation-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     return artifact_binding(api("repos/" + worker + "/actions/artifacts/" + str(artifact_id)),
                             artifact_id, name, digest, int(os.environ["GITHUB_RUN_ID"]))
 
@@ -875,18 +876,18 @@ def self_check():
         invalid.append(reject_request)
     with patch.dict(os.environ, {"CM_BUILD_KIND": "mod-only", "CM_HOST_ORIGIN": json.dumps(origin)}):
         assert build_request() == ("mod-only", origin)
-    run_path = "repos/DSLZL/CM-build-linux-x64/actions/runs/12"
+    run_path = f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/runs/12"
     run = {"id": 12, "run_attempt": 1, "status": "completed", "conclusion": "success",
-        "head_sha": "b" * 40, "event": "workflow_dispatch", "repository": {"full_name": "DSLZL/CM-build-linux-x64"},
-        "path": ".github/workflows/build.yml", "display_title": "CM Linux x64 / cm-fixture-origin"}
+        "head_sha": "b" * 40, "event": "workflow_dispatch", "repository": {"full_name": "DSLZL/CM-build-" + linux_native()["key"]},
+        "path": ".github/workflows/build.yml", "display_title": f"CM {linux_native()['label']} / cm-fixture-origin"}
     jobs = [{"id": index, "name": name, "conclusion": "success"} for index, name in enumerate(
-        ("preflight", "build-write / linux-x64", "runtime-consumer", "receipt"), 30)]
-    ci = {"provider": "github_actions", "repository": "DSLZL/CM-build-linux-x64", "source_repository": "DSLZL/CM",
+        ("preflight", "build-write / " + linux_native()["key"], "runtime-consumer", "receipt"), 30)]
+    ci = {"provider": "github_actions", "repository": "DSLZL/CM-build-" + linux_native()["key"], "source_repository": "DSLZL/CM",
         "head_sha": "a" * 40, "source_sha": "a" * 40, "workflow_sha": "b" * 40,
         "run_id": 12, "run_attempt": 1, "request_id": "cm-fixture-origin", "build_kind": "qualification",
-        "execution_role": "platform_builder", "cache_repository": "DSLZL/CM-build-linux-x64",
+        "execution_role": "platform_builder", "cache_repository": "DSLZL/CM-build-" + linux_native()["key"],
         "workflow": ".github/workflows/build.yml", "target": TARGET, "runner_environment": "github-hosted",
-        "runner_os": "Linux", "runner_arch": "X64", **successful_job(jobs, "build-write / linux-x64")}
+        "runner_os": "Linux", "runner_arch": linux_native()["runner_arch"], **successful_job(jobs, "build-write / " + linux_native()["key"])}
     consumer = {"execution_role": "runtime_consumer", "cache_mode": "none", "producer_job_id": 31,
         **successful_job(jobs, "runtime-consumer"),
         **{key: ci[key] for key in ("source_sha", "workflow_sha", "run_id", "run_attempt", "request_id")},
@@ -898,32 +899,32 @@ def self_check():
                                 ("consumer", "source_sha", "f" * 40), ("consumer", "producer_job_id", 999)):
         changed = {**receipt, section: {**receipt[section], key: value}}
         invalid.append(lambda changed=changed: qualification_receipt(
-            changed, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64"))
+            changed, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"]))
     responses = {run_path: run, run_path + "/attempts/1/jobs?per_page=100": {"jobs": jobs},
-        "repos/DSLZL/CM-build-linux-x64/compare/" + "b" * 40 + "..." + "d" * 40: {"status": "ahead"},
+        f"repos/DSLZL/CM-build-{linux_native()['key']}/compare/" + "b" * 40 + "..." + "d" * 40: {"status": "ahead"},
         "repos/DSLZL/CM/compare/" + "a" * 40 + "..." + "e" * 40: {"status": "ahead"}}
-    for prefix, name in (("input", "cm-linux-x64-runtime-inputs-"),
-                         ("consumer", "cm-linux-x64-consumer-artifacts-"), ("receipt", "cm-build-receipt-")):
+    for prefix, name in (("input", f"cm-{linux_native()['key']}-runtime-inputs-"),
+                         ("consumer", f"cm-{linux_native()['key']}-consumer-artifacts-"), ("receipt", "cm-build-receipt-")):
         identifier = origin[prefix + "_artifact_id"]
-        responses["repos/DSLZL/CM-build-linux-x64/actions/artifacts/" + str(identifier)] = {
+        responses[f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/artifacts/" + str(identifier)] = {
             "id": identifier, "name": name + "cm-fixture-origin-1", "digest": "sha256:" + "c" * 64,
             "expired": False, "workflow_run": {"id": 12}}
     with patch.dict(os.environ, {"CM_SOURCE_SHA": "e" * 40}), patch(__name__ + ".api", side_effect=responses.__getitem__):
-        assert qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64") == ci
-        assert verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)["run"] == run
+        assert qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"]) == ci
+        assert verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"], "d" * 40)["run"] == run
         for key, value in (("run_attempt", 2), ("conclusion", "failure"), ("head_sha", "f" * 40)):
             changed = {**responses, run_path: {**run, key: value}}
             with patch(__name__ + ".api", side_effect=changed.__getitem__):
                 try:
-                    verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)
-                    qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64")
+                    verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"], "d" * 40)
+                    qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"])
                 except RuntimeError:
                     pass
                 else:
                     raise AssertionError("Unqualified Host origin accepted")
         for mutation in ("expired", "wrong-run", "wrong-digest", "skipped-consumer", "unrelated-source"):
             changed = json.loads(json.dumps(responses))
-            artifact_key = "repos/DSLZL/CM-build-linux-x64/actions/artifacts/20"
+            artifact_key = f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/artifacts/20"
             if mutation == "expired":
                 changed[artifact_key]["expired"] = True
             elif mutation == "wrong-run":
@@ -936,37 +937,37 @@ def self_check():
                 changed["repos/DSLZL/CM/compare/" + "a" * 40 + "..." + "e" * 40]["status"] = "diverged"
             with patch(__name__ + ".api", side_effect=changed.__getitem__):
                 try:
-                    verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)
-                    qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64")
+                    verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"], "d" * 40)
+                    qualification_receipt(receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"])
                 except RuntimeError:
                     pass
                 else:
                     raise AssertionError("Invalid qualification artifact or job accepted")
     production = {"run_id": 11, "run_attempt": 1, "source_sha": "9" * 40, "workflow_sha": "8" * 40,
-        "request_id": "cm-original-producer", "job": "build-write / linux-x64", "job_id": 19}
+        "request_id": "cm-original-producer", "job": "build-write / " + linux_native()["key"], "job_id": 19}
     reused_responses = json.loads(json.dumps(responses))
     for key, identifier, name in (("input_artifact", 20, "runtime-inputs"), ("product_artifact", 23, "task-artifacts")):
-        record = {"id": identifier, "name": "cm-linux-x64-" + name + "-cm-original-producer-1",
+        record = {"id": identifier, "name": f"cm-{linux_native()['key']}-" + name + "-cm-original-producer-1",
             "digest": "sha256:" + "c" * 64, "size_in_bytes": 1, "expired": False, "workflow_run": {"id": 11}}
-        reused_responses["repos/DSLZL/CM-build-linux-x64/actions/artifacts/" + str(identifier)] = record
+        reused_responses[f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/artifacts/" + str(identifier)] = record
         production[key] = {key: record[key] for key in ("id", "name", "digest", "size_in_bytes")}
-    reused_responses["repos/DSLZL/CM-build-linux-x64/actions/runs/11"] = {
-        **run, "id": 11, "head_sha": "8" * 40, "display_title": "CM Linux x64 / cm-original-producer"}
-    reused_responses["repos/DSLZL/CM-build-linux-x64/actions/runs/11/attempts/1/jobs?per_page=100"] = {
-        "jobs": [{"id": 19, "name": "build-write / linux-x64", "status": "completed", "conclusion": "success"}]}
-    reused_responses["repos/DSLZL/CM-build-linux-x64/actions/artifacts/24"] = {
-        "id": 24, "name": "cm-linux-x64-validation-inputs-cm-fixture-origin-1", "digest": "sha256:" + "c" * 64,
+    reused_responses[f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/runs/11"] = {
+        **run, "id": 11, "head_sha": "8" * 40, "display_title": f"CM {linux_native()['label']} / cm-original-producer"}
+    reused_responses[f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/runs/11/attempts/1/jobs?per_page=100"] = {
+        "jobs": [{"id": 19, "name": "build-write / " + linux_native()["key"], "status": "completed", "conclusion": "success"}]}
+    reused_responses[f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/artifacts/24"] = {
+        "id": 24, "name": f"cm-{linux_native()['key']}-validation-inputs-cm-fixture-origin-1", "digest": "sha256:" + "c" * 64,
         "expired": False, "workflow_run": {"id": 12}}
     reused_receipt = {"ci": {**ci, "artifact_id": 23, "artifact_sha256": "c" * 64, "production_origin": production},
         "consumer": {**consumer, "production_origin": production,
             "validation_artifact": {"artifact_id": 24, "artifact_sha256": "c" * 64}}}
     with patch.dict(os.environ, {"CM_SOURCE_SHA": "e" * 40}), patch(__name__ + ".api", side_effect=reused_responses.__getitem__):
-        assert verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-linux-x64", "d" * 40)["run"] == run
-        assert qualification_receipt(reused_receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64") == reused_receipt["ci"]
+        assert verify_origin(origin, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"], "d" * 40)["run"] == run
+        assert qualification_receipt(reused_receipt, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"]) == reused_receipt["ci"]
         for key, value in (("production_origin", {}), ("validation_artifact", {"artifact_id": 24, "artifact_sha256": "f" * 64})):
             changed = {**reused_receipt, "consumer": {**reused_receipt["consumer"], key: value}}
             try:
-                qualification_receipt(changed, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-linux-x64")
+                qualification_receipt(changed, origin, jobs, "DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"])
             except RuntimeError:
                 pass
             else:
@@ -1014,7 +1015,7 @@ def self_check():
 def index_binding_self_check():
     from copy import deepcopy
     ci = {"source_sha": "a" * 40, "workflow_sha": "b" * 40, "production_origin": {"run_id": 1},
-        "repository": "DSLZL/CM-build-linux-x64", "run_id": 20, "run_attempt": 2, "request_id": "cm-fixture"}
+        "repository": "DSLZL/CM-build-" + linux_native()["key"], "run_id": 20, "run_attempt": 2, "request_id": "cm-fixture"}
     consumer = {"artifact_id": 21, "job_id": 22}
     jobs, records = [], {}
     value = {"status": "pass", "source_sha": ci["source_sha"], "workflow_sha": ci["workflow_sha"],
@@ -1022,7 +1023,7 @@ def index_binding_self_check():
         "main_consumer_job_id": 22, "release_ready": False}
     for number, role, prefix, job in ((23, "qualification", "index-qualification", "attest-index-qualification"),
             (24, "proof_consumer", "index-proof-consumer", "index-proof-consumer")):
-        name = "cm-linux-x64-" + prefix + "-cm-fixture-2"
+        name = f"cm-{linux_native()['key']}-" + prefix + "-cm-fixture-2"
         jobs.append({"id": number, "name": job, "conclusion": "success"})
         records[str(number)] = {"id": number, "name": name, "digest": "sha256:" + "c" * 64,
             "expired": False, "workflow_run": {"id": 20}}
@@ -1065,7 +1066,7 @@ def verify_index_receipt(value, *, jobs, ci, consumer, fetch=None):
         if any(item.get(key) != data for key, data in successful_job(jobs, job).items()):
             raise RuntimeError("Index receipt has no exact successful " + job)
         bound = item["artifact"]
-        name = "cm-linux-x64-" + prefix + "-" + ci["request_id"] + "-" + str(ci["run_attempt"])
+        name = f"cm-{linux_native()['key']}-" + prefix + "-" + ci["request_id"] + "-" + str(ci["run_attempt"])
         record = fetch("repos/" + ci["repository"] + "/actions/artifacts/" + str(bound["artifact_id"]))
         artifact_binding(record, bound["artifact_id"], name, bound["artifact_sha256"], ci["run_id"])
         if bound["artifact_name"] != name:
@@ -1081,7 +1082,7 @@ def index_receipt(jobs, consumer, origin):
             ("INDEX_PROOF", "index-proof-consumer", "index-proof-consumer")):
         artifact_id = int(os.environ["CM_" + role + "_ARTIFACT_ID"])
         record = checked_artifact(api("repos/" + worker + "/actions/artifacts/" + str(artifact_id)), int(os.environ["GITHUB_RUN_ID"]))
-        bound = artifact_binding(record, artifact_id, "cm-linux-x64-" + prefix + "-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"],
+        bound = artifact_binding(record, artifact_id, f"cm-{linux_native()['key']}-" + prefix + "-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"],
             os.environ["CM_" + role + "_ARTIFACT_DIGEST"].removeprefix("sha256:"), int(os.environ["GITHUB_RUN_ID"]))
         artifacts[role] = {"artifact": bound, **successful_job(jobs, job)}
         if role == "INDEX_PROOF":
@@ -1117,7 +1118,7 @@ def receipt():
     digest = os.environ["CM_ARTIFACT_DIGEST"].removeprefix("sha256:")
     checked(digest, r"[0-9a-f]{64}", "actual upload artifact digest")
     origin = production_origin()
-    artifact_name = origin["product_artifact"]["name"] if origin else "cm-linux-x64-task-artifacts-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    artifact_name = origin["product_artifact"]["name"] if origin else f"cm-{linux_native()['key']}-task-artifacts-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     actual = api("repos/" + worker + "/actions/artifacts/" + str(artifact_id))
     artifact_binding(actual, artifact_id, artifact_name, digest, origin["run_id"] if origin else int(os.environ["GITHUB_RUN_ID"]))
     if origin and (artifact_id != origin["product_artifact"]["id"] or "sha256:" + digest != origin["product_artifact"]["digest"]):
@@ -1137,7 +1138,7 @@ def receipt():
           "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
           "run_url": "https://github.com/" + worker + "/actions/runs/" + os.environ["GITHUB_RUN_ID"],
           "workflow": ".github/workflows/build.yml", "job": os.environ["CM_BUILD_JOB"],
-          "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": "X64",
+          "runner_environment": "github-hosted", "runner_os": "Linux", "runner_arch": linux_native()["runner_arch"],
           "build_kind": build_request()[0],
           "target": TARGET, "conclusion": None, "artifact_name": artifact_name,
           "artifact_id": artifact_id, "artifact_sha256": digest, **producer_job,
@@ -1146,13 +1147,13 @@ def receipt():
     if os.environ.get("CM_CONSUMER_REQUIRED") == "true":
         consumer_id = int(os.environ["CM_CONSUMER_ARTIFACT_ID"])
         consumer_digest = checked(os.environ["CM_CONSUMER_ARTIFACT_DIGEST"].removeprefix("sha256:"), r"[0-9a-f]{64}", "consumer artifact digest")
-        consumer_name = "cm-linux-x64-consumer-artifacts-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        consumer_name = f"cm-{linux_native()['key']}-consumer-artifacts-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
         record = api("repos/" + worker + "/actions/artifacts/" + str(consumer_id))
         artifact_binding(record, consumer_id, consumer_name, consumer_digest, int(os.environ["GITHUB_RUN_ID"]))
         actual_job = successful_job(jobs, "runtime-consumer")
         input_id = int(os.environ["CM_INPUT_ARTIFACT_ID"])
         input_digest = os.environ["CM_INPUT_ARTIFACT_DIGEST"].removeprefix("sha256:")
-        input_name = origin["input_artifact"]["name"] if origin else "cm-linux-x64-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        input_name = origin["input_artifact"]["name"] if origin else f"cm-{linux_native()['key']}-runtime-inputs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
         input_record = api("repos/" + worker + "/actions/artifacts/" + str(input_id))
         inputs = artifact_binding(input_record, input_id, input_name, input_digest, origin["run_id"] if origin else int(os.environ["GITHUB_RUN_ID"]))
         consumer = {"execution_role": "runtime_consumer", "cache_mode": "none", "job": "runtime-consumer",
@@ -1182,7 +1183,7 @@ def receipt():
         proof_id = int(os.environ["CM_DISTRIBUTION_ARTIFACT_ID"])
         proof_digest = checked(os.environ["CM_DISTRIBUTION_ARTIFACT_DIGEST"].removeprefix("sha256:"),
             r"[0-9a-f]{64}", "distribution artifact digest")
-        proof_name = "cm-linux-x64-distribution-proofs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+        proof_name = f"cm-{linux_native()['key']}-distribution-proofs-" + request + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
         record = api("repos/" + worker + "/actions/artifacts/" + str(proof_id))
         proof_ref = artifact_binding(record, proof_id, proof_name, proof_digest, int(os.environ["GITHUB_RUN_ID"]))
         distribution = {"job": "attest-distribution", **successful_job(jobs, "attest-distribution"),

@@ -71,8 +71,31 @@ def native_inputs(key=None, *, root=None):
     return {name: entry[name] for name in ("target", "format", "library_suffix", "exe_suffix")}
 
 
+def linux_native(target=None):
+    target = os.environ.get("CM_TARGET", "x86_64-unknown-linux-gnu") if target is None else target
+    values = {
+        "x86_64-unknown-linux-gnu": {"key": "linux-x64", "machine": 62, "machine_name": "x86_64", "cpu": "x86-64", "runner_arch": "X64",
+            "rustflags": "-C target-cpu=x86-64", "cflags": "-march=x86-64 -mtune=generic",
+            "binutils": "binutils-x86-64-linux-gnu", "dpkg_arch": "amd64",
+            "interpreter": "/lib64/ld-linux-x86-64.so.2", "ldconfig_arch": "x86-64"},
+        "aarch64-unknown-linux-gnu": {"key": "linux-arm64", "machine": 183, "machine_name": "aarch64", "cpu": "armv8-a", "runner_arch": "ARM64",
+            "rustflags": "-C target-cpu=generic", "cflags": "-march=armv8-a -mtune=generic",
+            "binutils": "binutils-aarch64-linux-gnu", "dpkg_arch": "arm64",
+            "interpreter": "/lib/ld-linux-aarch64.so.1", "ldconfig_arch": "AArch64"},
+    }
+    if not isinstance(target, str) or target not in values:
+        raise RuntimeError("Unsupported native GNU Linux target: " + repr(target))
+    value = values[target]
+    return {"target": target, "label": "Linux " + value["key"].rsplit("-", 1)[1], **value}
+
+
 def title(entry):
     return entry["runner_os"] + " " + entry["key"].rsplit("-", 1)[1]
+
+
+def foreign_linux_target():
+    return ("aarch64-unknown-linux-gnu" if linux_native()["machine"] == 62
+            else "x86_64-unknown-linux-gnu")
 
 
 def self_check():
@@ -83,6 +106,20 @@ def self_check():
     table = load()
     default = select(enabled=True)
     assert default["key"] == "linux-x64" and title(default) == "Linux x64"
+    for key in ("linux-x64", "linux-arm64"):
+        entry = select(key)
+        native = linux_native(entry["target"])
+        assert native["runner_arch"] == entry["runner_arch"]
+        assert native["machine"] == (62 if key == "linux-x64" else 183)
+        with patch.dict(os.environ, {"CM_TARGET": entry["target"]}):
+            assert linux_native() == native
+    for target in ("", "aarch64-unknown-linux-musl", "x86_64-pc-windows-msvc", [], "unknown"):
+        try:
+            linux_native(target)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Unknown or non-GNU native target accepted")
     for key, entry in table["platforms"].items():
         assert select(key)["target"] == entry["target"]
         with patch.dict(os.environ, {"GITHUB_REPOSITORY": entry["repository"],
@@ -150,10 +187,34 @@ def self_check():
     import retry
     rows = b"100644 blob aaaa\t.github/cm-platforms.json\x00100644 blob bbbb\tci/scripts/cm_platforms.py\x00"
     recipe = "    env:\n      CM_TARGET: x86_64-unknown-linux-gnu\n    steps:\n"
-    with patch("retry.git", return_value=rows), patch("retry.source", return_value=recipe):
+    module = Path(__file__).read_text()
+    def inputs(root, revision, path):
+        return module if path == "ci/scripts/cm_platforms.py" else recipe
+    with patch("retry.git", return_value=rows), patch("retry.source", side_effect=inputs):
         current = retry.product_inputs(Path("unused"), "current")
-    with patch("retry.git", return_value=b""), patch("retry.source", return_value=recipe):
+    with patch("retry.git", return_value=rows.replace(b"aaaa", b"cccc")), patch("retry.source", side_effect=inputs):
         assert retry.product_inputs(Path("unused"), "previous") == current
-    with patch("retry.git", return_value=b"100644 blob cccc\tcrates/cm/src/lib.rs\x00"), \
-            patch("retry.source", return_value=recipe):
+    with patch("retry.git", return_value=rows + b"100644 blob cccc\tcrates/cm/src/lib.rs\x00"), \
+            patch("retry.source", side_effect=inputs):
         assert retry.product_inputs(Path("unused"), "changed-native") != current
+    for target in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"):
+        with patch.dict(os.environ, {"CM_TARGET": target}):
+            selected = linux_native()
+            baseline = retry.native_recipe(module)
+            other = linux_native("aarch64-unknown-linux-gnu" if selected["machine"] == 62 else "x86_64-unknown-linux-gnu")
+            assert retry.native_recipe(module.replace(other["rustflags"], "unselected flags")) == baseline
+            assert retry.native_recipe(module.replace(selected["rustflags"], "changed native flags")) != baseline
+            pin = {"overlay": {}, "official_asset": {"url": "x64-fixture"},
+                "official_assets": {"aarch64-unknown-linux-gnu": {"url": "arm64-fixture"}}}
+            def fixture_inputs(root, revision, path):
+                return json.dumps(pin) if path == "adapters/codex-e4568a3/source.json" else inputs(root, revision, path)
+            with patch("retry.git", return_value=rows + b"100644 blob dddd\tadapters/codex-e4568a3/source.json\x00"), \
+                    patch("retry.source", side_effect=fixture_inputs):
+                product = retry.product_inputs(Path("unused"), "fixture")
+                arm = pin["official_assets"]["aarch64-unknown-linux-gnu"]
+                inactive = arm if selected["machine"] == 62 else pin["official_asset"]
+                inactive["url"] += "-changed"
+                assert retry.product_inputs(Path("unused"), "fixture") == product
+                active = pin["official_asset"] if selected["machine"] == 62 else arm
+                active["url"] += "-changed"
+                assert retry.product_inputs(Path("unused"), "fixture") != product

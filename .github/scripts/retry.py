@@ -1,5 +1,6 @@
 """Reuse exact remote products and independently audited runtime steps."""
 import ast
+from cm_platforms import linux_native
 import hashlib
 import importlib
 import json
@@ -19,7 +20,7 @@ import urllib.error
 import runtime_cases
 
 RUNTIME_FILES = (
-    "ci/scripts/mod_author.py", "ci/scripts/mod_manifest.py", "ci/scripts/runtime_sdk.py",
+    "ci/scripts/cm_platforms.py", "ci/scripts/mod_author.py", "ci/scripts/mod_manifest.py", "ci/scripts/runtime_sdk.py",
     "ci/scripts/managed_package.py", "ci/scripts/runtime_state.py", "ci/scripts/ci_progress.py",
     "fixtures/runtime-consumer/driver.py", "fixtures/native-loader/core_acceptance.py",
     "fixtures/native-loader/tool_barrier.py", "fixtures/runtime-sdk/driver.py",
@@ -33,7 +34,8 @@ RUNTIME_FILES = (
     "ci/scripts/sdk_seams.py", "fixtures/sdk-seams/driver.py",
     "ci/scripts/distribution_provenance.py", "fixtures/distribution-provenance/driver.py",
 )
-RUNTIME_DATA = ("ci/g05-baseline.json", "crates/cm/src/distribution-policy.json",
+RUNTIME_DATA = ("ci/g05-baseline.json", "crates/cm/src/" + ("distribution-policy-arm64.json"
+    if linux_native()["machine"] == 183 else "distribution-policy.json"),
     "crates/cm/src/distribution-root.jsonl", "docs/distribution.md", "schemas/release-receipt.schema.json",
     "fixtures/compatibility-policy/policy.json", "schemas/support-matrix.schema.json")
 SUPPORT_RUNTIME_FILES = ("ci/scripts/support_policy.py", "fixtures/compatibility-policy/driver.py")
@@ -274,6 +276,24 @@ def probe_inputs(root, revision):
     return {path: hashlib.sha256(source(root, revision, path).encode()).hexdigest() for path in PRIVATE_PROBES}
 
 
+def native_recipe(text):
+    module = ast.parse(text)
+    functions = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "linux_native"]
+    if not functions:
+        return {"legacy_module": digest(text)}
+    assert len(functions) == 1
+    function = functions[0]
+    tables = [node for node in function.body if isinstance(node, ast.Assign)
+        and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "values"]
+    assert len(tables) == 1 and isinstance(tables[0].value, ast.Dict), "Unknown native recipe layout"
+    table = tables[0].value
+    target = linux_native()["target"]
+    selected = [(key, value) for key, value in zip(table.keys, table.values) if ast.literal_eval(key) == target]
+    assert len(selected) == 1, "Current native target is absent from the reviewed recipe"
+    tables[0].value = ast.Dict(keys=[selected[0][0]], values=[selected[0][1]])
+    return {"target": target, "recipe": ast.dump(function, include_attributes=False)}
+
+
 def product_inputs(root, revision):
     tree = git(root, "ls-tree", "-rz", revision).split(b"\0")
     files = {}
@@ -292,7 +312,7 @@ def product_inputs(root, revision):
         "reports", "self_check", "attest_prepare", "consume_proofs", "prepare_bootstrap", "source_check", "artifact_download", "extract_materials"}
     administrative = {"ci/scripts/retry.py", "ci/scripts/worker_policy.py", "ci/scripts/record_run.py",
                       "ci/scripts/dispatch_build.py", "ci/scripts/ci_progress.py", "ci/scripts/mod_contract.py",
-                      "ci/source-files.txt", "ci/worker-files.json", ".github/cm-routing.json",
+                      "ci/source-files.txt", "ci/worker-files.json", "ci/worker-files-linux-arm64.json", ".github/cm-routing.json",
                       "ci/scripts/runtime_cases.py", "ci/scripts/acceptance_cache.py",
                       ".github/cm-build-routing.json", ".github/cm-platforms.json", "ci/scripts/cm_platforms.py",
                       *SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES,
@@ -302,6 +322,11 @@ def product_inputs(root, revision):
     for row in filter(None, tree):
         metadata, name = row.split(b"\t", 1)
         path = name.decode()
+        if path == "ci/scripts/cm_platforms.py":
+            files[path] = digest(native_recipe(source(root, revision, path)))
+            continue
+        if path in ("crates/cm/src/distribution-policy.json", "crates/cm/src/distribution-policy-arm64.json") and path != RUNTIME_DATA[1]:
+            continue
         if path == "ci/scripts/binary_index.py":
             files[path] = projection(source(root, revision, path), ("prepare_transport",), production=True)
             continue
@@ -311,12 +336,32 @@ def product_inputs(root, revision):
                 or path.startswith("fixtures/") and path.endswith(".py")
                 or "/.vscode/" in path or "/.github/" in path):
             continue
-        if path == ".github/cm-ci.json":
+        if path == "adapters/codex-e4568a3/source.json":
+            pin = json.loads(source(root, revision, path))
+            overlay = pin.pop("target_overlay", {}).get(linux_native()["target"], {})
+            official = pin.pop("official_assets", {}).get(linux_native()["target"], pin.pop("official_asset", None))
+            if official is not None:
+                pin["official_asset"] = official
+            pin["overlay"].update(overlay)
+            files[path] = digest(pin)
+        elif path == "adapters/codex-e4568a3/runtime-slots.json":
+            descriptor = json.loads(source(root, revision, path))
+            if "targets" in descriptor:
+                assert linux_native()["target"] in descriptor.pop("targets")
+                descriptor["target"] = linux_native()["target"]
+            files[path] = digest(descriptor)
+        elif path == ".github/cm-ci.json":
             config = json.loads(source(root, revision, path))
             native = {key: value for key, value in config.items() if key not in ("required_checks", "acceptance_script")}
             if native["task_id"] in ("CM-S01", "CM-S02", "CM-S03"):
                 del native["task_id"]
             native["acceptance_recipe"] = digest(source(root, revision, config["acceptance_script"]))
+            native["target"] = linux_native()["target"]
+            if linux_native()["machine"] == 183:
+                native["compile_env"] = {**native["compile_env"], "RUSTFLAGS": linux_native()["rustflags"],
+                    "CFLAGS": linux_native()["cflags"], "CXXFLAGS": linux_native()["cflags"]}
+                native["native_identity_files"] = ["crates/cm/src/distribution-policy-arm64.json"
+                    if name == "crates/cm/src/distribution-policy.json" else name for name in native["native_identity_files"]]
             files[path] = digest(native)
         elif path in ("ci/scripts/host.py", "ci/scripts/linux_ci.py"):
             files[path] = digest(ast.dump(ProductionRouting().visit(ast.parse(source(root, revision, path))),
@@ -387,12 +432,12 @@ def select(root, logs):
             continue
         try:
             jobs = p.api("repos/" + worker + "/actions/runs/" + str(run["id"]) + "/attempts/" + str(run["run_attempt"]) + "/jobs?per_page=100")["jobs"]
-            producers = [j for j in jobs if j["name"] in ("build-read / linux-x64", "build-write / linux-x64") and j["conclusion"] == "success"]
+            producers = [j for j in jobs if j["name"] in ("build-read / " + linux_native()["key"], "build-write / " + linux_native()["key"]) and j["conclusion"] == "success"]
             if len(producers) != 1:
                 continue
             records = p.api("repos/" + worker + "/actions/runs/" + str(run["id"]) + "/artifacts?per_page=100")["artifacts"]
-            indexes = [a for a in records if a["name"].startswith("cm-linux-x64-validation-inputs-") and not a["expired"]]
-            evidence = indexes or [a for a in records if a["name"].startswith("cm-linux-x64-evidence-") and not a["expired"]]
+            indexes = [a for a in records if a["name"].startswith(f"cm-{linux_native()['key']}-validation-inputs-") and not a["expired"]]
+            evidence = indexes or [a for a in records if a["name"].startswith(f"cm-{linux_native()['key']}-evidence-") and not a["expired"]]
             if len(evidence) != 1:
                 continue
             record = checked_artifact(evidence[0], run["id"])
@@ -409,7 +454,7 @@ def select(root, logs):
                             continue
                         origin = {"source_sha": ci["source_sha"], "workflow_sha": ci["workflow_sha"], "run_id": run["id"],
                                   "run_attempt": run["run_attempt"], "request_id": ci["request_id"], "job": producers[0]["name"], "job_id": producers[0]["id"]}
-                        for artifact_kind, prefix in (("product", "cm-linux-x64-task-artifacts-"), ("input", "cm-linux-x64-runtime-inputs-")):
+                        for artifact_kind, prefix in (("product", f"cm-{linux_native()['key']}-task-artifacts-"), ("input", f"cm-{linux_native()['key']}-runtime-inputs-")):
                             items = [a for a in records if a["name"] == prefix + ci["request_id"] + "-" + str(run["run_attempt"])]
                             if len(items) != 1:
                                 raise RuntimeError("Missing exact producer artifact")
@@ -426,7 +471,7 @@ def select(root, logs):
                 previous_request = legacy_request(producers[0], worker, verified["product_artifact"])
             if previous_request != plan["build_request"]:
                 continue
-            resume = [a for a in records if a["name"].startswith("cm-linux-x64-consumer-checkpoints-") and not a["expired"]]
+            resume = [a for a in records if a["name"].startswith(f"cm-{linux_native()['key']}-consumer-checkpoints-") and not a["expired"]]
             plan.update(status="hit", reason="Exact production inputs and runner image unchanged", production_origin=origin,
                         test_builds=old.get("test_builds", {}) if indexes else {},
                         checkpoint_origin={"run_id": run["id"], "run_attempt": run["run_attempt"],
@@ -486,7 +531,7 @@ def checkpoint_history(root, runs, worker, workflow_sha):
         if run["id"] == int(os.environ["GITHUB_RUN_ID"]) or run.get("path") != ".github/workflows/build.yml":
             continue
         records = policy().api("repos/" + worker + "/actions/runs/" + str(run["id"]) + "/artifacts?per_page=100")["artifacts"]
-        expected = "cm-linux-x64-consumer-checkpoints-" + run["display_title"].removeprefix("CM Linux x64 / ") + "-" + str(run["run_attempt"])
+        expected = f"cm-{linux_native()['key']}-consumer-checkpoints-" + run["display_title"].removeprefix(f"CM {linux_native()['label']} / ") + "-" + str(run["run_attempt"])
         matches = [row for row in records if row["name"] == expected and not row["expired"]]
         if not matches:
             continue
@@ -583,12 +628,12 @@ def verify_production_origin(origin, *, worker=None, fetch=None):
     worker = worker or p.identities()[1]
     fetch = fetch or p.api
     assert all(re.fullmatch(r"[0-9a-f]{40}", origin[key]) for key in ("source_sha", "workflow_sha"))
-    assert origin["job"] in ("build-read / linux-x64", "build-write / linux-x64")
+    assert origin["job"] in ("build-read / " + linux_native()["key"], "build-write / " + linux_native()["key"])
     assert type(origin["run_id"]) is int and origin["run_id"] > 0
     assert type(origin["run_attempt"]) is int and origin["run_attempt"] > 0
     run_id = int(origin["run_id"])
     run = fetch("repos/" + worker + "/actions/runs/" + str(run_id))
-    if run["run_attempt"] != origin["run_attempt"] or run["head_sha"] != origin["workflow_sha"] or run["event"] != "workflow_dispatch" or run["path"] != ".github/workflows/build.yml" or run["display_title"] != "CM Linux x64 / " + origin["request_id"]:
+    if run["run_attempt"] != origin["run_attempt"] or run["head_sha"] != origin["workflow_sha"] or run["event"] != "workflow_dispatch" or run["path"] != ".github/workflows/build.yml" or run["display_title"] != f"CM {linux_native()['label']} / " + origin["request_id"]:
         raise RuntimeError("Producer origin run/attempt/workflow/request changed")
     jobs_path = "repos/" + worker + "/actions/runs/" + str(run_id) + "/attempts/" + str(origin["run_attempt"]) + "/jobs?per_page=100"
     jobs = p.receipt_jobs(jobs_path, (origin["job"],), fetch=fetch)
@@ -599,7 +644,7 @@ def verify_production_origin(origin, *, worker=None, fetch=None):
     for key in ("product_artifact", "input_artifact"):
         expected = origin[key]
         actual = checked_artifact(fetch("repos/" + worker + "/actions/artifacts/" + str(expected["id"])), run_id)
-        prefix = "cm-linux-x64-" + ("task-artifacts-" if key == "product_artifact" else "runtime-inputs-")
+        prefix = f"cm-{linux_native()['key']}-" + ("task-artifacts-" if key == "product_artifact" else "runtime-inputs-")
         if artifact_ref(actual) != expected or actual["name"] != prefix + origin["request_id"] + "-" + str(origin["run_attempt"]):
             raise RuntimeError("Producer artifact identity changed")
         records[key] = actual
@@ -690,19 +735,19 @@ def verify_test_build(item, *, worker=None, fetch=None):
     worker = worker or os.environ["GITHUB_REPOSITORY"]
     fetch = fetch or policy().api
     assert item["target"] in PROBE_TARGETS
-    assert item["job"] in ("build-read / linux-x64", "build-write / linux-x64")
+    assert item["job"] in ("build-read / " + linux_native()["key"], "build-write / " + linux_native()["key"])
     assert all(re.fullmatch(r"[0-9a-f]{40}", item[key]) for key in ("source_sha", "workflow_sha"))
     assert all(type(item[key]) is int and item[key] > 0 for key in ("run_id", "run_attempt", "job_id"))
     run = fetch("repos/" + worker + "/actions/runs/" + str(item["run_id"]))
     assert run["run_attempt"] == item["run_attempt"] and run["head_sha"] == item["workflow_sha"]
     assert run["event"] == "workflow_dispatch" and run["path"] == ".github/workflows/build.yml"
-    assert run["display_title"] == "CM Linux x64 / " + item["request_id"]
+    assert run["display_title"] == f"CM {linux_native()['label']} / " + item["request_id"]
     jobs = policy().receipt_jobs("repos/" + worker + "/actions/runs/" + str(item["run_id"]) + "/attempts/"
         + str(item["run_attempt"]) + "/jobs?per_page=100", (item["job"],), fetch=fetch)
     assert policy().successful_job(jobs, item["job"])["job_id"] == item["job_id"]
     record = checked_artifact(fetch("repos/" + worker + "/actions/artifacts/" + str(item["artifact"]["id"])), item["run_id"])
     assert artifact_ref(record) == item["artifact"]
-    assert record["name"] == "cm-linux-x64-test-build-" + item["target"] + "-" + item["request_id"] + "-" + str(item["run_attempt"])
+    assert record["name"] == f"cm-{linux_native()['key']}-test-build-" + item["target"] + "-" + item["request_id"] + "-" + str(item["run_attempt"])
     return record
 
 
@@ -842,7 +887,7 @@ def current_producer_job():
     p = policy()
     for attempt in range(12):
         jobs = p.api("repos/" + os.environ["GITHUB_REPOSITORY"] + "/actions/runs/" + os.environ["GITHUB_RUN_ID"] + "/attempts/" + os.environ["GITHUB_RUN_ATTEMPT"] + "/jobs?per_page=100")["jobs"]
-        producers = [j for j in jobs if j["name"] in ("build-read / linux-x64", "build-write / linux-x64") and j["status"] == "in_progress"]
+        producers = [j for j in jobs if j["name"] in ("build-read / " + linux_native()["key"], "build-write / " + linux_native()["key"]) and j["status"] == "in_progress"]
         if len(producers) == 1:
             break
         if attempt < 11:
@@ -1582,14 +1627,14 @@ def history_self_check():
     from copy import deepcopy
     from types import SimpleNamespace
     from unittest.mock import patch
-    worker, workflow = "DSLZL/CM-build-linux-x64", "b" * 40
+    worker, workflow = "DSLZL/CM-build-" + linux_native()["key"], "b" * 40
     wanted = {"p04-states": "a", "m04-query": "b"}
     indexes, records = {}, {}
     runs = []
     for number, labels in ((9014, ()), (9013, ()), (9012, ("m04-query",)), (9011, ("p04-states",))):
         runs.append({"id": number, "run_attempt": 1, "head_sha": workflow, "event": "workflow_dispatch",
-            "path": ".github/workflows/build.yml", "display_title": "CM Linux x64 / history-" + str(number)})
-        record = {"id": number, "name": "cm-linux-x64-consumer-checkpoints-history-" + str(number) + "-1",
+            "path": ".github/workflows/build.yml", "display_title": f"CM {linux_native()['label']} / history-" + str(number)})
+        record = {"id": number, "name": f"cm-{linux_native()['key']}-consumer-checkpoints-history-" + str(number) + "-1",
             "digest": "sha256:" + "c" * 64, "size_in_bytes": 1, "expired": number == 9013,
             "workflow_run": {"id": number}}
         records[number] = record
@@ -1994,10 +2039,10 @@ def origin_self_check():
     from unittest.mock import patch
     p = policy()
     origin = {"source_sha": "a" * 40, "workflow_sha": "b" * 40, "request_id": "retry-self-check",
-              "run_id": 10, "run_attempt": 1, "job": "build-write / linux-x64", "job_id": 20}
+              "run_id": 10, "run_attempt": 1, "job": "build-write / " + linux_native()["key"], "job_id": 20}
     records = {}
     for number, (key, prefix) in enumerate((("product_artifact", "task-artifacts"), ("input_artifact", "runtime-inputs")), 1):
-        records[number] = {"id": number, "name": "cm-linux-x64-" + prefix + "-retry-self-check-1",
+        records[number] = {"id": number, "name": f"cm-{linux_native()['key']}-" + prefix + "-retry-self-check-1",
             "digest": "sha256:" + "c" * 64, "size_in_bytes": 1, "expired": False, "workflow_run": {"id": 10}}
         origin[key] = artifact_ref(records[number])
 
@@ -2007,14 +2052,14 @@ def origin_self_check():
         if "/actions/artifacts/" in path:
             return records[int(path.rsplit("/", 1)[1])]
         return {"run_attempt": 1, "head_sha": "b" * 40, "event": "workflow_dispatch",
-                "path": ".github/workflows/build.yml", "display_title": "CM Linux x64 / retry-self-check"}
+                "path": ".github/workflows/build.yml", "display_title": f"CM {linux_native()['label']} / retry-self-check"}
 
-    stub = SimpleNamespace(identities=lambda: ("DSLZL/CM", "DSLZL/CM-build-linux-x64", "a" * 40, "b" * 40, "retry-self-check"),
+    stub = SimpleNamespace(identities=lambda: ("DSLZL/CM", "DSLZL/CM-build-" + linux_native()["key"], "a" * 40, "b" * 40, "retry-self-check"),
                            api=api, successful_job=p.successful_job, receipt_jobs=p.receipt_jobs)
     with patch(__name__ + ".policy", return_value=stub):
         verify_production_origin(origin)
-        assert verify_production_origin(origin, worker="DSLZL/CM-build-linux-x64", fetch=api)["input_artifact"] == records[2]
-        jobs_path = "repos/DSLZL/CM-build-linux-x64/actions/runs/10/attempts/1/jobs?per_page=100"
+        assert verify_production_origin(origin, worker="DSLZL/CM-build-" + linux_native()["key"], fetch=api)["input_artifact"] == records[2]
+        jobs_path = f"repos/DSLZL/CM-build-{linux_native()['key']}/actions/runs/10/attempts/1/jobs?per_page=100"
         pending = {"jobs": [{"name": origin["job"], "id": 20, "status": "in_progress", "conclusion": None}]}
         with patch("time.sleep") as pause:
             responses = iter((pending, api(jobs_path)))
@@ -2023,13 +2068,13 @@ def origin_self_check():
             assert verify_production_origin(origin, fetch=delayed)["input_artifact"] == records[2]
             pause.assert_called_once_with(5)
         test_record = {**records[1], "id": 3,
-            "name": "cm-linux-x64-test-build-review-tui-probe-build-retry-self-check-1"}
+            "name": f"cm-{linux_native()['key']}-test-build-review-tui-probe-build-retry-self-check-1"}
         records[3] = test_record
         test_build = {**origin, "target": "review-tui-probe-build", "artifact": artifact_ref(test_record)}
-        assert verify_test_build(test_build, worker="DSLZL/CM-build-linux-x64", fetch=api) == test_record
+        assert verify_test_build(test_build, worker="DSLZL/CM-build-" + linux_native()["key"], fetch=api) == test_record
         for key, changed in (("job_id", 21), ("run_attempt", 2), ("target", "host")):
             try:
-                verify_test_build({**test_build, key: changed}, worker="DSLZL/CM-build-linux-x64", fetch=api)
+                verify_test_build({**test_build, key: changed}, worker="DSLZL/CM-build-" + linux_native()["key"], fetch=api)
             except (AssertionError, RuntimeError):
                 pass
             else:

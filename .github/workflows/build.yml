@@ -1,6 +1,6 @@
-# Install only in the independent CM-build-linux-x64 repository.
-name: CM Linux x64 builder
-run-name: CM Linux x64 / ${{ inputs.request_id }}
+# Install only in the fixed independent GNU Linux builder repositories.
+name: CM GNU Linux builder
+run-name: CM ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'Linux arm64' || 'Linux x64' }} / ${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
@@ -42,9 +42,13 @@ concurrency:
   group: cm-build-${{ inputs.request_id }}
   cancel-in-progress: false
 
+env:
+  CM_PLATFORM: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64' }}
+  CM_TARGET: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'aarch64-unknown-linux-gnu' || 'x86_64-unknown-linux-gnu' }}
+
 jobs:
   preflight:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     cache-mode: none
     outputs:
@@ -69,7 +73,7 @@ jobs:
         id: policy
         env:
           CM_SOURCE_REPOSITORY: DSLZL/CM
-          CM_BUILDER_REPOSITORY: DSLZL/CM-build-linux-x64
+          CM_BUILDER_REPOSITORY: ${{ github.repository }}
           CM_SOURCE_SHA: ${{ inputs.source_sha }}
           CM_REQUEST_ID: ${{ inputs.request_id }}
           CM_BUILD_KIND: ${{ inputs.build_kind }}
@@ -122,7 +126,7 @@ jobs:
       ${{ always() && needs.preflight.result == 'success' &&
       needs.preflight.outputs.distribution_required == 'true' &&
       (needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     cache-mode: none
     permissions:
@@ -140,7 +144,7 @@ jobs:
       CM_REQUEST_ID: ${{ inputs.request_id }}
       CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
       CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
-      CM_BUILD_JOB: ${{ needs.build-read.result == 'success' && 'build-read / linux-x64' || 'build-write / linux-x64' }}
+      CM_BUILD_JOB: ${{ format('{0} / {1}', needs.build-read.result == 'success' && 'build-read' || 'build-write', github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64') }}
       CM_INDEX_REQUIRED: ${{ needs.preflight.outputs.index_required }}
       CM_POLICY_TOKEN: ${{ github.token }}
       PYTHONDONTWRITEBYTECODE: "1"
@@ -203,7 +207,7 @@ jobs:
         id: proofs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-distribution-proofs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-distribution-proofs-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ steps.candidate.outputs.proof_directory }}
           if-no-files-found: error
           retention-days: 14
@@ -212,7 +216,7 @@ jobs:
   program-prepare:
     needs: preflight
     if: needs.preflight.outputs.build_kind == 'program'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     cache-mode: none
     outputs:
@@ -265,7 +269,7 @@ jobs:
         id: overlay
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-validation-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-validation-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_VALIDATION_INPUT_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -285,7 +289,7 @@ jobs:
       needs.preflight.outputs.consumer_required == 'true' &&
       (needs.preflight.outputs.distribution_required != 'true' || needs.attest-distribution.result == 'success') &&
       (needs.program-prepare.result == 'success' || needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 120
     cache-mode: none
     permissions:
@@ -388,7 +392,7 @@ jobs:
         id: index-input
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-index-qualification-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-index-qualification-inputs-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cm-index-qualification-inputs
           if-no-files-found: error
           retention-days: 14
@@ -396,7 +400,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-consumer-status-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-consumer-status-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.CM_CI_LOG_DIR }}/runtime-step-results.json
             ${{ env.CM_CI_LOG_DIR }}/run-metadata.json
@@ -410,7 +414,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-consumer-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-consumer-artifacts-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_ARTIFACT_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -418,7 +422,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-consumer-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-consumer-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_LOG_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -426,7 +430,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-consumer-checkpoints-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-consumer-checkpoints-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_RUNTIME_CHECKPOINT_DIR }}
           if-no-files-found: warn
           retention-days: 14
@@ -437,7 +441,7 @@ jobs:
     if: >-
       ${{ always() && needs.preflight.outputs.index_required == 'true' &&
       needs.runtime-consumer.result == 'success' && needs.attest-distribution.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     cache-mode: none
     permissions:
@@ -500,7 +504,7 @@ jobs:
         id: qualification
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-index-qualification-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-index-qualification-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ steps.candidate.outputs.qualification_directory }}
           if-no-files-found: error
           retention-days: 14
@@ -512,7 +516,7 @@ jobs:
       needs.preflight.outputs.index_required == 'true' && needs.attest-index-qualification.result == 'success' &&
       (needs.preflight.outputs.distribution_required != 'true' || needs.attest-distribution.result == 'success') &&
       (needs.build-read.result == 'success' || needs.build-write.result == 'success') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 25
     cache-mode: none
     permissions:
@@ -605,7 +609,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-index-proof-consumer-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-index-proof-consumer-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_ARTIFACT_DIR }}
           if-no-files-found: error
           retention-days: 14
@@ -613,7 +617,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cm-linux-x64-index-proof-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
+          name: cm-${{ env.CM_PLATFORM }}-index-proof-evidence-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: ${{ env.CM_CI_LOG_DIR }}
           if-no-files-found: warn
           retention-days: 14
@@ -626,7 +630,7 @@ jobs:
       (needs.preflight.outputs.consumer_required != 'true' || needs.runtime-consumer.result == 'success') &&
       (needs.preflight.outputs.index_required != 'true' ||
       (needs.attest-index-qualification.result == 'success' && needs.index-proof-consumer.result == 'success')) }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     cache-mode: none
     permissions:
@@ -645,7 +649,7 @@ jobs:
           CM_REQUEST_ID: ${{ inputs.request_id }}
           CM_ARTIFACT_ID: ${{ needs.build-read.outputs.artifact_id || needs.build-write.outputs.artifact_id }}
           CM_ARTIFACT_DIGEST: ${{ needs.build-read.outputs.artifact_digest || needs.build-write.outputs.artifact_digest }}
-          CM_BUILD_JOB: ${{ needs.build-read.result == 'success' && 'build-read / linux-x64' || 'build-write / linux-x64' }}
+          CM_BUILD_JOB: ${{ format('{0} / {1}', needs.build-read.result == 'success' && 'build-read' || 'build-write', github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64') }}
           CM_BUILD_KIND: ${{ needs.preflight.outputs.build_kind }}
           CM_PRODUCTION_ORIGIN: ${{ needs.build-read.outputs.production_origin || needs.build-write.outputs.production_origin }}
           CM_VALIDATION_ARTIFACT_ID: ${{ needs.build-read.outputs.validation_artifact_id || needs.build-write.outputs.validation_artifact_id }}
@@ -679,7 +683,7 @@ jobs:
       ${{ always() && needs.preflight.result == 'success' &&
       needs.preflight.outputs.build_kind == 'program' &&
       needs.program-prepare.result == 'success' && needs.runtime-consumer.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     cache-mode: none
     env:

@@ -13,6 +13,11 @@ import cm_platforms
 
 
 def require_hosted_linux():
+    if os.environ.get("CM_EXECUTION_ROLE", "source_checks") != "source_checks":
+        entry = require_hosted_worker()
+        if entry["runner_os"] != "Linux":
+            raise RuntimeError("This recipe requires a native GNU Linux worker")
+        return
     required = {
         "GITHUB_ACTIONS": "true",
         "RUNNER_ENVIRONMENT": "github-hosted",
@@ -109,6 +114,16 @@ def self_check():
                 patch("platform.system", return_value=system), patch("platform.machine", return_value=machine), \
                 patch("struct.calcsize", return_value=8), patch("sysconfig.get_platform", return_value=python_platform):
             assert require_hosted_worker() == entry
+            with patch.dict(os.environ, {"CM_EXECUTION_ROLE": "platform_builder"}):
+                if entry["runner_os"] == "Linux":
+                    require_hosted_linux()
+                else:
+                    try:
+                        require_hosted_linux()
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError("A non-Linux worker entered the Linux recipe")
             for field, bad in (("GITHUB_ACTIONS", "false"), ("RUNNER_ENVIRONMENT", "self-hosted"),
                     ("RUNNER_OS", "other"), ("RUNNER_ARCH", "other")):
                 with patch.dict(os.environ, {field: bad}):
