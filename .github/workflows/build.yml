@@ -350,6 +350,7 @@ jobs:
           CM_INPUT_RUN_ID: ${{ steps.input.outputs.input_run_id }}
           CM_VALIDATION_ARTIFACT_NAME: ${{ steps.input.outputs.validation_artifact_name }}
           CM_POLICY_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ env.CM_WORKER_POLICY_DIR }}:${{ env.CM_CONSUMER_INPUT_DIR }}
         run: |
           gh run download "$CM_INPUT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_INPUT_ARTIFACT_NAME" --dir "$CM_CONSUMER_TRANSFER_DIR"
           /usr/bin/python3 -B .github/scripts/worker_policy.py extract-consumer
@@ -578,6 +579,7 @@ jobs:
           CM_INPUT_RUN_ID: ${{ steps.input.outputs.input_run_id }}
           CM_VALIDATION_ARTIFACT_NAME: ${{ steps.input.outputs.validation_artifact_name }}
           CM_POLICY_TOKEN: ${{ github.token }}
+          PYTHONPATH: ${{ env.CM_WORKER_POLICY_DIR }}:${{ env.CM_CONSUMER_INPUT_DIR }}
         run: |
           gh run download "$CM_INPUT_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$CM_INPUT_ARTIFACT_NAME" --dir "$CM_CONSUMER_TRANSFER_DIR"
           /usr/bin/python3 -B .github/scripts/worker_policy.py extract-consumer
