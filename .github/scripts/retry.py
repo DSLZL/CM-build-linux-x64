@@ -186,8 +186,12 @@ def ordinary_audit(text):
 
 
 def test_inputs(root, revision):
+    # Historical x64 snapshots predate the shared platform module.
+    platform_path = "ci/scripts/cm_platforms.py"
+    platform_files = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", platform_path).decode().splitlines())
     texts = {path: source(root, revision, path) for path in RUNTIME_FILES
-             if not path.endswith("ci_progress.py") and path not in (*SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES, *PROGRAM_RUNTIME_FILES)}
+             if not path.endswith("ci_progress.py") and path not in (*SUPPORT_RUNTIME_FILES, *INDEX_RUNTIME_FILES, *PROGRAM_RUNTIME_FILES)
+             and (path != platform_path or path in platform_files)}
     available = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", *SUPPORT_RUNTIME_FILES).decode().splitlines())
     support = {path: source(root, revision, path) for path in SUPPORT_RUNTIME_FILES if path in available}
     index_available = set(git(root, "ls-tree", "-r", "--name-only", revision, "--", *INDEX_RUNTIME_FILES).decode().splitlines())
