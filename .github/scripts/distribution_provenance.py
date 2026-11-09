@@ -495,7 +495,8 @@ def native_components(root, package, destination, native):
     component("rust-std", rust, rust_url, [text_material(destination, path, rust_url, fetch(rust_url + "/" + path))
         for path in ("LICENSE-APACHE", "LICENSE-MIT", "COPYRIGHT")], ["runtime-static-standard-library"])
     rg_manifest = (upstream / "scripts/codex_package/rg").read_text()
-    rg = json.loads(rg_manifest[rg_manifest.index("{"):])["platforms"]["linux-x86_64"]
+    rg_platform = "linux-" + linux_native()["target"].split("-", 1)[0]
+    rg = json.loads(rg_manifest[rg_manifest.index("{"):])["platforms"][rg_platform]
     assert rg["hash"] == "sha256" and len(rg["providers"]) == 1
     url = rg["providers"][0]["url"]
     data = fetch(url)
@@ -510,7 +511,8 @@ def native_components(root, package, destination, native):
     assert re.fullmatch(r"[0-9a-f]{40}", commit)
     data = fetch("https://codeload.github.com/BurntSushi/ripgrep/tar.gz/" + commit)
     source = ripgrep_source(data, Path(os.environ["RUNNER_TEMP"]) / "cm-ripgrep-source", commit)
-    command = ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", "x86_64-unknown-linux-musl"]
+    rg_target = Path(rg["path"]).parts[0].removeprefix("ripgrep-15.2.0-")
+    command = ["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", rg_target]
     if "+pcre2" in version:
         command += ["--features", "pcre2"]
     metadata = json.loads(subprocess.check_output(command, cwd=source, text=True, timeout=300))
