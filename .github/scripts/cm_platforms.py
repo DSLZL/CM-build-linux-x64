@@ -52,13 +52,13 @@ def select(key=None, *, root=None, enabled=False):
     return {"key": key, **entry}
 
 
-def worker(*, root=None):
+def worker(*, root=None, enabled=True):
     table = load(root)
     repository = os.environ.get("GITHUB_REPOSITORY")
     matches = [key for key, entry in table["platforms"].items() if entry["repository"] == repository]
     if len(matches) != 1:
         raise RuntimeError("Product work requires its exact independent builder repository")
-    entry = select(matches[0], root=root, enabled=True)
+    entry = select(matches[0], root=root, enabled=enabled)
     if (os.environ.get("CM_PLATFORM", entry["key"]) != entry["key"]
             or os.environ.get("CM_TARGET", entry["target"]) != entry["target"]):
         raise RuntimeError("Requested platform/target differs from the fixed builder repository")
@@ -87,6 +87,7 @@ def self_check():
         assert select(key)["target"] == entry["target"]
         with patch.dict(os.environ, {"GITHUB_REPOSITORY": entry["repository"],
                 "CM_PLATFORM": key, "CM_TARGET": entry["target"]}):
+            assert worker(enabled=False)["key"] == key
             if entry["enabled"]:
                 assert worker()["key"] == key
             else:

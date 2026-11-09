@@ -24,8 +24,8 @@ def require_hosted_linux():
         raise RuntimeError("CM compilation and tests require a GitHub-hosted Linux x64 job; missing/mismatched: " + ", ".join(wrong))
 
 
-def require_hosted_worker():
-    entry = cm_platforms.worker()
+def require_hosted_worker(*, enabled=True):
+    entry = cm_platforms.worker(enabled=enabled)
     required = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
         "RUNNER_OS": entry["runner_os"], "RUNNER_ARCH": entry["runner_arch"]}
     machine = platform.machine().lower()
@@ -45,7 +45,9 @@ def record(output):
         require_hosted_linux()
         entry = cm_platforms.select()
     else:
-        entry = require_hosted_worker()
+        entry = require_hosted_worker(enabled=role != "platform_preflight")
+        if role == "platform_preflight" and (entry["key"] != "linux-arm64" or os.environ.get("GITHUB_JOB") != "native-preflight"):
+            raise RuntimeError("Disabled targets are restricted to the reviewed ARM64 mechanism preflight")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     source_root = os.environ.get("CM_SOURCE_DIR", os.environ["GITHUB_WORKSPACE"])
@@ -56,15 +58,15 @@ def record(output):
     source_sha = os.environ.get("CM_SOURCE_SHA", head)
     if source_sha != head:
         raise RuntimeError("Requested source SHA does not match the checked-out CM source")
-    if role not in {"source_checks", "platform_builder", "runtime_consumer", "runtime_validation"}:
+    if role not in {"source_checks", "platform_builder", "runtime_consumer", "runtime_validation", "platform_preflight"}:
         raise RuntimeError("Unknown execution role")
     if source_repository != "DSLZL/CM":
         raise RuntimeError("Execution must bind the sole reviewed CM source repository")
     if role == "source_checks" and source_repository != repository:
         raise RuntimeError("Source checks must run in their source repository")
-    if role in {"platform_builder", "runtime_consumer", "runtime_validation"} and (source_repository == repository or os.environ.get("CM_BUILDER_REPOSITORY") != repository):
+    if role in {"platform_builder", "runtime_consumer", "runtime_validation", "platform_preflight"} and (source_repository == repository or os.environ.get("CM_BUILDER_REPOSITORY") != repository):
         raise RuntimeError("Product builds require the distinct fixed builder repository")
-    if role in {"runtime_consumer", "runtime_validation"} and (os.environ.get("CM_CACHE_MODE") != "none" or os.environ.get("ACTIONS_CACHE_MODE") != "none"):
+    if role in {"runtime_consumer", "runtime_validation", "platform_preflight"} and (os.environ.get("CM_CACHE_MODE") != "none" or os.environ.get("ACTIONS_CACHE_MODE") != "none"):
         raise RuntimeError("Runtime consumer requires actual platform-enforced cache-mode none")
     identity = {"provider": "github_actions", "repository": repository,
                 "source_repository": source_repository, "source_sha": source_sha, "head_sha": head,
@@ -94,6 +96,7 @@ def record(output):
 
 
 def self_check():
+    import tempfile
     from unittest.mock import patch
     for key in cm_platforms.load()["platforms"]:
         entry = cm_platforms.select(key)
@@ -134,6 +137,28 @@ def self_check():
                             pass
                         else:
                             raise AssertionError("An emulated Windows Python was accepted")
+    entry = cm_platforms.select("linux-arm64")
+    env = {"CM_EXECUTION_ROLE": "platform_preflight", "GITHUB_JOB": "native-preflight",
+        "GITHUB_REPOSITORY": entry["repository"], "CM_BUILDER_REPOSITORY": entry["repository"],
+        "CM_SOURCE_REPOSITORY": "DSLZL/CM", "CM_SOURCE_SHA": "a" * 40, "GITHUB_WORKFLOW_SHA": "b" * 40,
+        "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_WORKFLOW_REF": "reviewed",
+        "CM_CACHE_MODE": "none", "ACTIONS_CACHE_MODE": "none", "GITHUB_WORKSPACE": "/unused"}
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, env, clear=True), \
+            patch(__name__ + ".require_hosted_worker", return_value=entry) as guard, \
+            patch("subprocess.check_output", return_value="a" * 40):
+        record(directory)
+        guard.assert_called_with(enabled=False)
+        value = json.loads(Path(directory, "run-metadata.json").read_text())["ci"]
+        assert value["execution_role"] == "platform_preflight" and value["cache_repository"] is None
+        for changes in ({"GITHUB_JOB": "build-write"}, {"CM_CACHE_MODE": "read"}, {"ACTIONS_CACHE_MODE": "write"},
+                {"CM_BUILDER_REPOSITORY": "other/repo"}, {"CM_SOURCE_SHA": "c" * 40}):
+            with patch.dict(os.environ, changes):
+                try:
+                    record(directory)
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Invalid native mechanism metadata authority accepted")
 
 
 if __name__ == "__main__":

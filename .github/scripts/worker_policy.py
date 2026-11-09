@@ -57,8 +57,8 @@ def output(values):
             stream.write(key + "=" + str(value) + "\n")
 
 
-def identities():
-    entry = require_hosted_worker()
+def identities(*, enabled=True):
+    entry = require_hosted_worker(enabled=enabled)
     source = checked(os.environ.get("CM_SOURCE_REPOSITORY"), r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", "fixed source repository")
     worker = checked(os.environ.get("CM_BUILDER_REPOSITORY"), r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", "fixed builder repository")
     sha = checked(os.environ.get("CM_SOURCE_SHA"), r"[0-9a-f]{40}", "source SHA")
@@ -288,10 +288,14 @@ def restore_origin():
     print("Restored exact successful qualification Host and runtime fixtures; no compiler or rebuild fallback.", flush=True)
 
 
-def preflight():
-    source, worker, sha, workflow_sha, request = identities()
-    entry = cm_platforms.worker()
+def preflight(*, mechanism_only=False):
+    source, worker, sha, workflow_sha, request = identities(enabled=not mechanism_only)
+    entry = cm_platforms.worker(enabled=not mechanism_only)
     kind, origin = build_request()
+    if mechanism_only and (entry["key"] != "linux-arm64" or os.environ.get("GITHUB_JOB") != "native-preflight"
+            or kind != "qualification" or origin is not None
+            or os.environ.get("CM_CACHE_MODE") != "none" or os.environ.get("ACTIONS_CACHE_MODE") != "none"):
+        raise RuntimeError("Only the cache-none Linux ARM64 mechanism preflight may inspect a disabled target")
     # These APIs run before any requested CM source is checked out or executed.
     source_info = api("repos/" + source)
     worker_info = api("repos/" + worker)
@@ -310,6 +314,8 @@ def preflight():
     if resolved.get("sha") != sha:
         raise RuntimeError("Exact requested CM source SHA was not found in the fixed source repository")
     source_head = api("repos/" + source + "/commits/" + urllib.parse.quote(branch, safe=""))["sha"]
+    if mechanism_only and (worker_info.get("private") is not False or branch != "main" or worker_branch != "main" or sha != source_head):
+        raise RuntimeError("Mechanism preflight requires public main repositories and the exact current source head")
     mode = "write" if sha == source_head else "read"
     config_record = api("repos/" + source + "/contents/.github/cm-ci.json?ref=" + sha)
     config = json.loads(base64.b64decode(config_record["content"]))
@@ -322,15 +328,72 @@ def preflight():
         if config.get("task_id") != "CM-M05":
             raise RuntimeError("Mod-only requires the reviewed M05 mapping")
         verify_origin(origin, source, worker, workflow_sha)
+    if mechanism_only:
+        mode, consumer_required = "none", "false"
     record = {"source_repository": source, "source_sha": sha, "source_default_branch": branch,
               "observed_source_default_sha": source_head, "builder_repository": worker,
               "workflow_sha": workflow_sha, "worker_default_branch": worker_branch,
               "request_id": request, "platform": entry["key"], "target": entry["target"], "cache_mode": mode, "consumer_required": consumer_required,
-              "build_kind": kind, "distribution_required": "true" if kind != "program" and config.get("task_id") in ("CM-S01", "CM-S02", "CM-S03") else "false",
-              "index_required": "true" if kind != "program" and config.get("task_id") == "CM-S03" else "false"}
+              "build_kind": kind, "distribution_required": "true" if not mechanism_only and kind != "program" and config.get("task_id") in ("CM-S01", "CM-S02", "CM-S03") else "false",
+              "index_required": "true" if not mechanism_only and kind != "program" and config.get("task_id") == "CM-S03" else "false"}
+    if mechanism_only:
+        record["execution_role"] = "platform_preflight"
     Path(os.environ["RUNNER_TEMP"], "cm-worker-preflight.json").write_text(json.dumps(record, indent=2) + "\n")
     output({**record, "source_default_sha_verified": "true" if mode == "write" else "false"})
     print(json.dumps(record, indent=2))
+
+
+def native_preflight():
+    preflight(mechanism_only=True)
+
+
+def native_preflight_self_check():
+    from unittest.mock import patch
+    entry = cm_platforms.select("linux-arm64")
+    source, worker, sha, workflow_sha, request = "DSLZL/CM", entry["repository"], "a" * 40, "b" * 40, "mechanism-check"
+    env = {"GITHUB_JOB": "native-preflight", "GITHUB_REF": "refs/heads/main", "CM_CACHE_MODE": "none",
+        "ACTIONS_CACHE_MODE": "none", "CM_BUILD_KIND": "qualification", "CM_HOST_ORIGIN": ""}
+    records = {"repos/" + name: {"full_name": name, "private": False, "default_branch": "main"} for name in (source, worker)}
+    records.update({"repos/" + worker + "/commits/main": {"sha": workflow_sha},
+        "repos/" + source + "/commits/" + sha: {"sha": sha}, "repos/" + source + "/commits/main": {"sha": sha},
+        "repos/" + source + "/contents/.github/cm-ci.json?ref=" + sha:
+            {"content": base64.b64encode(json.dumps({"task_id": "CM-S03"}).encode()).decode()}})
+    with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {**env, "RUNNER_TEMP": directory}, clear=True), \
+            patch(__name__ + ".identities", return_value=(source, worker, sha, workflow_sha, request)) as identity, \
+            patch.object(cm_platforms, "worker", return_value=entry), patch(__name__ + ".api", side_effect=records.__getitem__), \
+            patch(__name__ + ".output") as emitted:
+        native_preflight()
+        identity.assert_called_with(enabled=False)
+        value = emitted.call_args.args[0]
+        assert value["cache_mode"] == "none" and value["execution_role"] == "platform_preflight"
+        assert all(value[key] == "false" for key in ("consumer_required", "distribution_required", "index_required"))
+        for changes in ({"GITHUB_JOB": "build-write"}, {"CM_CACHE_MODE": "write"}, {"ACTIONS_CACHE_MODE": "read"},
+                {"CM_BUILD_KIND": "program"}, {"CM_HOST_ORIGIN": "{}"}, {"GITHUB_REF": "refs/heads/other"}):
+            with patch.dict(os.environ, changes):
+                try:
+                    native_preflight()
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Invalid mechanism preflight authority accepted: " + repr(changes))
+        for path, changed in (("repos/" + worker, {"full_name": worker, "private": True, "default_branch": "main"}),
+                ("repos/" + worker + "/commits/main", {"sha": "c" * 40}),
+                ("repos/" + source + "/commits/main", {"sha": "c" * 40})):
+            with patch.dict(records, {path: changed}):
+                try:
+                    native_preflight()
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("Changed mechanism preflight origin accepted")
+        with patch.object(cm_platforms, "worker", return_value=cm_platforms.select("linux-x64")):
+            try:
+                native_preflight()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Mechanism exception escaped its reviewed ARM64 target")
+    print("CM ARM64 mechanism authority self-check passed; normal disabled product routing remains closed", flush=True)
 
 
 def benchmark_capacity(cache, pending_bytes=None, *, usage_floor=0):
@@ -1134,7 +1197,8 @@ def receipt():
 
 if __name__ == "__main__":
     try:
-        {"self-check": self_check, "preflight": preflight, "benchmark-preflight": benchmark_preflight,
+        {"self-check": self_check, "preflight": preflight, "native-preflight": native_preflight,
+         "native-preflight-self-check": native_preflight_self_check, "benchmark-preflight": benchmark_preflight,
          "verify-checkout": verify_checkout, "cache-save-plan": cache_save_plan, "verify-consumer": verify_consumer,
          "extract-consumer": extract_consumer, "restore-origin": restore_origin, "receipt": receipt}[sys.argv[1]]()
     except (RuntimeError, KeyError, IndexError, OSError, ValueError, subprocess.SubprocessError) as exc:
