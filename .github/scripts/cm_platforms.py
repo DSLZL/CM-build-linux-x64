@@ -113,6 +113,7 @@ def self_check():
         assert native["machine"] == (62 if key == "linux-x64" else 183)
         with patch.dict(os.environ, {"CM_TARGET": entry["target"]}):
             assert linux_native() == native
+            assert linux_native(foreign_linux_target())["machine"] != native["machine"]
     for target in ("", "aarch64-unknown-linux-musl", "x86_64-pc-windows-msvc", [], "unknown"):
         try:
             linux_native(target)
