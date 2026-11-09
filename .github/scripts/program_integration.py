@@ -414,7 +414,10 @@ def self_check():
     print("CM program historical outer audit:", json.dumps({revision: retry.projection(
         retry.source(root, revision, "ci/scripts/runtime_consumer.py"), ("observe",))
         for revision in (reference["qualification"]["origin"]["source_sha"], "HEAD")}), flush=True)
-    assert len(changed_legacy) < len(previous), "New registration invalidated every historical case"
+    if len(changed_legacy) == len(previous):
+        assert all(previous[label]["audit"] != base[label]["audit"] for label in previous), \
+            "New registration invalidated every historical case without an audit policy migration"
+        print("CM program historical audit policy changed; old checkpoints require fresh qualification", flush=True)
     print("CM program historical dependency changes:", json.dumps(changed_legacy), flush=True)
     original_source = retry.source
     audit_path = "ci/scripts/runtime_consumer.py"
