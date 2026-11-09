@@ -138,6 +138,7 @@ jobs:
       artifact_id: ${{ steps.proofs.outputs.artifact-id }}
       artifact_digest: ${{ steps.proofs.outputs.artifact-digest }}
     env:
+      CM_EXECUTION_ROLE: runtime_validation
       CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
       CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
       CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
@@ -453,6 +454,7 @@ jobs:
       artifact_id: ${{ steps.qualification.outputs.artifact-id }}
       artifact_digest: ${{ steps.qualification.outputs.artifact-digest }}
     env:
+      CM_EXECUTION_ROLE: runtime_validation
       CM_SOURCE_REPOSITORY: ${{ needs.preflight.outputs.source_repository }}
       CM_BUILDER_REPOSITORY: ${{ needs.preflight.outputs.builder_repository }}
       CM_SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
