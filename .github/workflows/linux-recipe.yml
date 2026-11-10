@@ -69,7 +69,7 @@ jobs:
   linux-x64:
     name: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'linux-arm64' || 'linux-x64' }}
     runs-on: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ github.repository == 'DSLZL/CM-build-linux-arm64' && 180 || 90 }}
     concurrency:
       group: ${{ inputs.cache_mode == 'write' && 'cm-repository-cache-writer' || format('cm-cache-reader-{0}-{1}-{2}', github.run_id, github.run_attempt, inputs.request_id) }}
       cancel-in-progress: false
@@ -444,6 +444,12 @@ jobs:
         id: host-cache-prepare
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-quality.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
         run: python3 -B ci/scripts/host.py cache-save
+      - name: Save successful trusted source Host binaries and original build checks
+        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-cache-prepare.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
+        uses: ./.cm-worker/.github/actions/cache-save
+        with:
+          path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
+          key: ${{ steps.host-identity.outputs.host_key }}
       - name: Restore the qualified legacy Host reference for metadata rejection
         if: inputs.consumer_required && inputs.build_kind == 'qualification' && steps.reuse.outputs.reused != 'true'
         env:
@@ -646,12 +652,6 @@ jobs:
         with:
           path: ${{ env.SCCACHE_DIR }}
           key: ${{ steps.cache-identity.outputs.sccache_key }}
-      - name: Save successful trusted source Host binaries and original build checks
-        if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.host-cache-prepare.outcome == 'success' && steps.host-cache.outputs.cache-hit != 'true' }}
-        uses: ./.cm-worker/.github/actions/cache-save
-        with:
-          path: ${{ env.CM_HOST_BUILD_CACHE_DIR }}
-          key: ${{ steps.host-identity.outputs.host_key }}
       - name: Save successful compiled target host-core-baseline-build
         if: ${{ !cancelled() && inputs.build_kind == 'qualification' && inputs.cache_mode == 'write' && steps.acceptance-cache-prepare.outcome == 'success' && steps.acceptance-cache-prepare.outputs.save_host_core_baseline_build == 'true' && steps.acceptance-host-core-baseline-build.outputs.cache-hit != 'true' }}
         uses: ./.cm-worker/.github/actions/cache-save
